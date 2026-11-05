@@ -56,7 +56,7 @@ Reading a new long prompt is slow: about 26 s at 16K tokens, 2 minutes at 64K, 4
 - About 200 GB of free disk on each Spark for the pack, plus room for the images and the engine build, and up to
   64 GB on the head for saved conversations.
 - Nothing else serving on either GPU: at 1M the serve leaves about 7 GiB free on each Spark.
-- Ports: 8892 (API), 29651-29652 (between the ranks).
+- Ports: 8888 (API), 29651-29652 (between the ranks).
 
 ## Run it
 
@@ -65,7 +65,7 @@ On the head:
 ```bash
 scripts/prepare.sh       # the engine: TensorFold v1.2.2 + patches-zig/, built in a container
 scripts/fetch_pack.sh    # the 2.71 bpw pack from Hugging Face (197 GB, pinned revision) to both Sparks, verified
-./start.sh               # OpenAI-compatible API on :8892, model id Ling-3.1-flash, 1M context
+./start.sh               # OpenAI-compatible API on :8888, model id Ling-3.1-flash, 1M context
 ./stop.sh
 ```
 

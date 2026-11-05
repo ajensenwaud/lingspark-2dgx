@@ -53,7 +53,7 @@ PACK_DIR="${PACK_DIR:-$MODELS_ROOT/packs/$PACK_NAME}"   # the same path on both 
 # tensorfold-native serve on both nodes: rank 0 (HEAD) serves the API, rank 1 (WORKER) follows its steps.
 SERVED_NAME="${SERVED_NAME:-Ling-3.1-flash}"
 HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-8892}"                          # API port
+PORT="${PORT:-8888}"                          # API port
 TP_PORT="${TP_PORT:-29651}"                   # rank rendezvous on MASTER (NCCL_COMM_ID); the next port carries the TCP line
 # Context per stream. The native window is 262,144; past it YaRN (factor 4) stretches the rope to 1,048,576. start.sh
 # then serves a config overlay (the pack's files linked, config.json with SGLang's YaRN rope_scaling), never edits the
