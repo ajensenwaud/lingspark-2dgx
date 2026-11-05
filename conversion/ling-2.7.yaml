@@ -1,0 +1,25 @@
+# LingSpark pack recipe: Ling-3.1-flash-1019 at ~2.7 bpw, sized so 1M context fits two Sparks at bf16 KV.
+# Experts are 96 % of the bytes, so they carry the budget on whole-bit steps only (exllamav3's 2.5-bit path measured
+# 2.4 s a matrix vs ~0.9 at 3 bits: ~70 h vs ~30 h for the pack). The 8-layer converter trial put down_proj's error ~2x
+# gate/up's at every width, so down_proj is 3 bits everywhere. exllamav3's fused expert kernel needs gate and up at
+# the same width, so they share it: 3 bits on the first and last 17 MoE layers (4-20, 55-71; the ends of a deep
+# stack are usually the most sensitive, and 65-71 carry Ling's SwiGLU clamp), 2 bits on the middle 34 (21-54).
+# Average 2.67 bits a routed expert. KDA attention is half of every token's weight reads: 5 bits (proxy error ~1e-4,
+# far below the experts'). MLA attention 6, shared experts 6, dense MLP (layers 0-3) 4; head 6 (-hb), MTP layer 3 (-mb).
+target_bpw: 2.7
+tensors:
+  "*": 6
+  "model.layers.[0-3].mlp.*": 4
+  "*.attention.qkv_proj": 5
+  "*.attention.f_proj": 5
+  "*.attention.g_proj": 5
+  "*.attention.o_proj": 5
+  "*.mlp.shared_experts.*": 6
+  "*.mlp.experts.*": 2
+  "*.mlp.experts.*.down_proj": 3
+  "model.layers.[4-9].mlp.experts.*": 3
+  "model.layers.1[0-9].mlp.experts.*": 3
+  "model.layers.20.mlp.experts.*": 3
+  "model.layers.5[5-9].mlp.experts.*": 3
+  "model.layers.6[0-9].mlp.experts.*": 3
+  "model.layers.7[01].mlp.experts.*": 3

@@ -1,0 +1,329 @@
+From b9f323756e483e673662f2211095c7f06387d388 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 21:51:56 +1100
+Subject: [PATCH 05/26] ling: EXL3 routed experts in Ling's clamp order,
+ min(silu(g), L) * clip(u, -L, L), on the shared grouped finish's twin
+
+exl3_experts.cu's plan finish becomes a template: tf_exl3_plan_finish keeps the clamp on silu's input
+(its sm_121 SASS unchanged, as every other function of the image), tf_exl3_plan_finish_after clamps
+silu's output. exl3_grouped launches the twin for experts.Layer.after; the Ling loader sets it and the
+SwiGLU limit, so the clamped layers 65-71 load on EXL3. ling-exl3-clamp checks a real EXL3 layer's
+grouped gate-up against float64 on its own g and u (read through the same kernels as down projections),
+with an unclamped control and GLM's order told apart.
+---
+ zig/kernels/cuda/exl3_experts.cu       |   1 +
+ zig/kernels/cuda/exl3_plan.cuh         |   6 +-
+ zig/src/cuda/exl3_experts.zig          |   2 +
+ zig/src/cuda/exl3_grouped.zig          |   2 +-
+ zig/src/cuda/experts.zig               |   2 +-
+ zig/src/families/ling/weights_proj.zig |   7 +-
+ zig/tests/cuda/ling_cmds.zig           |   3 +
+ zig/tests/cuda/ling_exl3_clamp.zig     | 164 +++++++++++++++++++++++++
+ 8 files changed, 179 insertions(+), 8 deletions(-)
+ create mode 100644 zig/tests/cuda/ling_exl3_clamp.zig
+
+diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
+index d6c8a6751..3dce3afde 100644
+--- a/zig/kernels/cuda/exl3_experts.cu
++++ b/zig/kernels/cuda/exl3_experts.cu
+@@ -262,6 +262,7 @@ extern "C" __global__ void tf_exl3_plan_rotate(const PlanStage a) {
+ }
+ 
+ extern "C" __global__ void tf_exl3_plan_finish(const PlanStage a) { tf_exl3::plan_finish<tf_exl3::FINISH_SERVED>(a); }
++extern "C" __global__ void tf_exl3_plan_finish_after(const PlanStage a) { tf_exl3::plan_finish<tf_exl3::FINISH_SERVED, true>(a); }
+ 
+ // Transposed fp32 prompt accumulators in the shared EXL3 module; decode kernels above stay unchanged.
+ #include "exl3_prompt.cuh"
+diff --git a/zig/kernels/cuda/exl3_plan.cuh b/zig/kernels/cuda/exl3_plan.cuh
+index e1a4d147d..4e145080c 100644
+--- a/zig/kernels/cuda/exl3_plan.cuh
++++ b/zig/kernels/cuda/exl3_plan.cuh
+@@ -32,7 +32,8 @@ namespace tf_exl3 {
+ // plan_finish as served, or one of the contract's planted SwiGLU-OAI faults: no + 1 on the up, alpha 1.
+ enum FinishFault { FINISH_SERVED, FINISH_NO_PLUS_ONE, FINISH_ALPHA_ONE };
+ 
+-template <int FAULT>
++// AFTER: the SwiGLU clamp on silu's output, min(silu(g), L) * clip(u, -L, L) (Ling); else on its input (GLM).
++template <int FAULT, bool AFTER = false>
+ __device__ __forceinline__ void plan_finish(const PlanStage a) {
+     const int it = blockIdx.x, blk = blockIdx.y, lane = threadIdx.x;
+     if (it >= a.counts[0]) return;
+@@ -64,9 +65,10 @@ __device__ __forceinline__ void plan_finish(const PlanStage a) {
+                     continue;
+                 }
+                 if (a.act_mode == 0) { v = bf16r(v); up = bf16r(up); }
+-                if (a.limit > 0) { v = upTo(v, a.limit); up = within(up, a.limit); }
++                if (!AFTER && a.limit > 0) { v = upTo(v, a.limit); up = within(up, a.limit); }
+                 v = v / (1.f + expf(-v));
+                 if (a.act_mode == 0) v = bf16r(v);
++                if (AFTER && a.limit > 0) { v = upTo(v, a.limit); up = within(up, a.limit); }
+                 v *= up;
+             }
+             const size_t at = (size_t)p * a.n + n + q;
+diff --git a/zig/src/cuda/exl3_experts.zig b/zig/src/cuda/exl3_experts.zig
+index 733eae576..005e007fd 100644
+--- a/zig/src/cuda/exl3_experts.zig
++++ b/zig/src/cuda/exl3_experts.zig
+@@ -115,6 +115,7 @@ pub const Experts = struct {
+     prompt: prompt.Kernels = undefined,
+     plan_rotate: Function = undefined,
+     plan_finish: Function = undefined,
++    plan_finish_after: Function = undefined, // the same, the clamp on silu's output (experts.Layer.after: Ling)
+ 
+     pub fn load(d: *const Driver) !Experts {
+         if (!kernels.available) return error.BuiltWithoutKernels;
+@@ -130,6 +131,7 @@ pub const Experts = struct {
+         e.prompt = try prompt.Kernels.resolve(e.mod);
+         e.plan_rotate = try e.mod.function("tf_exl3_plan_rotate");
+         e.plan_finish = try e.mod.function("tf_exl3_plan_finish");
++        e.plan_finish_after = try e.mod.function("tf_exl3_plan_finish_after");
+         e.group = try e.mod.function("tf_exl3_group");
+         try e.group.allowDynamicShared(64 * 1024);
+         e.rot_in = try e.mod.function("tf_exl3_experts_rot_in");
+diff --git a/zig/src/cuda/exl3_grouped.zig b/zig/src/cuda/exl3_grouped.zig
+index 79e7a621e..b9cd44d25 100644
+--- a/zig/src/cuda/exl3_grouped.zig
++++ b/zig/src/cuda/exl3_grouped.zig
+@@ -96,7 +96,7 @@ pub const Grouped = struct {
+         try launch.launch(g.kernels.grouped[@backingInt(w.codebook)], .{ .grid = .{ .x = @intCast(items), .y = @intCast(n / 128), .z = @intCast(mats * sk * 4) }, .block = .{ .x = 128 } }, s, &args);
+         var finish: launch.Args = .{};
+         finish.add(a);
+-        try launch.launch(g.kernels.plan_finish, .{ .grid = .{ .x = @intCast(items), .y = @intCast(n / 128) }, .block = .{ .x = 32 } }, s, &finish);
++        try launch.launch(if (l.after) g.kernels.plan_finish_after else g.kernels.plan_finish, .{ .grid = .{ .x = @intCast(items), .y = @intCast(n / 128) }, .block = .{ .x = 32 } }, s, &finish);
+     }
+ };
+ 
+diff --git a/zig/src/cuda/experts.zig b/zig/src/cuda/experts.zig
+index d2824a738..c6e42b297 100644
+--- a/zig/src/cuda/experts.zig
++++ b/zig/src/cuda/experts.zig
+@@ -30,7 +30,7 @@ pub const Layer = struct {
+     experts: usize,
+     limit: f32 = 0.0, // fp8g, nvfp4: the SwiGLU clamp, 0 for none
+     relu2: bool = false, // nvfp4: up is one projection under relu^2 (Nemotron), not SwiGLU's gate and up; iq2xxs: always
+-    after: bool = false, // fp8g: clamp silu's output (Ling: min(silu(g), L)), not its input (silu(min(g, L)))
++    after: bool = false, // fp8g, exl3: clamp silu's output (Ling: min(silu(g), L)), not its input (silu(min(g, L)))
+     swiglu: bool = false, // affine4: up is gate and up interleaved per group ([E][NI/32][D/64][2][288]) under SwiGLU
+     shared: i32 = -1, // affine3: the expert whose tables are 4-bit (a SwiGLU pair at shared_up, down at shared_down)
+     shared_up: u64 = 0,
+diff --git a/zig/src/families/ling/weights_proj.zig b/zig/src/families/ling/weights_proj.zig
+index 899d24ac1..997af3837 100644
+--- a/zig/src/families/ling/weights_proj.zig
++++ b/zig/src/families/ling/weights_proj.zig
+@@ -355,8 +355,6 @@ pub const Reader = struct {
+ 
+     /// experts.Layer's exl3 form (main's exl3_grouped): trellises as stored, pointers and half-bit widths per expert.
+     fn exl3Experts(r: *Reader, i: u32, count: usize, ni: usize, d: usize, limit: f32) !cuda.experts.Layer {
+-        // Ling's clamp is min(silu(g), L); the shared EXL3 epilogue clamps g before silu, so clamped layers wait for it
+-        if (limit != 0) return error.Exl3ClampOrder;
+         var tables: [3]struct { ptrs: u64, k2: u64, suh: u64, svh: u64 } = undefined;
+         var codebook: ?cuda.exl3.Codebook = null;
+         var b: [192]u8 = undefined;
+@@ -412,10 +410,11 @@ pub const Reader = struct {
+             .dims = d,
+             .width = ni,
+             .codebook = codebook orelse return error.UnexpectedTensor,
+-            .limit = 0,
++            .limit = limit,
+             .act_mode = 1, // fp32 silu(g) * u, nearest exllamav3's fp16 intermediate
+         };
+-        return .{ .format = .exl3, .exl3 = lay, .up = 0, .down = 0, .width = ni, .dims = d, .experts = count };
++        // after: Ling's order, min(silu(g), L) * clip(u, -L, L), on the shared finish's twin (tf_exl3_plan_finish_after)
++        return .{ .format = .exl3, .exl3 = lay, .up = 0, .down = 0, .width = ni, .dims = d, .experts = count, .limit = limit, .after = true };
+     }
+ 
+     fn expertModule(b: []u8, i: u32, e: usize, comptime proj: []const u8) ![]const u8 {
+diff --git a/zig/tests/cuda/ling_cmds.zig b/zig/tests/cuda/ling_cmds.zig
+index 41938408e..a758fbc9b 100644
+--- a/zig/tests/cuda/ling_cmds.zig
++++ b/zig/tests/cuda/ling_cmds.zig
+@@ -14,6 +14,7 @@ pub const usage =
+     \\  ling-ckpt-check <dir> [index]   every tensor's name, dtype and shape against the loader's (headers alone)
+     \\  ling-exl3-layers <dir> <ref> <out>   real EXL3 layers on exllamav3's inputs (prompt and decode), outputs saved
+     \\  ling-init-faults <dir> [--mtp] [--every N]   the backend opened with each driver call, then each allocation, failing
++    \\  ling-exl3-clamp <dir> [layer]   an EXL3 MoE layer's grouped gate-up in Ling's clamp order vs float64
+     \\
+ ;
+ 
+@@ -48,6 +49,8 @@ pub fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !bool {
+         try @import("ling_exl3_layers.zig").run(gpu, rest);
+     } else if (eq(u8, cmd, "ling-init-faults")) {
+         try @import("ling_faults.zig").run(gpu, rest);
++    } else if (eq(u8, cmd, "ling-exl3-clamp")) {
++        try @import("ling_exl3_clamp.zig").run(gpu, rest);
+     } else return false;
+     return true;
+ }
+diff --git a/zig/tests/cuda/ling_exl3_clamp.zig b/zig/tests/cuda/ling_exl3_clamp.zig
+new file mode 100644
+index 000000000..873eca2e7
+--- /dev/null
++++ b/zig/tests/cuda/ling_exl3_clamp.zig
+@@ -0,0 +1,164 @@
++//! `ling-exl3-clamp DIR [LAYER]`: an EXL3 MoE layer's grouped gate-up in Ling's clamp order vs float64 on its own g, u.
++//! g and u come from the same grouped kernels run as down projections over the gate and up tables (fp32, unrounded).
++const std = @import("std");
++const cuda = @import("cuda");
++const ling = @import("ling_cuda");
++const check = @import("check.zig");
++const qr = @import("quant_ref_tests.zig");
++const lw = @import("ling_weights_tests.zig");
++
++const Rig = qr.RigT;
++const h = qr.helpers;
++const ex = cuda.experts;
++
++fn silu(g: f64) f64 {
++    return g / (1 + @exp(-g));
++}
++
++/// `l`'s gate (or up) tables as a down projection: dims and width swapped, so the down epilogue writes fp32 g (or u).
++fn asDown(l: ex.Layer, up: bool) ex.Layer {
++    var x = l.exl3.?;
++    x.down = if (up) x.up else x.gate;
++    x.down_k2 = if (up) x.up_k2 else x.gate_k2;
++    x.suh_d = if (up) x.suh_u else x.suh_g;
++    x.svh_d = if (up) x.svh_u else x.svh_g;
++    x.dims = l.width;
++    x.width = l.dims;
++    var o = l;
++    o.exl3 = x;
++    o.dims = l.width;
++    o.width = l.dims;
++    o.limit = 0;
++    o.after = false;
++    return o;
++}
++
++fn plan(r: *Rig, router: *const cuda.grouped.Router, pairs: usize, slots: usize, count: usize) !cuda.grouped.Plan {
++    const pk = try r.a.alloc(i32, pairs);
++    for (pk, 0..) |*e, p| e.* = lw.pick(p, slots, count);
++    const p: cuda.grouped.Plan = .{ .members = try r.zeros(pairs * 4), .items = try r.zeros(cuda.grouped.maxItems(pairs, count, 16) * 12), .counts = try r.zeros(8), .rank = try r.zeros(4), .hist = try r.zeros(4) };
++    try router.route(r.s, try r.dev(std.mem.sliceAsBytes(pk)), pairs, count, 16, p);
++    return p;
++}
++
++fn f32s(r: *Rig, ptr: u64, n: usize) ![]const f32 {
++    const b = try r.back(ptr, n * 4);
++    const out = try r.a.alloc(f32, n);
++    @memcpy(std.mem.sliceAsBytes(out), b);
++    return out;
++}
++
++pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
++    if (rest.len < 1) return error.MissingArgument;
++    const layer: u32 = if (rest.len > 1) try std.fmt.parseInt(u32, rest[1], 10) else 4;
++    var arena = std.heap.ArenaAllocator.init(gpu.gpa);
++    defer arena.deinit();
++    var s = try cuda.Stream.init(gpu.d, false);
++    defer s.deinit();
++    var prng = std.Random.DefaultPrng.init(0xe3c1);
++    var r: Rig = .{ .gpu = gpu, .a = arena.allocator(), .s = s, .rng = prng.random() };
++    defer {
++        for (r.bufs.items) |*x| x.free();
++        r.bufs.deinit(gpu.gpa);
++    }
++    var why: ling.config.Why = .{};
++    var o = ling.weights.open(gpu.gpa, gpu.io, rest[0], &why) catch |e| {
++        std.debug.print("{s}: {s}\n", .{ rest[0], why.text() });
++        return e;
++    };
++    defer o.ck.close();
++    var pack = try cuda.modelopt.Packer.load(gpu.d);
++    defer pack.unload();
++    var w = try ling.weights.load(gpu.gpa, gpu.d, s, &pack, &o.ck, o.c, &.{layer}, .{ .globals = false });
++    defer w.deinit();
++    const l = switch (w.layers[0].ffn) {
++        .moe => |m| switch (m.routed) {
++            .grouped => |x| x,
++            .lanes => return error.NotGrouped,
++        },
++        .dense => return error.NotMoe,
++    };
++    try check.expect(l.format == .exl3 and l.after, "layer {d}: EXL3 experts loaded in Ling's order (after {})", .{ layer, l.after });
++    var kx = try cuda.exl3_experts.Experts.load(gpu.d);
++    defer kx.unload();
++    var g: cuda.exl3_grouped.Grouped = .{ .d = gpu.d, .kernels = &kx };
++    defer g.deinit();
++    var em = try cuda.Module.load(gpu.d, cuda.kernels.experts);
++    defer em.unload();
++    const router = try cuda.grouped.Router.resolve(em);
++    const ni = l.width;
++    const d = l.dims;
++    const slots = @min(4, l.experts);
++    for ([_]usize{ 3, 24 }) |rows| {
++        const pairs = rows * slots;
++        const p = try plan(&r, &router, pairs, slots, l.experts);
++        const items = cuda.grouped.maxItems(pairs, l.experts, 16);
++        const x = try r.bfs(rows * d, 4);
++        const xp = try r.a.alloc(u16, pairs * d); // pair p's row: x[p / slots]
++        for (0..pairs) |q| @memcpy(xp[q * d ..][0..d], x[(q / slots) * d ..][0..d]);
++        const gp = try r.zeros(pairs * ni * 4);
++        const up = try r.zeros(pairs * ni * 4);
++        const pin: ex.Rows = .{ .x = try r.dev(std.mem.sliceAsBytes(xp)), .stride = d };
++        try g.run(r.s, .down_f32, pin, asDown(l, false), p, gp, items, -1, false);
++        try g.run(r.s, .down_f32, pin, asDown(l, true), p, up, items, -1, false);
++        const gv = try f32s(&r, gp, pairs * ni);
++        const uv = try f32s(&r, up, pairs * ni);
++        // L at the 90th percentile of silu(g): the clamp bites on a tenth of the values
++        const sv = try r.a.alloc(f64, gv.len);
++        for (sv, gv) |*o2, x2| o2.* = silu(x2);
++        std.mem.sort(f64, sv, {}, std.sort.asc(f64));
++        const lim: f32 = @floatCast(sv[sv.len * 9 / 10]);
++        const in: ex.Rows = .{ .x = try r.dev(std.mem.sliceAsBytes(x)), .stride = d, .slots = slots };
++        var outs: [3][]const u8 = undefined;
++        for ([_]bool{ true, false, true }, [_]f32{ lim, lim, 0 }, 0..) |after, lv, k| {
++            var lc = l;
++            lc.limit = lv;
++            lc.after = after;
++            lc.exl3.?.limit = lv;
++            const out = try r.zeros(pairs * ni * 2);
++            try g.run(r.s, .up, in, lc, p, out, items, -1, rows > 16);
++            outs[k] = try r.back(out, pairs * ni * 2);
++        }
++        var most: f64 = 0;
++        var most0: f64 = 0; // the unclamped control, silu(g) * u: checks how g and u were read
++        var over: usize = 0;
++        var at: usize = 0;
++        var above: usize = 0;
++        var wide: usize = 0;
++        var off: usize = 0; // GLM's order (clamp before silu) outside this tolerance
++        const L: f64 = lim;
++        const e16 = std.math.pow(f64, 2, -16);
++        for (0..pairs * ni) |i| {
++            const gg: f64 = gv[i];
++            const uu: f64 = uv[i];
++            // the K-split order g and u were summed in moves each by its 128-block's scale (the Hadamard mixes them)
++            var bg: f64 = 0;
++            var bu: f64 = 0;
++            for (i / 128 * 128..i / 128 * 128 + 128) |j| {
++                bg = @max(bg, @abs(gv[j]));
++                bu = @max(bu, @abs(uv[j]));
++            }
++            const sg = silu(gg);
++            const want = @min(sg, L) * std.math.clamp(uu, -L, L);
++            const tol = @abs(want) * std.math.pow(f64, 2, -8) + (1.1 * @min(@abs(uu), L) * bg + @min(@abs(sg), L) * bu) * e16 + 1e-30;
++            const want0 = sg * uu;
++            const tol0 = @abs(want0) * std.math.pow(f64, 2, -8) + (1.1 * @abs(uu) * bg + @abs(sg) * bu) * e16 + 1e-30;
++            const got = h.bfOf(std.mem.bytesToValue(u16, outs[0][2 * i ..][0..2]));
++            const glm_order = h.bfOf(std.mem.bytesToValue(u16, outs[1][2 * i ..][0..2]));
++            const got0 = h.bfOf(std.mem.bytesToValue(u16, outs[2][2 * i ..][0..2]));
++            const e = @abs(got - want) / tol;
++            if (e > most) at = i;
++            most = @max(most, e);
++            over += @intFromBool(e > 1);
++            most0 = @max(most0, @abs(got0 - want0) / tol0);
++            above += @intFromBool(sg > L);
++            wide += @intFromBool(@abs(uu) > L);
++            off += @intFromBool(@abs(glm_order - want) > tol);
++        }
++        r.worst = @max(r.worst, most);
++        const gw = h.bfOf(std.mem.bytesToValue(u16, outs[0][2 * at ..][0..2]));
++        std.debug.print("RESULT layer {d} EXL3 gate-up, {d} rows ({d} pairs x {d}), L {d:.4}: float64 at {d:.3} of its tolerance ({d} over; worst g {e:.4} u {e:.4} got {e:.4}), unclamped control at {d:.3}; silu(g) > L on {d}, |u| > L on {d}; GLM's order off on {d}\n", .{ layer, rows, pairs, ni, lim, most, over, gv[at], uv[at], gw, most0, above, wide, off });
++        try check.expect(most <= 1 and most0 <= 1 and above > 0 and wide > 0 and off > 0, "{d} rows: Ling's order within tolerance, the clamp exercised, GLM's order told apart", .{rows});
++    }
++    check.pass("ling-exl3-clamp: layer {d}'s EXL3 experts in Ling's order min(silu(g), L) * clip(u, -L, L), worst {d:.3} of tolerance", .{ layer, r.worst });
++}
+-- 
+2.53.0
+

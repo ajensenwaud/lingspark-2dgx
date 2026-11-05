@@ -1,0 +1,113 @@
+From 9f3511e6450acf3ddbb1c1e2215fa04f89896622 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 07:39:51 +1100
+Subject: [PATCH 16/26] ling: the split pair's contract fixture copied no keys
+ (n = @min(512, ...) is a u10, so n * 576 wrapped to 0): the two halves now
+ hold the cache's chunks; tf_glm_merge back to v1.2.1's own body (the shared
+ template changed its SASS on sm_120/121), tf_ling_merge_part the same loop
+ beside it
+
+---
+ zig/kernels/cuda/glm_glue_attn.cuh    | 60 ++++++++++++++-------------
+ zig/tests/cuda/contract_ling_more.zig |  2 +-
+ 2 files changed, 33 insertions(+), 29 deletions(-)
+
+diff --git a/zig/kernels/cuda/glm_glue_attn.cuh b/zig/kernels/cuda/glm_glue_attn.cuh
+index 7613ac5b3..5dce6ffc5 100644
+--- a/zig/kernels/cuda/glm_glue_attn.cuh
++++ b/zig/kernels/cuda/glm_glue_attn.cuh
+@@ -265,13 +265,11 @@ extern "C" __global__ void __launch_bounds__(256)
+                                  po, pm, pl, rows, heads, w, scale, sparse, nullptr, 0, scales);
+ }
+ 
+-namespace glm_attn {
+-
+-// latent._merge's loop, block (row, head): chunks in order into o / l in bf16, or (PART) o, m and l kept in fp32.
+-template <bool PART>
+-__device__ __forceinline__ void merge_rows(const float* po, const float* pm, const float* pl, __nv_bfloat16* out,
+-                                           float* qo, float* qm, float* ql, const int* cnt, int64_t rows,
+-                                           int64_t heads, int nch, int sparse) {
++// latent._merge, block (row, head), 128 threads: chunks merged in order, o / l by div.full; skips sparse count-0 rows.
++extern "C" __global__ void __launch_bounds__(128)
++    tf_glm_merge(const float* po, const float* pm, const float* pl, __nv_bfloat16* out, const int* cnt, int64_t rows,
++                 int64_t heads, int nch, int sparse) {
++  constexpr int LW = glm_attn::LW;
+   const int64_t r = blockIdx.x, h = blockIdx.y;
+   if (sparse && cnt[r] == 0) return;
+   const int k0 = threadIdx.x * 4;
+@@ -292,32 +290,38 @@ __device__ __forceinline__ void merge_rows(const float* po, const float* pm, con
+     }
+     m = nm;
+   }
+-  if constexpr (PART) {
+-    for (int j = 0; j < 4; ++j) qo[(r * heads + h) * LW + k0 + j] = o[j];
+-    if (threadIdx.x == 0) {
+-      qm[r * heads + h] = m;
+-      ql[r * heads + h] = l;
+-    }
+-  } else {
+-    for (int j = 0; j < 4; ++j)
+-      out[(r * heads + h) * LW + k0 + j] = __float2bfloat16_rn(glm_triton::div_full(o[j], l));
+-  }
+-}
+-
+-}  // namespace glm_attn
+-
+-// latent._merge, block (row, head), 128 threads: chunks merged in order, o / l by div.full; skips sparse count-0 rows.
+-extern "C" __global__ void __launch_bounds__(128)
+-    tf_glm_merge(const float* po, const float* pm, const float* pl, __nv_bfloat16* out, const int* cnt, int64_t rows,
+-                 int64_t heads, int nch, int sparse) {
+-  glm_attn::merge_rows<false>(po, pm, pl, out, nullptr, nullptr, nullptr, cnt, rows, heads, nch, sparse);
++  for (int j = 0; j < 4; ++j) out[(r * heads + h) * LW + k0 + j] = __float2bfloat16_rn(glm_triton::div_full(o[j], l));
+ }
+ 
+-// One rank's chunks of a split cache merged, block (row, head): o, m and l in fp32 as one chunk's (nch 0: empty).
++// tf_glm_merge's loop (kept apart: GLM's SASS) over one rank's chunks of a split cache; o, m, l kept in fp32.
+ extern "C" __global__ void __launch_bounds__(128)
+     tf_ling_merge_part(const float* po, const float* pm, const float* pl, float* qo, float* qm, float* ql,
+                        int64_t rows, int64_t heads, int nch) {
+-  glm_attn::merge_rows<true>(po, pm, pl, nullptr, qo, qm, ql, nullptr, rows, heads, nch, 0);
++  constexpr int LW = glm_attn::LW;
++  const int64_t r = blockIdx.x, h = blockIdx.y;
++  const int k0 = threadIdx.x * 4;
++  float m = -INFINITY, l = 0.0f, o[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++  for (int c = 0; c < nch; ++c) {
++    const int64_t base = (c * rows + r) * heads + h;
++    const float cm = pm[base], cl = pl[base];
++    const bool active = cl > 0.0f;
++    const float nm = active ? fmaxf(m, cm) : m;
++    const float b = active ? glm_triton::exp_approx(cm - nm) : 0.0f;
++    if (c == 0) {
++      for (int j = 0; j < 4; ++j) o[j] = __fmaf_rn(b, po[base * LW + k0 + j], 0.0f);
++      l = __fmaf_rn(b, cl, 0.0f);
++    } else {
++      const float a = active ? (m == -INFINITY ? 0.0f : glm_triton::exp_approx(m - nm)) : 1.0f;
++      for (int j = 0; j < 4; ++j) o[j] = __fmaf_rn(o[j], a, __fmul_rn(b, po[base * LW + k0 + j]));
++      l = __fmaf_rn(l, a, __fmul_rn(b, cl));
++    }
++    m = nm;
++  }
++  for (int j = 0; j < 4; ++j) qo[(r * heads + h) * LW + k0 + j] = o[j];
++  if (threadIdx.x == 0) {
++    qm[r * heads + h] = m;
++    ql[r * heads + h] = l;
++  }
+ }
+ 
+ // sparse._scores, block (row, L pool blocks) of 4 warps, 16 pools a warp: sum_h w relu(dots scale), -inf past visible.
+diff --git a/zig/tests/cuda/contract_ling_more.zig b/zig/tests/cuda/contract_ling_more.zig
+index 428b98d54..b3b4086d6 100644
+--- a/zig/tests/cuda/contract_ling_more.zig
++++ b/zig/tests/cuda/contract_ling_more.zig
+@@ -461,7 +461,7 @@ fn splitPrepare(self: *Chunks) !void {
+         var j: usize = 0;
+         while (2 * j + w < self.nch) : (j += 1) {
+             const first = (2 * j + w) * chunk;
+-            const n = @min(chunk, span - first);
++            const n: usize = @min(chunk, span - first); // @min with the comptime 512 is a u10: n * kw would wrap
+             @memcpy(host[j * chunk * kw ..][0 .. n * kw], self.cache[first * kw ..][0 .. n * kw]);
+         }
+         self.halves[w] = try self.rig.input(std.mem.sliceAsBytes(host));
+-- 
+2.53.0
+

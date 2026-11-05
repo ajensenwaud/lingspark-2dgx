@@ -1,0 +1,209 @@
+From 9a5b7904bd4c44f388051f7ea7e40f7e3359d770 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 21:02:35 +1100
+Subject: [PATCH 03/26] ling: GLM's absorb_q, expand_v and topk entries back to
+ v1.2.0's code, Ling's twins beside them
+
+Templating GLM's three device bodies kept their arithmetic but moved sm_120/121 SASS (cuda_sass_identity:
+6 functions changed). GLM's entries are v1.2.0's text again; Ling's 128-wide absorb/expand and its
+group-limited top-k are templated twins in the same headers.
+---
+ zig/kernels/cuda/glm_glue_latent.cuh | 86 ++++++++++++++++++++++------
+ zig/kernels/cuda/glm_glue_moe.cuh    | 52 +++++++++++++++--
+ 2 files changed, 113 insertions(+), 25 deletions(-)
+
+diff --git a/zig/kernels/cuda/glm_glue_latent.cuh b/zig/kernels/cuda/glm_glue_latent.cuh
+index ec2aadabe..a6d741172 100644
+--- a/zig/kernels/cuda/glm_glue_latent.cuh
++++ b/zig/kernels/cuda/glm_glue_latent.cuh
+@@ -6,9 +6,69 @@
+ using namespace glm_triton;
+ 
+ // latent._absorb_q(_rows), block (head, 32 latent columns, row block) of 128 threads; rows per block change no bits.
+-// q_nope D wide (GLM 256, Ling 128) in q rows qs apart per head, qa rows qaw apart (GLM's entry: D, 512).
++extern "C" __global__ void __launch_bounds__(128)
++    tf_glm_absorb_q(const __nv_bfloat16* q, const __nv_bfloat16* wk, __nv_bfloat16* qa, int64_t rows, int64_t heads,
++                    int64_t rb) {
++  constexpr int D = 256, LW = 512;
++  __shared__ float smem[128];
++  const int t = threadIdx.x, k0 = t >> 2, nq = t & 3, warp = t >> 5;
++  const int64_t h = blockIdx.x, n0 = (int64_t)blockIdx.y * 32 + nq * 8, r0 = blockIdx.z * rb;
++  float w[8][8];
++  for (int rep = 0; rep < 8; ++rep)
++    for (int j = 0; j < 8; ++j) w[rep][j] = bf(wk[(h * D + k0 + 32 * rep) * LW + n0 + j]);
++  for (int64_t r = r0; r < r0 + rb && r < rows; ++r) {
++    float qv[8];
++    for (int rep = 0; rep < 8; ++rep) qv[rep] = bf(q[(r * heads + h) * D + k0 + 32 * rep]);
++    for (int j = 0; j < 8; ++j) {
++      float a = fmul(w[1][j], qv[1]);
++      a = __fmaf_rn(w[0][j], qv[0], a);
++      for (int rep = 2; rep < 8; ++rep) a = __fmaf_rn(w[rep][j], qv[rep], a);
++      for (int o = 16; o >= 4; o >>= 1) a = a + __shfl_xor_sync(0xffffffffu, a, o);
++      if ((t & 28) == 0) smem[(nq * 8 + j) * 4 + warp] = a;
++    }
++    __syncthreads();
++    float v = smem[t];
++    v = v + __shfl_xor_sync(0xffffffffu, v, 2);
++    v = v + __shfl_xor_sync(0xffffffffu, v, 1);
++    if ((t & 3) == 0) qa[(r * heads + h) * LW + (int64_t)blockIdx.y * 32 + t / 4] = __float2bfloat16_rn(v);
++    __syncthreads();
++  }
++}
++
++// latent._expand_v(_rows), block (head, 16 outputs, row block) of 128 threads: o . wv by fma, lanes xor 16 .. 1.
++extern "C" __global__ void __launch_bounds__(128)
++    tf_glm_expand_v(const __nv_bfloat16* ol, const __nv_bfloat16* wv, __nv_bfloat16* out, int64_t rows,
++                    int64_t heads, int64_t rb) {
++  constexpr int DV = 256, LW = 512;
++  __shared__ float smem[32];
++  const int t = threadIdx.x, lane = t & 31, warp = t >> 5, kb = (warp & 1) * 256 + lane * 8, nb = warp >> 1;
++  const int64_t h = blockIdx.x, n0 = (int64_t)blockIdx.y * 16, r0 = blockIdx.z * rb;
++  float w[8][8];
++  for (int rep = 0; rep < 8; ++rep)
++    for (int j = 0; j < 8; ++j) w[rep][j] = bf(wv[(h * DV + n0 + nb + 2 * rep) * LW + kb + j]);
++  for (int64_t r = r0; r < r0 + rb && r < rows; ++r) {
++    float o[8];
++    for (int j = 0; j < 8; ++j) o[j] = bf(ol[(r * heads + h) * LW + kb + j]);
++    for (int rep = 0; rep < 8; ++rep) {
++      float a = fmul(w[rep][1], o[1]);
++      a = __fmaf_rn(w[rep][0], o[0], a);
++      for (int j = 2; j < 8; ++j) a = __fmaf_rn(w[rep][j], o[j], a);
++      for (int s = 16; s > 0; s >>= 1) a = a + __shfl_xor_sync(0xffffffffu, a, s);
++      if (lane == 0) smem[(nb + 2 * rep) * 2 + (warp & 1)] = a;
++    }
++    __syncthreads();
++    if (t < 32) {
++      float v = smem[t];
++      v = v + __shfl_xor_sync(0xffffffffu, v, 1);
++      if ((t & 1) == 0) out[(r * heads + h) * DV + n0 + t / 2] = __float2bfloat16_rn(v);
++    }
++    __syncthreads();
++  }
++}
++
++// Ling's twin of tf_glm_absorb_q (GLM's keeps its SASS): q_nope D wide in q rows qs apart a head, qa rows qaw apart.
+ template <int D>
+-__device__ __forceinline__ void absorb_q(const __nv_bfloat16* q, const __nv_bfloat16* wk, __nv_bfloat16* qa,
++__device__ __forceinline__ void ling_absorb_q(const __nv_bfloat16* q, const __nv_bfloat16* wk, __nv_bfloat16* qa,
+                                          int64_t rows, int64_t heads, int64_t rb, int64_t qs, int64_t qaw) {
+   constexpr int LW = 512, R = D / 32;
+   __shared__ float smem[128];
+@@ -36,15 +96,9 @@ __device__ __forceinline__ void absorb_q(const __nv_bfloat16* q, const __nv_bflo
+   }
+ }
+ 
+-extern "C" __global__ void __launch_bounds__(128)
+-    tf_glm_absorb_q(const __nv_bfloat16* q, const __nv_bfloat16* wk, __nv_bfloat16* qa, int64_t rows, int64_t heads,
+-                    int64_t rb) {
+-  absorb_q<256>(q, wk, qa, rows, heads, rb, 256, 512);
+-}
+-
+-// latent._expand_v(_rows), block (head, 16 outputs, row block) of 128 threads: o . wv by fma, lanes xor 16 .. 1.
+-template <int DV>  // v heads DV wide: GLM 256, Ling 128
+-__device__ __forceinline__ void expand_v(const __nv_bfloat16* ol, const __nv_bfloat16* wv, __nv_bfloat16* out,
++// Ling's twin of tf_glm_expand_v (GLM's keeps its SASS): v heads DV wide.
++template <int DV>
++__device__ __forceinline__ void ling_expand_v(const __nv_bfloat16* ol, const __nv_bfloat16* wv, __nv_bfloat16* out,
+                                          int64_t rows, int64_t heads, int64_t rb) {
+   constexpr int LW = 512;
+   __shared__ float smem[32];
+@@ -73,24 +127,18 @@ __device__ __forceinline__ void expand_v(const __nv_bfloat16* ol, const __nv_bfl
+   }
+ }
+ 
+-extern "C" __global__ void __launch_bounds__(128)
+-    tf_glm_expand_v(const __nv_bfloat16* ol, const __nv_bfloat16* wv, __nv_bfloat16* out, int64_t rows,
+-                    int64_t heads, int64_t rb) {
+-  expand_v<256>(ol, wv, out, rows, heads, rb);
+-}
+-
+ // Ling: q_nope the first 128 of each head's qs columns, qa rows qaw (576: the latent, then the roped q_rope).
+ extern "C" __global__ void __launch_bounds__(128)
+     tf_ling_absorb_q_128(const __nv_bfloat16* q, const __nv_bfloat16* wk, __nv_bfloat16* qa, int64_t rows,
+                          int64_t heads, int64_t rb, int64_t qs, int64_t qaw) {
+-  absorb_q<128>(q, wk, qa, rows, heads, rb, qs, qaw);
++  ling_absorb_q<128>(q, wk, qa, rows, heads, rb, qs, qaw);
+ }
+ 
+ // Ling's 128-wide v heads.
+ extern "C" __global__ void __launch_bounds__(128)
+     tf_ling_expand_v_128(const __nv_bfloat16* ol, const __nv_bfloat16* wv, __nv_bfloat16* out, int64_t rows,
+                          int64_t heads, int64_t rb) {
+-  expand_v<128>(ol, wv, out, rows, heads, rb);
++  ling_expand_v<128>(ol, wv, out, rows, heads, rb);
+ }
+ 
+ // Ling's rope (exl3's GPT-J pairs), block (row, head) of 32: x + r xs + h xh into out + r os + h oh, in place ok.
+diff --git a/zig/kernels/cuda/glm_glue_moe.cuh b/zig/kernels/cuda/glm_glue_moe.cuh
+index 688ab5686..00e2d016a 100644
+--- a/zig/kernels/cuda/glm_glue_moe.cuh
++++ b/zig/kernels/cuda/glm_glue_moe.cuh
+@@ -162,7 +162,52 @@ extern "C" __global__ void __launch_bounds__(128)
+ }
+ 
+ // glue._topk, a warp a row: top_k by sigmoid + bias (ties to lower id), normed if `norm`, x scale; then shared expert.
+-// GROUPS: only experts in the topk_group groups of the best top-2 sums (Ling's n_group 8, keep 4) compete.
++extern "C" __global__ void __launch_bounds__(32)
++    tf_glm_topk(const float* logits, const float* bias, int* pick, float* wts, float scale, int ne, int top_k,
++                int norm) {
++  constexpr int MAXE = 16;  // 512 experts a row
++  const int64_t r = blockIdx.x;
++  const int lane = threadIdx.x;
++  float score[MAXE], choice[MAXE];
++  for (int i = 0; i < MAXE; ++i) {
++    const int e = i * 32 + lane;
++    score[i] = e < ne ? div_full(1.0f, exp_approx(0.0f - logits[r * ne + e]) + 1.0f) : 0.0f;
++    choice[i] = e < ne ? score[i] + bias[e] : -INFINITY;
++  }
++  float total = 0.0f, mine = 0.0f;
++  int mine_id = 0;
++  for (int k = 0; k < top_k; ++k) {
++    float mx = choice[0];
++    for (int i = 1; i < MAXE; ++i) mx = fmaxf(mx, choice[i]);
++    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
++    int id = 1 << 30;
++    for (int i = MAXE - 1; i >= 0; --i)
++      if (choice[i] == mx) id = i * 32 + lane;
++    for (int o = 16; o > 0; o >>= 1) id = min(id, __shfl_xor_sync(0xffffffffu, id, o));
++    float sk = 0.0f;
++    for (int i = 0; i < MAXE; ++i)
++      if (i * 32 + lane == id) {
++        sk = score[i];
++        choice[i] = -INFINITY;
++      }
++    sk = __shfl_sync(0xffffffffu, sk, id & 31);
++    total = total + sk;
++    if (lane == k) {
++      mine = sk;
++      mine_id = id;
++    }
++  }
++  if (lane < top_k) {
++    const float v = norm ? div_full(mine, total + 1e-20f) : mine;
++    pick[r * (top_k + 1) + lane] = mine_id;
++    wts[r * (top_k + 1) + lane] = __fmul_rn(v, scale);
++  } else if (lane == top_k) {
++    pick[r * (top_k + 1) + lane] = ne;
++    wts[r * (top_k + 1) + lane] = 1.0f;
++  }
++}
++
++// Ling's twin of tf_glm_topk (GLM's keeps its SASS): experts outside the topk_group best groups of n_group drop out.
+ namespace glm_moe {
+ template <bool GROUPS>
+ __device__ __forceinline__ void topk_rows(const float* logits, const float* bias, int* pick, float* wts, float scale,
+@@ -213,11 +258,6 @@ __device__ __forceinline__ void topk_rows(const float* logits, const float* bias
+ }
+ }  // namespace glm_moe
+ 
+-extern "C" __global__ void __launch_bounds__(32)
+-    tf_glm_topk(const float* logits, const float* bias, int* pick, float* wts, float scale, int ne, int top_k,
+-                int norm) {
+-  glm_moe::topk_rows<false>(logits, bias, pick, wts, scale, ne, top_k, norm, 1, 1);
+-}
+ 
+ // Ling's group-limited glue._topk: n_group groups by their top-2 sums, the best topk_group kept (lower group on ties).
+ extern "C" __global__ void __launch_bounds__(32)
+-- 
+2.53.0
+

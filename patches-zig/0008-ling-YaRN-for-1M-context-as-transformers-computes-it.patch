@@ -1,0 +1,1883 @@
+From 208bd0f11c27e6d223d4690ee6f4cf21625d2ca9 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 22:56:27 +1100
+Subject: [PATCH 08/26] ling: YaRN for 1M context as transformers computes it
+ (rope.zig: rope_scaling yarn only, inv_freq and attention factor, MLA mscale;
+ TF_LING_YARN=auto|on|off, auto past the native window), attention rows capped
+ by partials bytes for 1M positions; the TP=2 path (rank cuts on EXL3's
+ 128-wide blocks, one reduce a block, vocabulary-split head, GLM's step link
+ and follower) under test
+
+---
+ zig/kernels/cuda/glm_glue_latent.cuh   |   4 +-
+ zig/src/families/ling/block_mla.zig    |  13 +-
+ zig/src/families/ling/config.zig       |  15 +-
+ zig/src/families/ling/config_test.zig  |  17 +-
+ zig/src/families/ling/cuda.zig         |   5 +
+ zig/src/families/ling/engine.zig       | 121 ++++++++++++--
+ zig/src/families/ling/forward.zig      |  20 ++-
+ zig/src/families/ling/graph.zig        |   8 +-
+ zig/src/families/ling/host_test.zig    |   1 +
+ zig/src/families/ling/lanes.zig        |   1 +
+ zig/src/families/ling/native.zig       |  82 +++++++++-
+ zig/src/families/ling/ops.zig          |   6 +-
+ zig/src/families/ling/rope.zig         | 180 +++++++++++++++++++++
+ zig/src/families/ling/state.zig        |  41 +++--
+ zig/src/families/ling/tp.zig           | 124 ++++++++++++++
+ zig/src/families/ling/weights.zig      |  74 +++++++--
+ zig/src/families/ling/weights_cut.zig  | 214 +++++++++++++++++++++++++
+ zig/src/families/ling/weights_proj.zig |  28 ++--
+ zig/tests/cuda/ling_cmds.zig           |   3 +
+ zig/tests/cuda/ling_exl3_layers.zig    |  14 ++
+ zig/tests/cuda/ling_ref_mla.zig        |  27 ++--
+ zig/tests/cuda/ling_synth.zig          |  10 +-
+ zig/tests/cuda/ling_tp.zig             |  89 ++++++++++
+ 23 files changed, 1012 insertions(+), 85 deletions(-)
+ create mode 100644 zig/src/families/ling/rope.zig
+ create mode 100644 zig/src/families/ling/tp.zig
+ create mode 100644 zig/src/families/ling/weights_cut.zig
+ create mode 100644 zig/tests/cuda/ling_tp.zig
+
+diff --git a/zig/kernels/cuda/glm_glue_latent.cuh b/zig/kernels/cuda/glm_glue_latent.cuh
+index a6d741172..52c075800 100644
+--- a/zig/kernels/cuda/glm_glue_latent.cuh
++++ b/zig/kernels/cuda/glm_glue_latent.cuh
+@@ -144,13 +144,15 @@ extern "C" __global__ void __launch_bounds__(128)
+ // Ling's rope (exl3's GPT-J pairs), block (row, head) of 32: x + r xs + h xh into out + r os + h oh, in place ok.
+ extern "C" __global__ void __launch_bounds__(32)
+     tf_ling_rope(const __nv_bfloat16* x, int64_t xs, int64_t xh, __nv_bfloat16* out, int64_t os, int64_t oh,
+-                 const int* pos, const float* inv_freq) {
++                 const int* pos, const float* inv_freq, float scale) {
+   const int64_t r = blockIdx.x, h = blockIdx.y;
+   const int i = threadIdx.x;  // pair i at angle fp32 inv_freq[i] (pos + r); explicit rn ops, no fma contraction
+   const __nv_bfloat16* src = x + r * xs + h * xh + 2 * i;
+   const float x0 = bf(src[0]), x1 = bf(src[1]);
+   float s, c;
+   sincosf(__fmul_rn(inv_freq[i], (float)((int64_t)pos[0] + r)), &s, &c);
++  s = __fmul_rn(s, scale);  // YaRN's attention factor on cos and sin (exact at 1)
++  c = __fmul_rn(c, scale);
+   __nv_bfloat16* dst = out + r * os + h * oh + 2 * i;
+   dst[0] = __float2bfloat16_rn(__fsub_rn(__fmul_rn(x0, c), __fmul_rn(x1, s)));
+   dst[1] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(x1, c), __fmul_rn(x0, s)));
+diff --git a/zig/src/families/ling/block_mla.zig b/zig/src/families/ling/block_mla.zig
+index dc5fd1f21..d97c186d7 100644
+--- a/zig/src/families/ling/block_mla.zig
++++ b/zig/src/families/ling/block_mla.zig
+@@ -43,12 +43,17 @@ pub fn block(o: Ops, b: *const state.Buffers, a: weights.Mla, ab: graph.Absorb,
+     for (segs) |sg| {
+         const st = sg.st;
+         const r = sg.row0;
+-        try ops.rope(&o.m.ling, o.s, .{ .x = b.q + (r * H * qk + nope) * 2, .x_row = H * qk, .x_head = qk, .out = b.qa + (r * H * kw + lw) * 2, .o_row = H * kw, .o_head = kw }, sg.rows, H, st.pos_dev, g.freq);
+-        try ops.rope(&o.m.ling, o.s, .{ .x = b.kv + (r * kvs + lw) * 2, .x_row = kvs, .x_head = 0, .out = b.lat + (r * kw + lw) * 2, .o_row = kw, .o_head = 0 }, sg.rows, 1, st.pos_dev, g.freq);
++        var rp = st.pos_dev; // the rope's first position: the cache's, or past it by a check's rope_base
++        if (st.rope_base != 0) {
++            try o.addI32(st.pos_dev, st.rope_base, b.at + 4);
++            rp = b.at + 4;
++        }
++        try ops.rope(&o.m.ling, o.s, .{ .x = b.q + (r * H * qk + nope) * 2, .x_row = H * qk, .x_head = qk, .out = b.qa + (r * H * kw + lw) * 2, .o_row = H * kw, .o_head = kw }, sg.rows, H, rp, g.freq, g.rope_scale);
++        try ops.rope(&o.m.ling, o.s, .{ .x = b.kv + (r * kvs + lw) * 2, .x_row = kvs, .x_head = 0, .out = b.lat + (r * kw + lw) * 2, .o_row = kw, .o_head = 0 }, sg.rows, 1, rp, g.freq, g.rope_scale);
+         try latent.latentWrite(o.set(), o.s, b.lat + r * kw * 2, kw, st.cacheAt(mi), .{}, st.pos_dev, sg.rows, kw);
+         var r0: usize = 0;
+-        while (r0 < sg.rows) : (r0 += state.att_rows) {
+-            const m = @min(state.att_rows, sg.rows - r0);
++        while (r0 < sg.rows) : (r0 += b.ar) {
++            const m = @min(b.ar, sg.rows - r0);
+             var at = st.pos_dev;
+             if (r0 > 0) {
+                 try o.addI32(st.pos_dev, r0, b.at);
+diff --git a/zig/src/families/ling/config.zig b/zig/src/families/ling/config.zig
+index 8efc511c1..64a74ec64 100644
+--- a/zig/src/families/ling/config.zig
++++ b/zig/src/families/ling/config.zig
+@@ -1,6 +1,7 @@
+ //! Ling-3.1-flash's shape from config.json (bailing_hybrid), refusing what the engine does not run.
+ const std = @import("std");
+ const route = @import("route.zig");
++const rope = @import("rope.zig");
+ 
+ /// Backbone plus MTP layers the per-layer tables hold (Ling-3.1-flash: 72 + 1).
+ pub const max_layers = 80;
+@@ -43,6 +44,9 @@ pub const Config = struct {
+     rope_theta: f64,
+     rope_dim: u32, // qk_rope_head_dim: the modeling's rotary embedding takes it whole (partial factor 1)
+     rope_style: RopeStyle,
++    max_pos: u32, // max_position_embeddings: the native window when rope_scaling is null
++    rope_scaling: ?rope.Yarn, // config.json's (yarn only)
++    yarn: ?rope.Yarn, // what the forward applies (the engine's TF_LING_YARN choice; parse leaves it null)
+     group: u32, // layer_group_size: MLA on each group's last layer and on the tail past the last full group
+     dense_layers: u32, // first_k_dense_replace
+     dense_inter: u32,
+@@ -100,9 +104,10 @@ pub const Config = struct {
+         return c.nope + c.rope_dim;
+     }
+ 
+-    /// MLA's softmax scale, qk_head_dim^-0.5 (no rope_scaling mscale: parse refuses rope_scaling).
++    /// MLA's softmax scale, qk_head_dim^-0.5, times YaRN's mscale_all_dim factor squared as the modeling applies it.
+     pub fn smScale(c: *const Config) f32 {
+-        return @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(c.qkDim()))));
++        const s = 1.0 / @sqrt(@as(f64, @floatFromInt(c.qkDim())));
++        return @floatCast(if (c.yarn) |y| s * rope.smFactor(y) else s);
+     }
+ 
+     /// Group-limited routing: n_group groups, the best topk_group kept (parse holds those bounds).
+@@ -429,10 +434,8 @@ fn parseConfig(gpa: std.mem.Allocator, json: []const u8, why: *Why) !Config {
+     c.v_dim = try int(o, "v_head_dim", why);
+     c.rope_theta = try float(o, "rope_theta", why);
+     c.rope_style = if (try flag(o, "rope_interleave", true, why)) .gptj else .neox;
+-    if (o.get("rope_scaling")) |r| if (r != .null) {
+-        why.set("rope_scaling: the engine's MLA has plain rope only", .{});
+-        return error.RopeScaling;
+-    };
++    c.max_pos = if (o.get("max_position_embeddings")) |_| try int(o, "max_position_embeddings", why) else 262144;
++    c.rope_scaling = try rope.parse(o, c.rope_theta, c.max_pos, why);
+     const gate = o.get("gated_attention_proj_granularity_type") orelse std.json.Value.null;
+     c.head_gate = gate == .string and std.mem.eql(u8, gate.string, "head_wise");
+     if (gate != .null and !c.head_gate) {
+diff --git a/zig/src/families/ling/config_test.zig b/zig/src/families/ling/config_test.zig
+index 3047cad08..a6484bf08 100644
+--- a/zig/src/families/ling/config_test.zig
++++ b/zig/src/families/ling/config_test.zig
+@@ -119,7 +119,9 @@ test "refusals: one edit each, with the reason" {
+     try refused("\"use_kda_lora\": false", "\"use_kda_lora\": true", error.KdaLora, "no_kda_lora");
+     try refused("\"kda_safe_gate\": true", "\"kda_safe_gate\": false", error.KdaGate, "kda_safe_gate");
+     try refused("\"head_wise\"", "\"element_wise\"", error.GateGranularity, "element_wise");
+-    try refused("\"rope_scaling\": null", "\"rope_scaling\": {\"type\": \"yarn\", \"factor\": 4}", error.RopeScaling, "rope_scaling");
++    try refused("\"rope_scaling\": null", "\"rope_scaling\": {\"type\": \"yarn\", \"factor\": 4}", error.RopeScaling, "original_max");
++    try refused("\"rope_scaling\": null", "\"rope_scaling\": {\"rope_type\": \"linear\", \"factor\": 4}", error.RopeScaling, "type linear");
++    try refused("\"rope_scaling\": null", "\"rope_scaling\": {\"rope_type\": \"yarn\", \"factor\": 2, \"original_max_position_embeddings\": 65536}", error.RopeScaling, "differs");
+     try refused("\"n_group\": 8", "\"n_group\": 7", error.Routing, "groups");
+     try refused("\"topk_group\": 4", "\"topk_group\": 9", error.Routing, "groups");
+     try refused("\"num_experts\": 512", "\"num_experts\": 1024", error.Routing, "glue.select");
+@@ -138,6 +140,19 @@ test "refusals: one edit each, with the reason" {
+     try refused("\"hidden_size\": 4096", "\"hidden_sz\": 4096", error.BadConfig, "hidden_size");
+ }
+ 
++test "SGLang's 1M override parses to yarn factor 4 over 262144; partial_rotary_factor is read past (64 columns turn)" {
++    const json = try edit("\"rope_scaling\": null", "\"rope_scaling\": {\"rope_type\": \"yarn\", \"factor\": 4.0, \"original_max_position_embeddings\": 262144, \"rope_theta\": 6000000, \"partial_rotary_factor\": 0.5}");
++    defer t.allocator.free(json);
++    var why: config.Why = .{};
++    var c = try config.parse(t.allocator, json, &why);
++    try t.expectEqual(@as(f64, 4), c.rope_scaling.?.factor);
++    try t.expectEqual(@as(u32, 262144), c.rope_scaling.?.original);
++    try t.expectEqual(@as(?@import("rope.zig").Yarn, null), c.yarn);
++    const plain = c.smScale();
++    c.yarn = c.rope_scaling;
++    try t.expectEqual(plain, c.smScale()); // no mscale_all_dim: the softmax scale stays qk_head_dim^-0.5
++}
++
+ test "optional keys: no quantization reads bf16, a null q_lora_rank one q_proj" {
+     const b = try edit("\"q_lora_rank\": 1536", "\"q_lora_rank\": null");
+     defer t.allocator.free(b);
+diff --git a/zig/src/families/ling/cuda.zig b/zig/src/families/ling/cuda.zig
+index c3cf69f49..1ed4d65c2 100644
+--- a/zig/src/families/ling/cuda.zig
++++ b/zig/src/families/ling/cuda.zig
+@@ -2,6 +2,7 @@
+ const std = @import("std");
+ const glm = @import("glm_cuda");
+ pub const config = @import("config.zig");
++pub const rope = @import("rope.zig");
+ pub const names = @import("names.zig");
+ pub const weights = @import("weights.zig");
+ pub const synth = @import("synth.zig");
+@@ -13,6 +14,7 @@ pub const mtp = @import("mtp.zig");
+ pub const engine = @import("engine.zig");
+ pub const lanes = @import("lanes.zig");
+ pub const native = @import("native.zig");
++pub const tp = @import("tp.zig");
+ pub const fake_driver = @import("fake_driver.zig");
+ 
+ const Config = config.Config;
+@@ -27,6 +29,9 @@ pub fn limits(c: *const Config, i: u32) Limits {
+ 
+ test {
+     _ = @import("config_test.zig");
++    _ = @import("rope.zig");
++    _ = @import("tp.zig");
++    _ = @import("weights_cut.zig");
+     _ = @import("names_test.zig");
+     _ = @import("synth.zig");
+     _ = ops;
+diff --git a/zig/src/families/ling/engine.zig b/zig/src/families/ling/engine.zig
+index 4d3b4ae1d..900692cd1 100644
+--- a/zig/src/families/ling/engine.zig
++++ b/zig/src/families/ling/engine.zig
+@@ -6,6 +6,8 @@ const config = @import("config.zig");
+ const weights = @import("weights.zig");
+ const fw = @import("forward.zig");
+ const head = @import("mtp.zig");
++const rope = @import("rope.zig");
++const tp = @import("tp.zig");
+ 
+ const sampler = glm.sampler;
+ pub const Sampling = sampler.Sampling;
+@@ -25,6 +27,9 @@ pub const Options = struct {
+     prompt_rows: usize = prompt_rows, // rows a prompt chunk takes at most
+     mtp: bool = false, // load the MTP layer, if the checkpoint has one, and draft with it
+     layers: ?[]const u32 = null, // a thin model's backbone layers, ascending (checks on a real checkpoint); null: all
++    yarn: rope.Mode = .auto, // TF_LING_YARN: auto turns YaRN on when the context passes the native window
++    context: ?usize = null, // the served context auto compares (null: the capacity)
++    group: ?*const cuda.tp_group.Group = null, // TP=2: the ranks' group (this rank's share loads, blocks reduce)
+ };
+ 
+ /// Rank 0's word on its request (cancelled or not), asked before each chunk.
+@@ -75,6 +80,10 @@ pub const Engine = struct {
+     chunk: usize,
+     snaps: std.AutoHashMapUnmanaged(u64, Snap) = .empty,
+     next_snap: u64 = 1,
++    link: ?*tp.Link = null, // TP=2: the steps' link (rank 0 sends on it when `lead`, rank 1 receives in tp.follow)
++    lead: bool = false,
++    asleep: bool = false, // rank 0: the other ranks sleep on their lines until its next step
++    dropped: std.ArrayList(u64) = .empty, // kept states dropped since the last step: rank 1 drops them first
+ 
+     /// The checkpoint at `dir` in its own format.
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, dir: []const u8, o: Options) !*Engine {
+@@ -85,7 +94,12 @@ pub const Engine = struct {
+             return err;
+         };
+         defer opened.ck.close();
+-        const c = opened.c;
++        var c = opened.c;
++        c.yarn = rope.resolve(c.rope_scaling, c.max_pos, o.yarn, o.context orelse o.capacity) catch |err| {
++            std.log.err("{s}: TF_LING_YARN=off keeps the plain rope, trained to {d} positions: serve less or allow YaRN", .{ dir, c.max_pos });
++            return err;
++        };
++        if (c.yarn) |y| std.log.info("{s}: YaRN factor {d} over {d} positions (attention factor {d:.6})", .{ dir, y.factor, y.original, rope.attentionFactor(y) });
+         const mtp = o.mtp and c.mtp > 0;
+         const e = try gpa.create(Engine);
+         errdefer gpa.destroy(e);
+@@ -101,13 +115,15 @@ pub const Engine = struct {
+             defer gpa.free(all);
+             var pack = try cuda.modelopt.Packer.load(d);
+             defer pack.unload();
+-            e.w = try weights.load(gpa, d, e.stream, &pack, &opened.ck, c, all, .{});
++            const g = o.group;
++            e.w = try weights.load(gpa, d, e.stream, &pack, &opened.ck, c, all, .{ .rank = if (g) |x| @intCast(x.rank) else 0, .world = if (g) |x| @intCast(x.world) else 1 });
+         }
+         errdefer e.w.drop(weights.drains(e.stream)); // leaked on a failed drain: a queued launch may read them
+         e.main = e.w;
+         e.main.layers = e.w.layers[0..layers.len];
+         e.g = try fw.Graph.init(gpa, d, &e.m, e.stream, &e.main);
+         errdefer e.g.drop(weights.drains(e.stream)); // as e.w
++        e.g.tp = o.group;
+         if (mtp) {
+             e.mtp = @as(head.Head, undefined);
+             e.mtp.?.init(gpa, d, &e.m, e.stream, &e.w, o.prompt_rows, o.capacity) catch |err| {
+@@ -116,6 +132,7 @@ pub const Engine = struct {
+             };
+         }
+         errdefer if (e.mtp) |*h| h.deinit();
++        if (e.mtp) |*h| h.g.tp = o.group;
+         e.bp = try fw.Buffers.init(d, &e.m, &e.w, o.prompt_rows, true, o.capacity);
+         errdefer e.bp.deinit();
+         e.bd = try fw.Buffers.init(d, &e.m, &e.w, window_rows, false, o.capacity);
+@@ -151,6 +168,7 @@ pub const Engine = struct {
+         var it = e.snaps.valueIterator();
+         while (it.next()) |s| e.freeSnap(s);
+         e.snaps.deinit(e.gpa);
++        e.dropped.deinit(e.gpa);
+         for (0..e.seqs.items.len) |i| e.free(i);
+         e.seqs.deinit(e.gpa);
+         e.pairs.free();
+@@ -189,8 +207,48 @@ pub const Engine = struct {
+         e.slot = slot;
+     }
+ 
++    /// TP: rank 0's step on `slot` to the other ranks, the drops queued before it first (nothing elsewhere).
++    fn sendOn(e: *Engine, slot: u32, h: tp.Header, ids: []const u32) !void {
++        const l = e.link orelse return;
++        if (!e.lead) return;
++        if (e.asleep) { // the other ranks wait on their lines, not in NCCL: wake them for this step
++            cuda.tp_watch.wake();
++            e.asleep = false;
++        }
++        const put = e.m.glue.put_words;
++        while (e.dropped.items.len > 0) {
++            var ids32: [64]u32 = undefined;
++            const n = @min(e.dropped.items.len, ids32.len);
++            for (ids32[0..n], e.dropped.items[0..n]) |*x, id| x.* = @intCast(id);
++            try l.send(put, .{ .kind = @backingInt(tp.Kind.drop) }, ids32[0..n]);
++            e.dropped.replaceRangeAssumeCapacity(0, n, &.{});
++        }
++        var hh = h;
++        hh.slot = slot;
++        try l.send(put, hh, ids);
++    }
++
++    fn send(e: *Engine, kind: tp.Kind, h: tp.Header, ids: []const u32) !void {
++        var hh = h;
++        hh.kind = @backingInt(kind);
++        return e.sendOn(e.slot, hh, ids);
++    }
++
++    /// TP: no stream left on rank 0, so the other ranks sleep on their lines until its next step.
++    pub fn idle(e: *Engine) !void {
++        if (!e.lead or e.asleep or !cuda.tp_watch.open()) return;
++        try e.send(.idle, .{ .kind = 0 }, &.{});
++        e.asleep = true;
++    }
++
++    /// TP: rank 0 is closing; the other ranks leave their loops.
++    pub fn end(e: *Engine) !void {
++        try e.send(.end, .{ .kind = 0 }, &.{});
++    }
++
+     /// Frees slot `slot`'s sequence (slot 0 stays) and binds slot 0.
+     pub fn release(e: *Engine, slot: u32) void {
++        e.sendOn(slot, .{ .kind = @backingInt(tp.Kind.release) }, &.{}) catch |err| std.log.err("release step to the other ranks: {s}", .{@errorName(err)});
+         if (slot != 0) e.free(slot);
+         e.cur = e.seqs.items[0].?;
+         e.slot = 0;
+@@ -227,6 +285,16 @@ pub const Engine = struct {
+     /// A fresh sequence with `sampling` (null or temperature 0: greedy).
+     pub fn begin(e: *Engine, sampling: ?Sampling) !void {
+         e.cur.sampling = sampler.check(sampling);
++        var sh: tp.Header = .{ .kind = 0 };
++        if (e.cur.sampling) |s| {
++            sh.flags = 1;
++            sh.seed = s.seed;
++            sh.temperature = s.temperature;
++            sh.top_p = s.top_p;
++            sh.min_p = s.min_p;
++            sh.top_k = s.top_k;
++        }
++        try e.send(.begin, sh, &.{});
+         e.cur.in_head = 0;
+         try e.cur.st.reset(e.stream);
+         if (e.cur.hd) |*h| try h.reset(e.stream);
+@@ -247,6 +315,7 @@ pub const Engine = struct {
+         if (len == 0 or len + window_rows >= e.capacity) return error.PromptTooLong;
+         const r = from orelse return 0;
+         if (r.at == 0 or r.at >= len) return error.BadResume;
++        try e.send(.restore, .{ .kind = 0, .a = r.id }, &.{});
+         try e.restoreState(r.id);
+         if (e.cur.st.pos != r.at) return error.BadResume;
+         return r.at;
+@@ -258,19 +327,28 @@ pub const Engine = struct {
+         if (at >= len or at != e.cur.st.pos) return error.BadChunk;
+         if (marks) |m| if (at > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(at)) != null) m.call(m.ctx, @intCast(at));
+         if (cancel) |c| if (c.check(c.ptr)) return error.Cancelled;
+-        var end = @min(len, at + e.chunk);
+-        if (marks) |m| for (m.at) |x| if (x > at and x < end) {
+-            end = x;
++        var stop = @min(len, at + e.chunk);
++        if (marks) |m| for (m.at) |x| if (x > at and x < stop) {
++            stop = x;
+             break;
+         };
+-        const rows = end - at;
++        const part = ids[at..@min(len, stop + 1)]; // the chunk and the token after it (the MTP layer's last)
++        try e.send(.chunk, .{ .kind = 0, .depth = @intCast(at), .seed = stop, .a = len }, part);
++        return e.chunkRun(part, at, stop, len);
++    }
++
++    /// prefillChunk's forward of rows at .. stop of a `len`-token prompt, `part` its ids from `at` (and one more).
++    pub fn chunkRun(e: *Engine, part: []const u32, at: usize, stop: usize, len: usize) !Step {
++        if (stop <= at or stop > len or part.len < @min(len, stop + 1) - at or at != e.cur.st.pos) return error.BadChunk;
++        const ids = part;
++        const rows = stop - at;
+         const f = e.forward(&e.bp);
+         const seg = [_]fw.Seg{.{ .st = &e.cur.st, .row0 = 0, .rows = rows }};
+-        try f.embed(@ptrCast(ids[at..end]));
++        try f.embed(@ptrCast(ids[0..rows]));
+         try f.stack(&seg);
+         try f.final(rows);
+         var first: ?u32 = null;
+-        if (end == len) {
++        if (stop == len) {
+             try f.logitsOf(rows - 1, 1);
+             var t: [1]u32 = undefined;
+             try e.draw(e.bp.logits, 1, len, &t);
+@@ -278,17 +356,18 @@ pub const Engine = struct {
+         }
+         if (e.mtp) |*h| { // each row whose next token is known through the MTP layer (it overwrites b.normed)
+             const q = e.cur;
+-            if (end == len) try e.copy(q.hold.?.ptr, e.bp.normed + (rows - 1) * e.c.hidden * 2, e.c.hidden * 2);
++            if (stop == len) try e.copy(q.hold.?.ptr, e.bp.normed + (rows - 1) * e.c.hidden * 2, e.c.hidden * 2);
+             const known = @min(rows, len - 1 - at);
+-            if (known > 0) try h.absorb(&e.m, e.stream, &e.bp, &q.hd.?, @ptrCast(ids[at + 1 ..][0..known]), e.bp.normed);
++            if (known > 0) try h.absorb(&e.m, e.stream, &e.bp, &q.hd.?, @ptrCast(ids[1..][0..known]), e.bp.normed);
+         }
+         try f.commit(&e.cur.st, rows);
+-        return .{ .at = end, .first = first };
++        return .{ .at = stop, .first = first };
+     }
+ 
+     /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r.
+     pub fn verify(e: *Engine, ids: []const u32, out: []u32) !void {
+         if (ids.len == 0 or ids.len > window_rows) return error.WindowTooWide;
++        try e.send(.verify, .{ .kind = 0 }, ids);
+         const f = e.forward(&e.bd);
+         const at = e.cur.st.pos;
+         try f.run(&.{.{ .st = &e.cur.st, .row0 = 0, .rows = ids.len }}, @ptrCast(ids));
+@@ -299,6 +378,18 @@ pub const Engine = struct {
+     /// Several streams' windows in one forward, each stream's rows on its own sequence.
+     pub fn verifyShared(e: *Engine, parts: []const Part) !void {
+         if (parts.len == 0 or parts.len > max_shared) return error.WindowTooWide;
++        if (e.lead) {
++            var buf: [2 * max_shared + shared_rows]u32 = undefined;
++            var n: usize = 2 * parts.len;
++            for (parts, 0..) |p, i| {
++                if (n + p.ids.len > buf.len) return error.WindowTooWide;
++                buf[2 * i] = p.slot;
++                buf[2 * i + 1] = @intCast(p.ids.len);
++                @memcpy(buf[n..][0..p.ids.len], p.ids);
++                n += p.ids.len;
++            }
++            try e.send(.shared, .{ .kind = 0, .depth = @intCast(parts.len) }, buf[0..n]);
++        }
+         var segs: [max_shared]fw.Seg = undefined;
+         var ids: [shared_rows]u32 = undefined;
+         var rows: usize = 0;
+@@ -320,6 +411,7 @@ pub const Engine = struct {
+ 
+     /// The last window's first `n` rows committed (the KDA states replayed when fewer than it ran).
+     pub fn keep(e: *Engine, n: usize) !void {
++        try e.send(.keep, .{ .kind = 0, .a = n }, &.{});
+         try e.forward(&e.bd).commit(&e.cur.st, n);
+     }
+ 
+@@ -328,6 +420,7 @@ pub const Engine = struct {
+         const h = if (e.mtp) |*x| x else return error.NoDraftHead;
+         if (depth > max_drafts or out.len < depth) return error.TooDeep;
+         if (follow.len == 0) return error.NoFollow;
++        try e.send(.draft, .{ .kind = 0, .depth = @intCast(depth), .flags = @intFromBool(from_prompt) }, follow);
+         const q = e.cur;
+         const hd = &q.hd.?;
+         const D: usize = e.c.hidden;
+@@ -379,7 +472,8 @@ pub const Engine = struct {
+     /// A copy of the bound sequence's state under a new id (the pass standing at a mark).
+     pub fn keepState(e: *Engine) !u64 {
+         const q = e.cur;
+-        if (q.st.pending != 0) return error.NotCommitted;
++        if (q.st.pending != 0 or (q.hd != null and q.in_head != 0)) return error.NotCommitted;
++        try e.send(.keep_state, .{ .kind = 0, .a = e.next_snap }, &.{});
+         var buf = try cuda.DeviceBuffer.alloc(e.d, q.st.arena.buf.len);
+         errdefer if (weights.drains(e.stream)) buf.free(); // else leaked: the copy into it may be queued
+         try e.copy(buf.ptr, q.st.arena.buf.ptr, buf.len);
+@@ -400,7 +494,7 @@ pub const Engine = struct {
+     }
+ 
+     /// The bound sequence made kept state `id`'s.
+-    fn restoreState(e: *Engine, id: u64) !void {
++    pub fn restoreState(e: *Engine, id: u64) !void {
+         const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
+         const q = e.cur;
+         try e.copy(q.st.arena.buf.ptr, s.buf.ptr, s.buf.len);
+@@ -423,6 +517,7 @@ pub const Engine = struct {
+ 
+     pub fn dropState(e: *Engine, id: u64) void {
+         var kv = e.snaps.fetchRemove(id) orelse return;
++        if (e.lead) e.dropped.append(e.gpa, id) catch {}; // rank 1 drops it before rank 0's next step
+         e.freeSnap(&kv.value);
+     }
+ 
+diff --git a/zig/src/families/ling/forward.zig b/zig/src/families/ling/forward.zig
+index 3019723fa..6baa929be 100644
+--- a/zig/src/families/ling/forward.zig
++++ b/zig/src/families/ling/forward.zig
+@@ -102,15 +102,26 @@ pub const Forward = struct {
+             .kda => |a| try block_kda.block(o, b, a, c, g.slot[j], segs, rows),
+             .mla => |a| try block_mla.block(o, b, a, g.absorb[g.slot[j]], g, g.slot[j], segs, rows),
+         }
++        try f.reduce(rows);
+         try o.add(b.x, b.y, b.x, rows * D);
+         try glue.rmsnorm(o.set(), o.s, b.x, D, l.mlp_norm, b.normed, D, null, c.eps, rows, D);
+         switch (l.ffn) {
+             .dense => |m| try block_ffn.mlp(o, b, m, b.normed, D, rows, 0, b.y),
+             .moe => |e| try block_ffn.moe(o, b, e, g, l.index, rows, picks),
+         }
++        try f.reduce(rows);
+         try o.add(b.x, b.y, b.x, rows * D);
+     }
+ 
++    /// TP=2: every rank's partial b.y gathered (rank order) and summed in fp32 once, bf16, into b.y; TP=1: nothing.
++    fn reduce(f: *const Forward, rows: usize) !void {
++        const g = f.g.tp orelse return;
++        if (g.world != 2) return error.BadWorld;
++        const n = rows * f.g.w.config.hidden;
++        try g.allGather(f.s, f.b.y, f.b.xg, n * 2);
++        try f.ops().add(f.b.xg, f.b.xg + n * 2, f.b.y, n);
++    }
++
+     /// The final norm and lm_head of b.x's rows into b.logits (bf16 [rows][vocab]).
+     pub fn head(f: *const Forward, rows: usize) !void {
+         try f.final(rows);
+@@ -128,7 +139,14 @@ pub const Forward = struct {
+     /// lm_head of b.normed's rows row0 .. row0 + n into b.logits from its first row.
+     pub fn logitsOf(f: *const Forward, row0: usize, n: usize) !void {
+         const D: usize = f.g.w.config.hidden;
+-        try f.ops().mm(f.g.w.head orelse return error.TiedHeadNotBuilt, f.b.normed + row0 * D * 2, D, n, f.b.logits);
++        const head_w = f.g.w.head orelse return error.TiedHeadNotBuilt;
++        const g = f.g.tp orelse return f.ops().mm(head_w, f.b.normed + row0 * D * 2, D, n, f.b.logits);
++        const V: usize = f.g.w.config.vocab; // TP: this rank's vocabulary half, gathered, then laid out by rows
++        const h = V / g.world;
++        const all = f.b.xg + n * h * 2;
++        try f.ops().mm(head_w, f.b.normed + row0 * D * 2, D, n, f.b.xg);
++        try g.allGather(f.s, f.b.xg, all, n * h * 2);
++        for (0..g.world) |r| try f.ops().copy(all + r * n * h * 2, h * 2, f.b.logits + r * h * 2, V * 2, n, h * 2);
+     }
+ 
+     /// Keep the first `keep` rows of the sequence's last forward (a prompt keeps them all): KDA states, position.
+diff --git a/zig/src/families/ling/graph.zig b/zig/src/families/ling/graph.zig
+index c20e4f1cc..c7daef379 100644
+--- a/zig/src/families/ling/graph.zig
++++ b/zig/src/families/ling/graph.zig
+@@ -8,6 +8,7 @@ pub const glue = glm.glue;
+ pub const kda = glm.kda;
+ pub const latent = glm.latent;
+ pub const ops = @import("ops.zig");
++const rope = @import("rope.zig");
+ const Proj = weights.Proj;
+ const Config = @import("config.zig").Config;
+ 
+@@ -170,8 +171,10 @@ pub const Graph = struct {
+     absorb: []Absorb, // by MLA slot
+     kda_layers: usize,
+     mla_layers: usize,
+-    freq: u64, // fp32 [32]: the rope's inv_freq
++    freq: u64, // fp32 [32]: the rope's inv_freq (YaRN's when the config's yarn is set)
++    rope_scale: f32 = 1, // YaRN's attention factor on cos and sin, 1 for the plain rope
+     zero_bias: u64, // fp32 [experts]: select's bias without moe_router_enable_expert_bias
++    tp: ?*const cuda.tp_group.Group = null, // TP=2: the ranks' group, set by the engine (each block's one reduce)
+ 
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, m: *const Modules, s: cuda.Stream, w: *const weights.Weights) !Graph {
+         const c = &w.config;
+@@ -188,7 +191,8 @@ pub const Graph = struct {
+             },
+         };
+         if (c.rope_dim != ops.rope_width or c.rope_style != .gptj) return error.RopeNotBuilt;
+-        const f = ops.ropeFreqs(c.rope_theta);
++        const f = if (c.yarn) |y| rope.yarnFreqs(c.rope_theta, y) else ops.ropeFreqs(c.rope_theta);
++        g.rope_scale = if (c.yarn) |y| @floatCast(rope.attentionFactor(y)) else 1;
+         g.freq = try g.store.keep(std.mem.sliceAsBytes(&f), "ling.rope.inv_freq");
+         const zero = try gpa.alloc(u8, @as(usize, c.experts) * 4);
+         defer gpa.free(zero);
+diff --git a/zig/src/families/ling/host_test.zig b/zig/src/families/ling/host_test.zig
+index 9cc556cf1..6ae157d8d 100644
+--- a/zig/src/families/ling/host_test.zig
++++ b/zig/src/families/ling/host_test.zig
+@@ -4,6 +4,7 @@ const std = @import("std");
+ test {
+     _ = @import("config.zig");
+     _ = @import("config_test.zig");
++    _ = @import("rope.zig");
+     _ = @import("names.zig");
+     _ = @import("names_test.zig");
+     _ = @import("tiny_test.zig");
+diff --git a/zig/src/families/ling/lanes.zig b/zig/src/families/ling/lanes.zig
+index f8b9c54c6..400a740a1 100644
+--- a/zig/src/families/ling/lanes.zig
++++ b/zig/src/families/ling/lanes.zig
+@@ -284,6 +284,7 @@ pub const Lanes = struct {
+         const self = of(ptr);
+         const kv = self.lanes.fetchRemove(s) orelse return;
+         self.e.release(kv.value.slot);
++        if (self.lanes.count() == 0) self.e.idle() catch |err| std.log.err("the other ranks' idle step: {s}", .{@errorName(err)});
+     }
+ };
+ 
+diff --git a/zig/src/families/ling/native.zig b/zig/src/families/ling/native.zig
+index b314261e4..0bf9e74e4 100644
+--- a/zig/src/families/ling/native.zig
++++ b/zig/src/families/ling/native.zig
+@@ -1,9 +1,11 @@
+-//! Ling-3.1-flash on the native CUDA server at TP=1: the engine, its lane backend, the prompt cache's copies.
++//! Ling-3.1-flash on the native CUDA server, one GPU or TP=2 over hosts (rank 0 serves, rank 1 follows).
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const lanes = @import("lanes");
+ const engine = @import("engine.zig");
+ const ling_lanes = @import("lanes.zig");
++const rope = @import("rope.zig");
++const tp = @import("tp.zig");
+ 
+ pub const model_type = "bailing_hybrid";
+ pub const formats: []const []const u8 = &.{ "bf16", "fp8-block", "modelopt-nvfp4", "exl3" };
+@@ -33,20 +35,63 @@ pub fn capacity(context: usize) usize {
+     return std.mem.alignForward(usize, context + engine.window_rows, 64);
+ }
+ 
+-const Owned = struct { gpa: std.mem.Allocator, e: *engine.Engine, lanes: ling_lanes.Lanes };
++/// What a rank owns: the engine, rank 0's lanes, and at TP=2 the group and the steps' link.
++const Owned = struct { gpa: std.mem.Allocator, e: *engine.Engine, lanes: ling_lanes.Lanes = undefined, group: ?cuda.tp_group.Group = null, link: ?tp.Link = null };
+ 
+ /// TF_LING_PROMPT_STEPS=0 passes prompts whole, TF_LING_SHARED=0 runs windows alone.
+ fn off(name: [*:0]const u8) bool {
+     return if (std.c.getenv(name)) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
+ }
+ 
++/// `explain` words this family's open refusals too (where to set the rank, the world and the id).
++pub const explains_open = true;
++
++/// Bytes this rank's weights take at most, for the server's admission: half at TP=2 (heads, widths, vocabulary).
++pub fn weightShare(a: std.mem.Allocator, io: std.Io, dir: []const u8, total: u64) u64 {
++    _ = .{ a, io, dir };
++    const p = tp.place(tp.env) catch return total;
++    return total / p.world;
++}
++
+ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
+     _ = kernels; // our own kernels: a captured set is not used
++    const p = try tp.place(tp.env);
++    const yarn = try rope.mode(if (std.c.getenv("TF_LING_YARN")) |v| std.mem.span(v) else null);
++    if (p.world == 1) return openRank(gpa, io, ctx, dir, o, yarn, p);
++    if (std.c.getenv("NCCL_COMM_ID") == null) return error.NoCommId;
++    try cuda.tp_watch.start(io, p.rank, p.world); // each rank's TCP line to rank 0 at NCCL_COMM_ID's port + 1
++    return openRank(gpa, io, ctx, dir, o, yarn, p) catch |err| {
++        cuda.tp_watch.fail(@errorName(err)); // the other ranks stop with this one
++        return err;
++    };
++}
++
++/// GLM's two-rank start: NCCL from rank 0's id, this rank's share loaded; rank 1 follows and exits, rank 0 serves.
++fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, o: Options, yarn: rope.Mode, p: tp.Place) !Loaded {
+     const own = try gpa.create(Owned);
+     errdefer gpa.destroy(own);
+-    own.gpa = gpa;
+-    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, .{ .capacity = capacity(o.context), .mtp = o.drafts });
++    own.* = .{ .gpa = gpa, .e = undefined };
++    if (p.world > 1) own.group = try tp.group(io, p);
++    errdefer if (own.group) |*g| g.close();
++    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, .{ .capacity = capacity(o.context), .mtp = o.drafts, .yarn = yarn, .context = o.context, .group = if (own.group) |*g| g else null });
+     errdefer own.e.deinit();
++    if (own.group) |*g| {
++        own.link = try tp.Link.init(gpa, ctx.d, &g.lib, g.comm, own.e.stream, capacity(o.context));
++        own.e.link = &own.link.?;
++        own.e.lead = p.rank == 0;
++        try cuda.tp_watch.ready(io, try digest(gpa, io, dir, o, yarn)); // the ranks agree on the checkpoint and settings
++        if (p.rank != 0) { // a follower never serves: rank 0's steps, then it leaves the process
++            tp.follow(own.e, io) catch |err| {
++                std.log.err("rank {d}: following rank 0 stopped ({s})", .{ p.rank, @errorName(err) });
++                cuda.tp_watch.fail(@errorName(err));
++                std.c._exit(1); // the stream may hold kernels waiting on a gone rank: a normal exit would join them
++            };
++            std.log.info("rank {d}: rank 0 ended; leaving", .{p.rank});
++            release(own);
++            std.process.exit(0);
++        }
++        own.e.asleep = cuda.tp_watch.open(); // the other ranks begin asleep: the first step wakes them
++    }
+     own.lanes = .{ .e = own.e, .whole = off("TF_LING_PROMPT_STEPS"), .alone = off("TF_LING_SHARED") };
+     return .{
+         .backend = own.lanes.backend(),
+@@ -59,10 +104,31 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     };
+ }
+ 
++/// What the ranks must agree on: config.json's bytes, the context, drafts and the YaRN setting.
++fn digest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Options, yarn: rope.Mode) ![32]u8 {
++    const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
++    defer gpa.free(path);
++    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24));
++    defer gpa.free(text);
++    var h = std.crypto.hash.sha2.Sha256.init(.{});
++    h.update(text);
++    h.update(std.mem.asBytes(&[_]u64{ o.context, @intFromBool(o.drafts), @backingInt(yarn) }));
++    return h.finalResult();
++}
++
+ fn close(ptr: *anyopaque) void {
+     const own: *Owned = @ptrCast(@alignCast(ptr));
++    cuda.tp_watch.ended(); // the other ranks leave on the end step, so their lines close on purpose from here
++    own.e.end() catch {};
+     own.lanes.deinit();
++    release(own);
++}
++
++/// What a rank owns, freed by rank 0's close and by a follower before it leaves.
++fn release(own: *Owned) void {
+     own.e.deinit();
++    if (own.link) |*l| l.deinit();
++    if (own.group) |*g| g.close();
+     own.gpa.destroy(own);
+ }
+ 
+@@ -105,6 +171,14 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.Quant => "Ling-3.1 on CUDA reads bf16, block-FP8 and ModelOpt NVFP4 checkpoints (the log names what config.json has)",
+         error.QuantizedRouter => "Ling-3.1's routing kernels read a bf16 router (mlp.gate): this checkpoint quantized it",
+         error.PromptTooLong => "the prompt and its reply exceed the window: raise --context",
++        error.YarnOff => "TF_LING_YARN=off keeps the plain rope, trained to the native window: lower --context or set TF_LING_YARN to auto or on",
++        error.BadYarnMode => "TF_LING_YARN: auto (YaRN past the native window, the default), on or off",
++        error.NoRank => "Ling at TP over hosts: set TF_LING_RANK and TF_LING_WORLD (1 or 2) on every host, or neither for one GPU",
++        error.TpWorld => "Ling on CUDA runs on one GPU or two ranks: set TF_LING_WORLD to 1 or 2",
++        error.NoCommId => "Ling's ranks meet over NCCL: with TF_LING_WORLD 2, set NCCL_COMM_ID to rank 0's address:port on every host",
++        error.TpFormat => "TP=2 reads EXL3 packs (their 128-wide blocks are the cuts): serve another format on one GPU",
++        error.TpShape => "this checkpoint's heads or widths do not split into two shares of whole 128-wide blocks (the log names which)",
++        error.RopeScaling => "config.json's rope_scaling is not one the engine runs: yarn only (the log names what it read)",
+         else => null,
+     };
+ }
+diff --git a/zig/src/families/ling/ops.zig b/zig/src/families/ling/ops.zig
+index 775cddd5d..716ca2514 100644
+--- a/zig/src/families/ling/ops.zig
++++ b/zig/src/families/ling/ops.zig
+@@ -94,10 +94,10 @@ pub fn expandV(k: *const Kernels, stream: cuda.Stream, ol: u64, wv: u64, out: u6
+ /// The 64 rope columns of `heads` heads a row: in at x + r x_row + h x_head, out likewise (bf16 elements).
+ pub const RopeRows = struct { x: u64, x_row: usize, x_head: usize, out: u64, o_row: usize, o_head: usize };
+ 
+-/// The rope (GPT-J pairs) at positions pos .. pos + rows - 1 (pos an i32 on device), inv_freq 32 fp32 on device.
+-pub fn rope(k: *const Kernels, stream: cuda.Stream, v: RopeRows, rows: usize, heads: usize, pos: u64, inv_freq: u64) !void {
++/// The GPT-J rope at device i32 pos + r, fp32 inv_freq [32], cos and sin times `scale` (YaRN's; 1 keeps plain bits).
++pub fn rope(k: *const Kernels, stream: cuda.Stream, v: RopeRows, rows: usize, heads: usize, pos: u64, inv_freq: u64, scale: f32) !void {
+     var a: cuda.Args = .{};
+-    inline for (.{ v.x, i64of(v.x_row), i64of(v.x_head), v.out, i64of(v.o_row), i64of(v.o_head), pos, inv_freq }) |x| a.add(x);
++    inline for (.{ v.x, i64of(v.x_row), i64of(v.x_head), v.out, i64of(v.o_row), i64of(v.o_head), pos, inv_freq, scale }) |x| a.add(x);
+     try cuda.launch.launch(k.rope, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(heads) }, .block = .{ .x = rope_width / 2 } }, stream, &a);
+ }
+ 
+diff --git a/zig/src/families/ling/rope.zig b/zig/src/families/ling/rope.zig
+new file mode 100644
+index 000000000..244e676aa
+--- /dev/null
++++ b/zig/src/families/ling/rope.zig
+@@ -0,0 +1,180 @@
++//! MLA's rope: plain, or YaRN as transformers' _compute_yarn_parameters and the Ling modeling's MLA read rope_scaling.
++const std = @import("std");
++
++/// The columns the rope turns: qk_rope_head_dim whole (the modeling's rotary sets head_dim to it, partial factor 1).
++pub const dim = 64;
++
++/// rope_scaling's yarn entries with transformers' defaults (beta_fast 32, beta_slow 1, truncate); 0: not given.
++pub const Yarn = struct {
++    factor: f64,
++    original: u32, // original_max_position_embeddings: the native window
++    beta_fast: f64 = 32,
++    beta_slow: f64 = 1,
++    truncate: bool = true,
++    attention_factor: f64 = 0, // 0: inferred from factor (and mscale over mscale_all_dim when both are given)
++    mscale: f64 = 0,
++    mscale_all_dim: f64 = 0,
++};
++
++/// TF_LING_YARN: on, off, or auto (on only when the served context passes the native window).
++pub const Mode = enum { auto, on, off };
++
++/// TF_LING_YARN's value (unset: auto); anything else is refused.
++pub fn mode(text: ?[]const u8) !Mode {
++    const v = text orelse return .auto;
++    inline for (.{ "auto", "on", "off" }, .{ Mode.auto, Mode.on, Mode.off }) |name, m| if (std.mem.eql(u8, v, name)) return m;
++    return error.BadYarnMode;
++}
++
++/// SGLang's cookbook rope_scaling for 1M on Ling-3.1-flash: yarn, factor 4 over the native window.
++pub fn cookbook(native: u32) Yarn {
++    return .{ .factor = 4, .original = native };
++}
++
++/// The modeling's (and transformers') yarn_get_mscale: 1 at scales up to 1, else 0.1 m ln(scale) + 1.
++pub fn getMscale(scale: f64, m: f64) f64 {
++    return if (scale <= 1) 1 else 0.1 * m * @log(scale) + 1;
++}
++
++/// transformers' attention_factor, which multiplies cos and sin: given, or mscale's ratio, or get_mscale(factor).
++pub fn attentionFactor(y: Yarn) f64 {
++    if (y.attention_factor != 0) return y.attention_factor;
++    if (y.mscale != 0 and y.mscale_all_dim != 0) return getMscale(y.factor, y.mscale) / getMscale(y.factor, y.mscale_all_dim);
++    return getMscale(y.factor, 1);
++}
++
++/// The modeling's MLA softmax scale factor: yarn_get_mscale(factor, mscale_all_dim) squared when it is given, else 1.
++pub fn smFactor(y: Yarn) f64 {
++    if (y.mscale_all_dim == 0) return 1;
++    const m = getMscale(y.factor, y.mscale_all_dim);
++    return m * m;
++}
++
++/// _compute_yarn_parameters' inv_freq in float64: theta^(-2i/dim) blended toward 1/factor of it past the ramp.
++pub fn yarnFreqs64(theta: f64, y: Yarn) [dim / 2]f64 {
++    const d: f64 = dim;
++    const orig: f64 = @floatFromInt(y.original);
++    const corr = struct {
++        fn at(rot: f64, dd: f64, base: f64, o: f64) f64 {
++            return dd * @log(o / (rot * 2 * std.math.pi)) / (2 * @log(base));
++        }
++    }.at;
++    var low = corr(y.beta_fast, d, theta, orig);
++    var high = corr(y.beta_slow, d, theta, orig);
++    if (y.truncate) {
++        low = @floor(low);
++        high = @ceil(high);
++    }
++    low = @max(low, 0);
++    high = @min(high, d - 1);
++    if (low == high) high += 0.001;
++    var out: [dim / 2]f64 = undefined;
++    for (&out, 0..) |*f, i| {
++        const pf = std.math.pow(f64, theta, @as(f64, @floatFromInt(2 * i)) / d);
++        const ramp = std.math.clamp((@as(f64, @floatFromInt(i)) - low) / (high - low), 0, 1);
++        const extra = 1 - ramp; // inv_freq_extrapolation_factor
++        f.* = 1 / (y.factor * pf) * (1 - extra) + 1 / pf * extra;
++    }
++    return out;
++}
++
++/// The device table: YaRN's inv_freq rounded from float64 to fp32.
++pub fn yarnFreqs(theta: f64, y: Yarn) [dim / 2]f32 {
++    var out: [dim / 2]f32 = undefined;
++    for (&out, yarnFreqs64(theta, y)) |*o, f| o.* = @floatCast(f);
++    return out;
++}
++
++fn num(v: std.json.Value) ?f64 {
++    return switch (v) {
++        .float => |f| f,
++        .integer => |i| @floatFromInt(i),
++        else => null,
++    };
++}
++
++/// config.json's rope_scaling: null, or yarn read as transformers reads it; any other type is refused by name.
++pub fn parse(o: std.json.ObjectMap, theta: f64, max_pos: u32, why: anytype) !?Yarn {
++    const rv = o.get("rope_scaling") orelse return null;
++    if (rv == .null) return null;
++    if (rv != .object) {
++        why.set("rope_scaling is not an object", .{});
++        return error.RopeScaling;
++    }
++    const r = rv.object;
++    const t = r.get("rope_type") orelse r.get("type") orelse std.json.Value{ .string = "?" };
++    if (t != .string or !std.mem.eql(u8, t.string, "yarn")) {
++        why.set("rope_scaling type {s}: the engine's MLA runs yarn only", .{if (t == .string) t.string else "?"});
++        return error.RopeScaling;
++    }
++    const f = num(r.get("factor") orelse .null) orelse 0;
++    const om = num(r.get("original_max_position_embeddings") orelse .null) orelse 0;
++    if (!(f >= 1) or !(om >= 1) or om != @floor(om) or om > std.math.maxInt(u32)) {
++        why.set("rope_scaling yarn needs a factor of 1 or more and a whole original_max_position_embeddings", .{});
++        return error.RopeScaling;
++    }
++    var y: Yarn = .{ .factor = f, .original = @intFromFloat(om) };
++    // transformers 4.x divides max_position_embeddings by the original, 5.x reads factor: both must agree
++    if (max_pos != y.original and @abs(@as(f64, @floatFromInt(max_pos)) / om - f) > 1e-9) {
++        why.set("rope_scaling factor {d} differs from max_position_embeddings / original ({d} / {d})", .{ f, max_pos, y.original });
++        return error.RopeScaling;
++    }
++    if (r.get("rope_theta")) |v| if ((num(v) orelse 0) != theta) {
++        why.set("rope_scaling's rope_theta differs from config.json's {d}", .{theta});
++        return error.RopeScaling;
++    };
++    inline for (.{ "beta_fast", "beta_slow", "attention_factor", "mscale", "mscale_all_dim" }) |k| if (r.get(k)) |v| {
++        const x = num(v) orelse if (v == .null) 0 else {
++            why.set("rope_scaling's " ++ k ++ " is not a number", .{});
++            return error.RopeScaling;
++        };
++        if (x != 0) @field(y, k) = x; // transformers' `get(k) or default` for the betas: 0 keeps the default
++    };
++    if (r.get("truncate")) |v| if (v == .bool) {
++        y.truncate = v.bool;
++    };
++    return y;
++}
++
++/// What the forward applies: config.json's rope_scaling (else the cookbook's) when `m` says on, or auto passes it.
++pub fn resolve(scaling: ?Yarn, max_pos: u32, m: Mode, context: usize) !?Yarn {
++    const y = scaling orelse cookbook(max_pos);
++    return switch (m) {
++        .on => y,
++        .off => if (context > y.original) error.YarnOff else null,
++        .auto => if (context > y.original) y else null,
++    };
++}
++
++test "YaRN's inv_freq and attention factor equal transformers' formula in float64 (Ling's 1M cookbook)" {
++    // python3 float64 of _compute_yarn_parameters: dim 64, theta 6e6, factor 4, original 262144, beta 32/1, truncate
++    const want = [32]f64{
++        1.0,                    0.6140203621035609,     0.3770210050777882,     0.23149857405851199,
++        0.14214483826986554,    0.08727982506561495,    0.05359158979112435,    0.03290632736925168,
++        0.020205155046766232,   0.012406376618173995,   0.007617767863484349,   0.00467746458195753,
++        0.0028720584963401437,  0.0017635023979053841,  0.001082826380932362,   0.0006025451859045607,
++        0.0003317017360018887,  0.00018017104850599877, 9.619886299498403e-05,  5.02078515866113e-05,
++        2.538829440959652e-05,  1.2248444785163924e-05, 5.469668728866783e-06,  3.3584879734853063e-06,
++        2.0621800015999023e-06, 1.266220511305094e-06,  7.774851768545099e-07,  4.773917298223573e-07,
++        2.931282428107692e-07,  1.7998670979344902e-07, 1.1051550472120212e-07, 6.785877022697034e-08,
++    };
++    const y = cookbook(262144);
++    const got = yarnFreqs64(6e6, y);
++    for (got, want) |g, w| try std.testing.expect(@abs(g - w) <= 1e-12 * w);
++    try std.testing.expect(@abs(attentionFactor(y) - 1.138629436111989) <= 1e-12);
++    try std.testing.expectEqual(@as(f64, 1), smFactor(y)); // no mscale_all_dim: the modeling keeps qk_head_dim^-0.5
++    var m = y;
++    m.mscale_all_dim = 1;
++    try std.testing.expect(@abs(smFactor(m) - 1.138629436111989 * 1.138629436111989) <= 1e-12);
++    m.mscale = 1;
++    try std.testing.expectEqual(@as(f64, 1), attentionFactor(m)); // both given: their ratio
++}
++
++test "TF_LING_YARN: auto turns YaRN on past the native window only, off refuses a longer context, others refused" {
++    try std.testing.expectEqual(@as(?Yarn, null), try resolve(null, 262144, .auto, 262144));
++    try std.testing.expectEqual(@as(f64, 4), (try resolve(null, 262144, .auto, 262145)).?.factor);
++    try std.testing.expectEqual(@as(f64, 4), (try resolve(null, 262144, .on, 4096)).?.factor);
++    try std.testing.expectError(error.YarnOff, resolve(null, 262144, .off, 1 << 20));
++    try std.testing.expectEqual(Mode.auto, try mode(null));
++    try std.testing.expectError(error.BadYarnMode, mode("1"));
++}
+diff --git a/zig/src/families/ling/state.zig b/zig/src/families/ling/state.zig
+index 31511c305..daa9e5745 100644
+--- a/zig/src/families/ling/state.zig
++++ b/zig/src/families/ling/state.zig
+@@ -11,6 +11,14 @@ const latent = graph.latent;
+ pub const window_rows = 16;
+ /// The most rows of one roped attention call (a prompt chunk's rows go in blocks of these).
+ pub const att_rows = 128;
++/// The attention partials' most bytes a scratch holds: long contexts take fewer rows a call (each row's bits stay).
++pub const att_bytes: usize = 2 << 30;
++
++/// Rows one attention call takes at `nch` chunks of `heads` heads: up to att_rows within att_bytes, at least one.
++pub fn attRows(rows: usize, nch: usize, heads: usize) usize {
++    const per = nch * heads * (512 * 4 + 8);
++    return @max(1, @min(@min(rows, att_rows), att_bytes / per));
++}
+ /// MLA's cache row: the 512-wide latent, then the 64 roped key columns.
+ pub const cache_width = 512 + graph.ops.rope_width;
+ /// kv_a's output row: the cache width, or the 640 an EXL3 pack pads it to.
+@@ -77,6 +85,7 @@ pub const Buffers = struct {
+     rows: usize,
+     prompt: bool,
+     nch: usize, // the most 512-key chunks one attention call reads
++    ar: usize, // the most rows one attention call takes (attRows)
+     ids: u64, // i32 [rows]
+     x: u64, // bf16 [rows][hidden]: the residual stream
+     normed: u64,
+@@ -100,7 +109,7 @@ pub const Buffers = struct {
+     g: u64, // bf16 [rows][heads]: g_proj's rows
+     partials: latent.Partials,
+     dummy: u64,
+-    at: u64, // i32: an attention block's first position
++    at: u64, // i32 [2]: an attention block's first position, then the rope's first (a State's rope_base)
+     gu: u64, // bf16 [rows][2 width]: [gate | up]
+     act: u64, // bf16 [rows][width]
+     xs: u64, // fp32 [rows][width / 64]
+@@ -112,6 +121,7 @@ pub const Buffers = struct {
+     eact: u64, // bf16 [pairs][moe_inter]
+     ey: u64, // bf16 [pairs][hidden], or every expert's rows [experts][rows][hidden] for per-expert lanes
+     logits: u64, // bf16 [rows][vocab]
++    xg: u64, // TP: bf16 [world][rows][hidden] gathered partials, or the head's [rows][vocab / world] then [world][..]
+ 
+     pub fn init(d: *const cuda.Driver, m: *const graph.Modules, w: *const weights.Weights, rows: usize, prompt: bool, capacity: usize) !Buffers {
+         const c = &w.config;
+@@ -128,22 +138,22 @@ pub const Buffers = struct {
+         for (w.layers) |l| if (l.ffn == .moe and l.ffn.moe.routed == .lanes) {
+             lanes = true;
+         };
+-        const ar = @min(rows, att_rows);
+         const nch = latent.chunksFor(capacity);
++        const ar = attRows(rows, nch, HM);
+         const hist = if (pairs > cuda.grouped.small) (pairs + cuda.grouped.small - 1) / cuda.grouped.small * (E + 1) else 1;
+         const sizes = [_]usize{
+-            rows * 4,                                        rows * D * 2,                   rows * D * 2,                rows * D * 2,
+-            rows * D * 2,                                    rows * @max(n, width) * 2,      partBytes(m, w, rows),       if (prompt) rows * kdaStride(w) * 2 else 16,
+-            rows * n * 2,                                    rows * n * 2,                   rows * n * 2,                rows * n * 4,
+-            rows * n * 2,                                    rows * n * 4,                   rows * H * 4,                rows * n * 4,
+-            rows * n * 2,                                    rows * ql * 2,                  rows * ql * 2,               rows * HM * c.qkDim() * 2,
+-            rows * kv_rows * 2,                              rows * cache_width * 2,         rows * HM * cache_width * 2, rows * HM * 512 * 2,
+-            rows * HM * c.v_dim * 2,                         rows * HM * 2,                  nch * ar * HM * 512 * 4,     nch * ar * HM * 4,
+-            nch * ar * HM * 4,                               4,                              4,                           rows * 2 * width * 2,
+-            rows * width * 2,                                rows * (width / 64 + 1) * 4,    rows * E * 4,                glue_router_ks * rows * E * 4,
+-            pairs * 4,                                       pairs * 4,                      pairs * 4,                   cuda.grouped.maxItems(pairs, E + 1, 16) * 12,
+-            8,                                               pairs * 4,                      hist * 4,                    pairs * c.moe_inter * 2,
+-            @max(pairs, if (lanes) E * rows else 0) * D * 2, rows * @as(usize, c.vocab) * 2,
++            rows * 4,                                        rows * D * 2,                   rows * D * 2,                                                                                             rows * D * 2,
++            rows * D * 2,                                    rows * @max(n, width) * 2,      partBytes(m, w, rows),                                                                                    if (prompt) rows * kdaStride(w) * 2 else 16,
++            rows * n * 2,                                    rows * n * 2,                   rows * n * 2,                                                                                             rows * n * 4,
++            rows * n * 2,                                    rows * n * 4,                   rows * H * 4,                                                                                             rows * n * 4,
++            rows * n * 2,                                    rows * ql * 2,                  rows * ql * 2,                                                                                            rows * HM * c.qkDim() * 2,
++            rows * kv_rows * 2,                              rows * cache_width * 2,         rows * HM * cache_width * 2,                                                                              rows * HM * 512 * 2,
++            rows * HM * c.v_dim * 2,                         rows * HM * 2,                  nch * ar * HM * 512 * 4,                                                                                  nch * ar * HM * 4,
++            nch * ar * HM * 4,                               4,                              8,                                                                                                        rows * 2 * width * 2,
++            rows * width * 2,                                rows * (width / 64 + 1) * 4,    rows * E * 4,                                                                                             glue_router_ks * rows * E * 4,
++            pairs * 4,                                       pairs * 4,                      pairs * 4,                                                                                                cuda.grouped.maxItems(pairs, E + 1, 16) * 12,
++            8,                                               pairs * 4,                      hist * 4,                                                                                                 pairs * c.moe_inter * 2,
++            @max(pairs, if (lanes) E * rows else 0) * D * 2, rows * @as(usize, c.vocab) * 2, if (w.world > 1) rows * @max(2 * D * w.world, @as(usize, c.vocab) / w.world * (w.world + 1)) * 2 else 16,
+         };
+         var p: [sizes.len]u64 = undefined;
+         const a = try Arena.init(d, &sizes, &p);
+@@ -152,6 +162,7 @@ pub const Buffers = struct {
+             .rows = rows,
+             .prompt = prompt,
+             .nch = nch,
++            .ar = ar,
+             .ids = p[0],
+             .x = p[1],
+             .normed = p[2],
+@@ -187,6 +198,7 @@ pub const Buffers = struct {
+             .eact = p[43],
+             .ey = p[44],
+             .logits = p[45],
++            .xg = p[46],
+         };
+     }
+ 
+@@ -203,6 +215,7 @@ pub const State = struct {
+     arena: Arena,
+     gpa: std.mem.Allocator,
+     capacity: usize,
++    rope_base: u32 = 0, // positions the rope adds past the cache's (a check's long-position probe; 0 when serving)
+     pos: usize = 0,
+     pending: usize = 0, // rows of the last forward until its commit
+     prompt: bool = false, // whether those rows were prompt rows (their KDA states already committed)
+diff --git a/zig/src/families/ling/tp.zig b/zig/src/families/ling/tp.zig
+new file mode 100644
+index 000000000..58baa817a
+--- /dev/null
++++ b/zig/src/families/ling/tp.zig
+@@ -0,0 +1,124 @@
++//! Ling at TP=2 over hosts as GLM runs it: rank 0's engine sends each step first (GLM's Link), rank 1 follows.
++const std = @import("std");
++const cuda = @import("cuda");
++const glm = @import("glm_cuda");
++const engine = @import("engine.zig");
++
++pub const Link = glm.follow.Link;
++pub const Header = glm.follow.Header;
++
++/// The steps rank 1 replays, in rank 0's order (Header.kind).
++pub const Kind = enum(u32) { begin = 1, restore, chunk, verify, shared, keep, draft, keep_state, drop, release, idle, end };
++
++/// This rank's place: TF_LING_RANK of TF_LING_WORLD (both unset: one GPU).
++pub const Place = struct { rank: u32, world: u32 };
++
++/// The place the environment gives; worlds other than 1 and 2 are refused (TP=2 is what was validated).
++pub fn place(get: *const fn ([*:0]const u8) ?[*:0]const u8) !Place {
++    const r = get("TF_LING_RANK");
++    const w = get("TF_LING_WORLD");
++    if (r == null and w == null) return .{ .rank = 0, .world = 1 };
++    const p: Place = .{
++        .rank = std.fmt.parseInt(u32, std.mem.span(r orelse return error.NoRank), 10) catch return error.NoRank,
++        .world = std.fmt.parseInt(u32, std.mem.span(w orelse return error.NoRank), 10) catch return error.NoRank,
++    };
++    if (p.world != 1 and p.world != 2) return error.TpWorld;
++    if (p.rank >= p.world) return error.NoRank;
++    return p;
++}
++
++pub fn env(name: [*:0]const u8) ?[*:0]const u8 {
++    return std.c.getenv(name);
++}
++
++extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
++extern "c" fn unsetenv(name: [*:0]const u8) c_int;
++
++/// The ranks' NCCL group as GLM opens it: rank 0's unique id over the TCP line (tp_watch.start ran first).
++pub fn group(io: std.Io, p: Place) !cuda.tp_group.Group {
++    // GLM's defaults: connections registered at init, no cuMem host buffers (GB10's driver pool wore out under them)
++    inline for (.{ "NCCL_RUNTIME_CONNECT", "NCCL_CUMEM_HOST_ENABLE", "NCCL_CUMEM_ENABLE" }) |name| if (std.c.getenv(name) == null) {
++        _ = setenv(name, "0", 0);
++    };
++    if (p.rank > 0 and std.c.getenv("NCCL_SOCKET_IFNAME") != null) _ = unsetenv("NCCL_COMM_ID");
++    var lib = try cuda.nccl.Library.open();
++    errdefer lib.close();
++    var id: cuda.nccl.UniqueId = undefined;
++    if (p.rank == 0) {
++        try lib.check(lib.api.ncclGetUniqueId(&id), "ncclGetUniqueId");
++        cuda.tp_watch.sendId(&id.internal);
++    } else id.internal = try cuda.tp_watch.takeId(io);
++    var comm: cuda.nccl.Comm = null;
++    try lib.check(lib.api.ncclCommInitRank(&comm, @intCast(p.world), id, @intCast(p.rank)), "ncclCommInitRank");
++    return .{ .lib = lib, .comm = comm, .rank = p.rank, .world = p.world };
++}
++
++/// Rank 1's loop: each of rank 0's steps on its own engine until rank 0 ends; an idle step sleeps on the TCP line.
++pub fn follow(e: *engine.Engine, io: std.Io) !void {
++    const l = e.link orelse return error.NoLink;
++    var drafts: [engine.max_drafts]u32 = undefined;
++    var out: [engine.shared_rows]u32 = undefined;
++    cuda.tp_watch.sleep(io); // rank 0 starts with no stream: its first step wakes this rank
++    while (true) {
++        const step = try l.receive();
++        const h = step.h;
++        if (h.kind < 1 or h.kind > @backingInt(Kind.end)) return error.BadStep;
++        const kind: Kind = @fromBackingInt(@intCast(h.kind));
++        switch (kind) {
++            .drop, .idle, .end, .shared, .release => {},
++            else => try e.bind(h.slot),
++        }
++        switch (kind) {
++            .begin => try e.begin(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null),
++            .restore => try e.restoreState(h.a),
++            .chunk => _ = try e.chunkRun(step.ids, h.depth, @intCast(h.seed), @intCast(h.a)),
++            .verify => {
++                if (step.ids.len > out.len) return error.BadStep;
++                try e.verify(step.ids, out[0..step.ids.len]);
++            },
++            .shared => {
++                const k = h.depth;
++                if (k == 0 or k > engine.max_shared or step.ids.len < 2 * k) return error.BadStep;
++                var parts: [engine.max_shared]engine.Part = undefined;
++                var at: usize = 2 * k;
++                var row: usize = 0;
++                for (parts[0..k], 0..) |*p, i| {
++                    const n = step.ids[2 * i + 1];
++                    if (at + n > step.ids.len or row + n > out.len) return error.BadStep;
++                    p.* = .{ .slot = step.ids[2 * i], .ids = step.ids[at..][0..n], .out = out[row..][0..n] };
++                    at += n;
++                    row += n;
++                }
++                try e.verifyShared(parts[0..k]);
++            },
++            .keep => try e.keep(@intCast(h.a)),
++            .draft => try e.draft(h.flags & 1 != 0, step.ids, h.depth, &drafts),
++            .keep_state => if (try e.keepState() != h.a) return error.RanksOutOfStep,
++            .drop => for (step.ids) |id| e.dropState(id),
++            .release => e.release(h.slot),
++            .idle => cuda.tp_watch.sleep(io),
++            .end => return cuda.tp_watch.ended(), // rank 0 ends on purpose: its line closing from here is expected
++        }
++    }
++}
++
++test "TF_LING_RANK and TF_LING_WORLD: unset is one GPU; worlds 1 and 2 only; a rank inside its world" {
++    const F = struct {
++        var r: ?[*:0]const u8 = null;
++        var w: ?[*:0]const u8 = null;
++        fn get(name: [*:0]const u8) ?[*:0]const u8 {
++            return if (std.mem.eql(u8, std.mem.span(name), "TF_LING_RANK")) r else w;
++        }
++    };
++    try std.testing.expectEqual(Place{ .rank = 0, .world = 1 }, try place(F.get));
++    F.r = "1";
++    F.w = "2";
++    try std.testing.expectEqual(Place{ .rank = 1, .world = 2 }, try place(F.get));
++    F.w = "3";
++    try std.testing.expectError(error.TpWorld, place(F.get));
++    F.r = "2";
++    F.w = "2";
++    try std.testing.expectError(error.NoRank, place(F.get));
++    F.r = null;
++    try std.testing.expectError(error.NoRank, place(F.get));
++}
+diff --git a/zig/src/families/ling/weights.zig b/zig/src/families/ling/weights.zig
+index ad5084f81..d5050703c 100644
+--- a/zig/src/families/ling/weights.zig
++++ b/zig/src/families/ling/weights.zig
+@@ -5,6 +5,7 @@ const core = @import("core");
+ const config = @import("config.zig");
+ const names = @import("names.zig");
+ pub const proj = @import("weights_proj.zig");
++pub const cuts = @import("weights_cut.zig");
+ 
+ const Config = config.Config;
+ const Role = names.Role;
+@@ -66,10 +67,14 @@ pub const Options = struct {
+     globals: bool = true, // embedding, final norm and head
+     experts: ?usize = null, // the first n routed experts of each MoE layer only (tests on a partial checkpoint)
+     stage: usize = 512 << 20, // raw expert bytes staged at a time (pinned and on the device), at least one expert
++    rank: u32 = 0, // a TP rank of `world`: heads, widths and the head's vocabulary cut (weights_cut)
++    world: u32 = 1,
+ };
+ 
+ pub const Weights = struct {
+-    config: Config,
++    config: Config, // this rank's share (weights_cut.rankConfig): every width the forward runs at
++    rank: u32 = 0,
++    world: u32 = 1,
+     store: Store,
+     embed: u64 = 0, // bf16 [vocab][hidden]
+     norm: u64 = 0,
+@@ -97,10 +102,22 @@ pub const Weights = struct {
+ 
+ const Loader = struct {
+     r: proj.Reader,
+-    c: *const Config,
++    c: *const Config, // the checkpoint's whole shapes
+     opts: Options,
+     buf: [192]u8 = undefined,
+ 
++    /// This rank's even share of `total`, or null at TP=1 (the uncut path).
++    fn share(L: *const Loader, total: usize) ?cuts.Span {
++        return if (L.opts.world == 1) null else cuts.even(total, L.opts.rank, L.opts.world);
++    }
++
++    /// Linear `role` of layer i, output rows cut to this rank's share (`out`) or its input columns (else).
++    fn cutLin(L: *Loader, i: u32, role: Role, out: bool) !Proj {
++        const nk = names.dims(L.c, role).linear;
++        const s = L.share(if (out) nk[0] else nk[1]) orelse return L.lin(i, role);
++        return cuts.linear(&L.r, try L.module(i, role), nk[0], nk[1], if (out) .{ .out = &.{s} } else .{ .in = s });
++    }
++
+     fn module(L: *Loader, i: u32, role: Role) ![]const u8 {
+         return names.moduleName(&L.buf, i, role, null);
+     }
+@@ -122,7 +139,14 @@ const Loader = struct {
+     /// The MLP of gate, up and down `role`s under `prefix`, at names.dims' widths.
+     fn mlp(L: *Loader, prefix: []const u8, gate: Role) !Mlp {
+         const nk = names.dims(L.c, gate).linear;
+-        return L.r.mlp(prefix, nk[0], nk[1]);
++        const s = L.share(nk[0]) orelse return L.r.mlp(prefix, nk[0], nk[1]);
++        var m: [3]Proj = undefined;
++        inline for (.{ "gate_proj", "up_proj", "down_proj" }, 0..) |p, j| {
++            var b: [192]u8 = undefined;
++            const name = try std.fmt.bufPrint(&b, "{s}{s}", .{ prefix, p });
++            m[j] = if (j < 2) try cuts.linear(&L.r, name, nk[0], nk[1], .{ .out = &.{s} }) else try cuts.linear(&L.r, name, nk[1], nk[0], .{ .in = s });
++        }
++        return .{ .gate = m[0], .up = m[1], .down = m[2] };
+     }
+ 
+     fn kda(L: *Loader, i: u32) !Kda {
+@@ -149,7 +173,11 @@ const Loader = struct {
+     fn kdaFused(L: *Loader, i: u32, n: usize) !Kda {
+         const d: usize = L.c.hidden;
+         var b: [96]u8 = undefined;
+-        const qkv = try L.r.linear(try std.fmt.bufPrint(&b, "model.layers.{d}.attention.qkv_proj", .{i}), 3 * n, d);
++        const h = n / L.opts.world; // this rank's heads x 128 of each of q, k, v
++        const lo = L.opts.rank * h;
++        const sp = [3]cuts.Span{ .{ .lo = lo, .hi = lo + h }, .{ .lo = n + lo, .hi = n + lo + h }, .{ .lo = 2 * n + lo, .hi = 2 * n + lo + h } };
++        const qkv_name = try std.fmt.bufPrint(&b, "model.layers.{d}.attention.qkv_proj", .{i});
++        const qkv = if (L.opts.world == 1) try L.r.linear(qkv_name, 3 * n, d) else try cuts.linear(&L.r, qkv_name, 3 * n, d, .{ .out = &sp });
+         const w = switch (qkv) {
+             .exl3 => |x| x,
+             else => return error.UnexpectedTensor, // a bf16 pack keeps q, k and v apart (the other path)
+@@ -160,6 +188,19 @@ const Loader = struct {
+             std.log.err("{s}: {t} {any}, expected {d} x {d} values", .{ conv, t.dtype, t.shape[0..t.rank], 3 * n, L.c.conv });
+             return error.UnexpectedTensor;
+         }
++        if (L.opts.world > 1) return .{
++            .q = .{ .exl3 = try w.columns(0, @intCast(h)) },
++            .k = .{ .exl3 = try w.columns(@intCast(h), @intCast(h)) },
++            .v = .{ .exl3 = try w.columns(@intCast(2 * h), @intCast(h)) },
++            .b = try L.cutLin(i, .kda_b, true),
++            .f = try L.cutLin(i, .kda_f, true),
++            .g = try L.cutLin(i, .kda_g, true),
++            .o = try L.cutLin(i, .kda_o, false),
++            .conv = try cuts.convs(&L.r, conv, 3 * n, L.c.conv, &sp),
++            .a_log = try cuts.small(&L.r, try L.module(i, .kda_a_log), names.numel(L.c, .kda_a_log), .f32, L.share(L.c.kda_heads).?),
++            .dt_bias = try cuts.small(&L.r, try L.module(i, .kda_dt_bias), n, .f32, L.share(n).?),
++            .o_norm = try L.small(i, .kda_o_norm, .bf16),
++        };
+         var host: std.ArrayList(u8) = .empty;
+         defer host.deinit(L.r.gpa);
+         try proj.append(L.r.gpa, &host, t, .f32);
+@@ -183,15 +224,15 @@ const Loader = struct {
+         var m: Mla = .{
+             .kv_a = try L.lin(i, .mla_kv_a),
+             .kv_a_norm = try L.small(i, .mla_kv_a_norm, .bf16),
+-            .kv_b = try L.lin(i, .mla_kv_b),
+-            .o = try L.lin(i, .mla_o),
++            .kv_b = try L.cutLin(i, .mla_kv_b, true),
++            .o = try L.cutLin(i, .mla_o, false),
+         };
+         if (c.q_lora > 0) {
+             m.q_a = try L.lin(i, .mla_q_a);
+             m.q_a_norm = try L.small(i, .mla_q_a_norm, .bf16);
+-            m.q_b = try L.lin(i, .mla_q_b);
+-        } else m.q = try L.lin(i, .mla_q);
+-        if (c.head_gate) m.gate = try L.lin(i, .mla_gate);
++            m.q_b = try L.cutLin(i, .mla_q_b, true);
++        } else m.q = try L.cutLin(i, .mla_q, true);
++        if (c.head_gate) m.gate = try L.cutLin(i, .mla_gate, true);
+         return m;
+     }
+ 
+@@ -211,7 +252,7 @@ const Loader = struct {
+         return .{
+             .router = try L.small(i, .router, .bf16),
+             .bias = if (c.expert_bias) try L.small(i, .router_bias, .f32) else 0,
+-            .routed = try L.r.experts(i, count, x[0], x[1], lim.routed),
++            .routed = try L.r.experts(i, count, x[0], x[1], lim.routed, L.share(x[0])),
+             .shared = if (c.shared_inter > 0) try L.mlp(try std.fmt.bufPrint(&b, "model.layers.{d}.mlp.shared_experts.", .{i}), .shared_gate) else null,
+             .experts = count,
+             .shared_limit = lim.shared,
+@@ -245,8 +286,15 @@ const Loader = struct {
+ 
+ /// Layers `layers` (index c.layers is the MTP layer) from `ck`, each tensor in its stored format; `stream` blocking.
+ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, stream: cuda.Stream, pack: *const cuda.modelopt.Packer, ck: *core.Checkpoint, c: Config, layers: []const u32, opts: Options) !Weights {
+-    var w: Weights = .{ .config = c, .store = .{ .gpa = gpa, .d = d } };
+-    var L: Loader = .{ .r = .{ .gpa = gpa, .stream = stream, .pack = pack, .ck = ck, .c = &w.config, .store = &w.store, .stage = opts.stage }, .c = &w.config, .opts = opts };
++    var why: config.Why = .{};
++    const rc = cuts.rankConfig(c, opts.world, &why) catch |err| {
++        std.log.err("{s}", .{why.text()});
++        return err;
++    };
++    if (opts.world == 0 or opts.rank >= opts.world) return error.BadRank;
++    var w: Weights = .{ .config = rc, .rank = opts.rank, .world = opts.world, .store = .{ .gpa = gpa, .d = d } };
++    const full = c; // the loader reads the file's shapes; the forward runs the rank's
++    var L: Loader = .{ .r = .{ .gpa = gpa, .stream = stream, .pack = pack, .ck = ck, .c = &full, .store = &w.store, .stage = opts.stage }, .c = &full, .opts = opts };
+     errdefer w.store.drop(L.r.settled()); // the packers' outputs freed only once nothing queued writes them
+     const out = try gpa.alloc(Layer, layers.len);
+     errdefer gpa.free(out);
+@@ -267,7 +315,7 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, stream: cuda.Stream,
+     w.embed = try w.store.keep(e.bytes, "model.word_embeddings.weight");
+     w.norm = try L.r.small("model.norm.weight", names.numel(&w.config, .final_norm), .bf16);
+     const hd = names.dims(&w.config, .lm_head).linear;
+-    if (!c.tie) w.head = try L.r.linear("lm_head", hd[0], hd[1]);
++    if (!c.tie) w.head = if (L.share(hd[0])) |s| try cuts.linear(&L.r, "lm_head", hd[0], hd[1], .{ .out = &.{s} }) else try L.r.linear("lm_head", hd[0], hd[1]);
+     return w;
+ }
+ 
+diff --git a/zig/src/families/ling/weights_cut.zig b/zig/src/families/ling/weights_cut.zig
+new file mode 100644
+index 000000000..97046fb16
+--- /dev/null
++++ b/zig/src/families/ling/weights_cut.zig
+@@ -0,0 +1,214 @@
++//! A TP rank's share of Ling's tensors: EXL3 by whole 128-wide blocks (output columns, input rows), bf16 by rows.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const config = @import("config.zig");
++const proj = @import("weights_proj.zig");
++
++const Reader = proj.Reader;
++const Proj = proj.Proj;
++const Tensor = core.checkpoint.Tensor;
++
++/// [lo, hi) of an axis.
++pub const Span = struct {
++    lo: usize,
++    hi: usize,
++
++    pub fn len(s: Span) usize {
++        return s.hi - s.lo;
++    }
++};
++
++/// A linear [n, k]'s part: output rows in the `out` spans, in order (none: every row), input columns `in` (null: all).
++pub const Cut = struct { out: []const Span = &.{}, in: ?Span = null };
++
++/// Rank `rank`'s even share of `total`.
++pub fn even(total: usize, rank: usize, world: usize) Span {
++    const w = total / world;
++    return .{ .lo = rank * w, .hi = (rank + 1) * w };
++}
++
++/// A rank's config: heads and widths divided by the world, each share whole 128-wide blocks (EXL3's tiles).
++pub fn rankConfig(c: config.Config, world: u32, why: *config.Why) !config.Config {
++    if (world == 1) return c;
++    if (c.quant != .exl3) {
++        why.set("TP over {d} ranks reads EXL3 packs only (their 128-wide blocks are the cuts)", .{world});
++        return error.TpFormat;
++    }
++    var r = c;
++    r.kda_heads = c.kda_heads / world;
++    r.mla_heads = c.mla_heads / world;
++    r.dense_inter = c.dense_inter / world;
++    r.moe_inter = c.moe_inter / world;
++    r.shared_inter = c.shared_inter / world;
++    const parts = [_]struct { []const u8, u32, u32, u32 }{
++        .{ "KDA heads x 128", c.kda_heads * c.kda_dim, r.kda_heads * c.kda_dim, 1 },
++        .{ "MLA heads x qk", c.mla_heads * c.qkDim(), r.mla_heads * c.qkDim(), 1 },
++        .{ "intermediate_size", c.dense_inter, r.dense_inter, @intFromBool(c.dense_layers > 0) },
++        .{ "moe_intermediate_size", c.moe_inter, r.moe_inter, 1 },
++        .{ "the shared expert's width", c.shared_inter, r.shared_inter, @intFromBool(c.shared_inter > 0) },
++        .{ "vocab_size", c.vocab, c.vocab / world, 1 },
++    };
++    for (parts) |p| if (p[3] == 1 and (p[1] % world != 0 or p[2] * world != p[1] or p[2] % 128 != 0 or p[2] == 0)) {
++        why.set("{s} {d} does not split into {d} shares of whole 128-wide blocks", .{ p[0], p[1], world });
++        return error.TpShape;
++    };
++    if (c.kda_heads % world != 0 or c.mla_heads % world != 0) {
++        why.set("{d} KDA and {d} MLA heads do not split over {d} ranks", .{ c.kda_heads, c.mla_heads, world });
++        return error.TpShape;
++    }
++    return r;
++}
++
++fn blocks(s: Span) !void {
++    if (s.lo % 128 != 0 or s.hi % 128 != 0 or s.hi <= s.lo) return error.TpCut;
++}
++
++/// `t` [rows][row bytes] cut to rows `s` (and the shape to match).
++fn rowsOf(t: Tensor, s: Span) Tensor {
++    var u = t;
++    const row = t.bytes.len / t.shape[0];
++    u.bytes = t.bytes[s.lo * row .. s.hi * row];
++    u.shape[0] = s.len();
++    return u;
++}
++
++/// Linear `module` [n, k], cut; whole when the cut is empty (the TP=1 path, as Reader.linear reads it).
++pub fn linear(r: *Reader, module: []const u8, n: usize, k: usize, cut: Cut) !Proj {
++    if (cut.out.len == 0 and cut.in == null) return r.linear(module, n, k);
++    var b: [256]u8 = undefined;
++    const trellis = try std.fmt.bufPrint(&b, "{s}.trellis", .{module});
++    if (r.c.quant == .exl3 and r.ck.has(trellis)) return .{ .exl3 = try exl3(r, module, n, k, cut) };
++    if (r.c.format(module) != .bf16 and r.c.quant != .exl3) return error.TpFormat;
++    return plain(r, module, n, k, cut);
++}
++
++/// An EXL3 linear's cut as its own stored matrix: each tile row's spans of tile columns, or whole tile rows.
++fn exl3(r: *Reader, module: []const u8, n: usize, k: usize, cut: Cut) !cuda.exl3.Weight {
++    const g = try r.exl3Group(module, n, k);
++    const tile = g.trellis.shape[2] * 2;
++    const nt = g.n / 16;
++    var host: std.ArrayList(u8) = .empty;
++    defer host.deinit(r.gpa);
++    var sv: std.ArrayList(u8) = .empty;
++    defer sv.deinit(r.gpa);
++    var su: []const u8 = g.suh.bytes;
++    var kk = k;
++    var nn = g.n;
++    if (cut.in) |s| {
++        if (cut.out.len != 0) return error.TpCut;
++        try blocks(s);
++        try host.appendSlice(r.gpa, g.trellis.bytes[(s.lo / 16) * nt * tile .. (s.hi / 16) * nt * tile]);
++        su = g.suh.bytes[s.lo * 2 .. s.hi * 2];
++        try sv.appendSlice(r.gpa, g.svh.bytes);
++        kk = s.len();
++    } else {
++        nn = 0;
++        for (cut.out) |s| {
++            try blocks(s);
++            nn += s.len();
++            try sv.appendSlice(r.gpa, g.svh.bytes[s.lo * 2 .. s.hi * 2]);
++        }
++        for (0..k / 16) |row| for (cut.out) |s| {
++            try host.appendSlice(r.gpa, g.trellis.bytes[row * nt * tile + (s.lo / 16) * tile ..][0 .. (s.len() / 16) * tile]);
++        };
++    }
++    const st = cuda.exl3.strides(kk, nn, g.halves, false);
++    var nb: [256]u8 = undefined;
++    return .{
++        .trellis = try r.store.keep(host.items, module),
++        .suh = try r.store.keep(su, try std.fmt.bufPrint(&nb, "{s}.suh", .{module})),
++        .svh = try r.store.keep(sv.items, try std.fmt.bufPrint(&nb, "{s}.svh", .{module})),
++        .k = @intCast(kk),
++        .n = @intCast(nn),
++        .halves = g.halves,
++        .codebook = g.codebook,
++        .stride_k = st.k,
++        .stride_nb = st.nb,
++    };
++}
++
++/// A bf16 (or an EXL3 pack's fp16) linear cut by output rows, or by input columns, rounded to bf16 for the lanes.
++fn plain(r: *Reader, module: []const u8, n: usize, k: usize, cut: Cut) !Proj {
++    var b: [256]u8 = undefined;
++    const t = try r.ck.get(try std.fmt.bufPrint(&b, "{s}.weight", .{module}));
++    if (!(t.is(.bf16, &.{ n, k }) or t.is(.f16, &.{ n, k }))) return error.UnexpectedTensor;
++    var host: std.ArrayList(u8) = .empty;
++    defer host.deinit(r.gpa);
++    var rows: usize = 0;
++    var cols = k;
++    if (cut.in) |s| {
++        cols = s.len();
++        rows = n;
++        for (0..n) |i| {
++            var u = rowsOf(t, .{ .lo = i, .hi = i + 1 });
++            u.bytes = u.bytes[s.lo * 2 .. s.hi * 2];
++            u.shape[1] = cols;
++            try proj.append(r.gpa, &host, u, .bf16);
++        }
++    } else for (cut.out) |s| {
++        rows += s.len();
++        try proj.append(r.gpa, &host, rowsOf(t, s), .bf16);
++    }
++    var u = t;
++    u.dtype = .bf16;
++    u.bytes = host.items;
++    u.shape[0] = rows;
++    u.shape[1] = cols;
++    return r.bf16Of(module, u, rows, cols);
++}
++
++/// A vector `tensor` of `numel` values (A_log, dt_bias) cut to `s`, as `to`.
++pub fn small(r: *Reader, tensor: []const u8, numel: usize, to: core.checkpoint.DType, s: Span) !u64 {
++    const t = try r.ck.get(tensor);
++    if (t.numel() != numel) return error.UnexpectedTensor;
++    var u = t;
++    u.rank = 1;
++    u.shape[0] = numel;
++    var host: std.ArrayList(u8) = .empty;
++    defer host.deinit(r.gpa);
++    try proj.append(r.gpa, &host, rowsOf(u, s), to);
++    return r.store.keep(host.items, tensor);
++}
++
++/// The fused q|k|v conv1d [3n][taps] cut to `spans` of channels, fp32.
++pub fn convs(r: *Reader, tensor: []const u8, n3: usize, taps: usize, spans: []const Span) !u64 {
++    const t = try r.ck.get(tensor);
++    if (t.numel() != n3 * taps) return error.UnexpectedTensor;
++    var u = t;
++    u.rank = 2;
++    u.shape[0] = n3;
++    u.shape[1] = taps;
++    var host: std.ArrayList(u8) = .empty;
++    defer host.deinit(r.gpa);
++    for (spans) |s| try proj.append(r.gpa, &host, rowsOf(u, s), .f32);
++    return r.store.keep(host.items, tensor);
++}
++
++/// One expert's trellis cut by width: gate and up by tile columns, down by tile rows (into `a`, or a view).
++pub fn expertTrellis(a: std.mem.Allocator, g: Reader.Group, k: usize, by_cols: bool, s: Span) ![]const u8 {
++    try blocks(s);
++    const tile = g.trellis.shape[2] * 2;
++    const nt = g.n / 16;
++    if (!by_cols) return g.trellis.bytes[(s.lo / 16) * nt * tile .. (s.hi / 16) * nt * tile];
++    const w = (s.len() / 16) * tile;
++    const out = try a.alloc(u8, (k / 16) * w);
++    for (0..k / 16) |row| @memcpy(out[row * w ..][0..w], g.trellis.bytes[row * nt * tile + (s.lo / 16) * tile ..][0..w]);
++    return out;
++}
++
++test "a TP=2 config halves heads and widths on whole 128-wide blocks; other worlds and shapes are refused" {
++    var why: config.Why = .{};
++    var c = try config.parse(std.testing.allocator, @embedFile("fixtures/config.json"), &why);
++    try std.testing.expectError(error.TpFormat, rankConfig(c, 2, &why));
++    c.quant = .exl3;
++    const r = try rankConfig(c, 2, &why);
++    try std.testing.expectEqual(@as(u32, 32), r.kda_heads);
++    try std.testing.expectEqual(@as(u32, 32), r.mla_heads);
++    try std.testing.expectEqual(@as(u32, 640), r.moe_inter);
++    try std.testing.expectEqual(@as(u32, 5120), r.dense_inter);
++    try std.testing.expectEqual(c.vocab, r.vocab); // the head's half is the loader's; logits stay whole
++    try std.testing.expectEqual(Span{ .lo = 78592, .hi = 157184 }, even(c.vocab, 1, 2));
++    c.moe_inter = 128;
++    try std.testing.expectError(error.TpShape, rankConfig(c, 2, &why));
++}
+diff --git a/zig/src/families/ling/weights_proj.zig b/zig/src/families/ling/weights_proj.zig
+index 150f822ad..3c7e01e75 100644
+--- a/zig/src/families/ling/weights_proj.zig
++++ b/zig/src/families/ling/weights_proj.zig
+@@ -5,6 +5,8 @@ const core = @import("core");
+ const config = @import("config.zig");
+ 
+ const Quant = config.Quant;
++const cuts = @import("weights_cut.zig");
++const Span = cuts.Span;
+ const Tensor = core.checkpoint.Tensor;
+ const X8 = cuda.experts.Fp8Experts;
+ const X4 = cuda.experts.Nvfp4Experts;
+@@ -226,7 +228,7 @@ pub const Reader = struct {
+         return r.bf16Of(module, t, n, k);
+     }
+ 
+-    fn bf16Of(r: *Reader, module: []const u8, t: Tensor, n: usize, k: usize) !Proj {
++    pub fn bf16Of(r: *Reader, module: []const u8, t: Tensor, n: usize, k: usize) !Proj {
+         var src = try r.staged(t.bytes);
+         defer if (r.settled()) src.free(); // else leaked: a packer may still read it
+         const out = try r.store.alloc(cuda.modelopt.padded(n) * k * 2, module);
+@@ -326,8 +328,8 @@ pub const Reader = struct {
+         return r.store.keep(host.items, out_name);
+     }
+ 
+-    /// Layer i's routed experts 0..count [width, dims]: every projection of every expert in one format, or refused.
+-    pub fn experts(r: *Reader, i: u32, count: usize, width: usize, dims: usize, limit: f32) !Routed {
++    /// Layer i's routed experts 0..count [width, dims], one format; `cut`: a TP rank's span of the width (EXL3 only).
++    pub fn experts(r: *Reader, i: u32, count: usize, width: usize, dims: usize, limit: f32, cut: ?Span) !Routed {
+         const names = @import("names.zig");
+         var b: [192]u8 = undefined;
+         const f = r.c.format(try names.moduleName(&b, i, .expert_gate, 0));
+@@ -339,6 +341,7 @@ pub const Reader = struct {
+             }
+         };
+         var prefix: [96]u8 = undefined;
++        if (cut != null and f != .exl3) return error.TpFormat;
+         switch (f) {
+             .bf16 => {
+                 const lanes = try r.gpa.alloc(Mlp, count);
+@@ -349,12 +352,15 @@ pub const Reader = struct {
+             },
+             .fp8_block128 => return .{ .grouped = try r.fp8Experts(i, count, width, dims, limit) },
+             .nvfp4 => return .{ .grouped = try r.fp4Experts(i, count, width, dims, limit) },
+-            .exl3 => return .{ .grouped = try r.exl3Experts(i, count, width, dims, limit) },
++            .exl3 => return .{ .grouped = try r.exl3Experts(i, count, width, dims, limit, cut) },
+         }
+     }
+ 
+     /// experts.Layer's exl3 form (main's exl3_grouped): trellises as stored, pointers and half-bit widths per expert.
+-    fn exl3Experts(r: *Reader, i: u32, count: usize, ni: usize, d: usize, limit: f32) !cuda.experts.Layer {
++    fn exl3Experts(r: *Reader, i: u32, count: usize, ni: usize, d: usize, limit: f32, cut: ?Span) !cuda.experts.Layer {
++        const w = if (cut) |s| s.len() else ni; // a rank's width: gate and up by tile columns, down by tile rows
++        var arena = std.heap.ArenaAllocator.init(r.gpa);
++        defer arena.deinit();
+         var tables: [3]struct { ptrs: u64, k2: u64, suh: u64, svh: u64 } = undefined;
+         var codebook: ?cuda.exl3.Codebook = null;
+         var b: [192]u8 = undefined;
+@@ -376,12 +382,12 @@ pub const Reader = struct {
+             for (0..count) |e| {
+                 const g = try r.exl3Group(try expertModule(&b, i, e, proj), n, k);
+                 if (codebook) |c| (if (c != g.codebook) return error.MixedExperts) else codebook = g.codebook;
+-                parts[e] = g.trellis.bytes;
++                parts[e] = if (cut) |s| try cuts.expertTrellis(arena.allocator(), g, k, m < 2, s) else g.trellis.bytes;
+                 ptrs[e] = at; // offsets until the one upload below
+-                at += g.trellis.bytes.len;
++                at += parts[e].len;
+                 k2[e] = @intCast(g.halves);
+-                try su.appendSlice(r.gpa, g.suh.bytes);
+-                try sv.appendSlice(r.gpa, g.svh.bytes);
++                try su.appendSlice(r.gpa, if (cut != null and m == 2) g.suh.bytes[cut.?.lo * 2 .. cut.?.hi * 2] else g.suh.bytes);
++                try sv.appendSlice(r.gpa, if (cut != null and m < 2) g.svh.bytes[cut.?.lo * 2 .. cut.?.hi * 2] else g.svh.bytes);
+             }
+             const base = try r.store.keepAll(parts, try label(&lb, i, proj ++ ".trellis"));
+             for (ptrs) |*p| p.* += base;
+@@ -408,13 +414,13 @@ pub const Reader = struct {
+             .svh_d = tables[2].svh,
+             .experts = count,
+             .dims = d,
+-            .width = ni,
++            .width = w,
+             .codebook = codebook orelse return error.UnexpectedTensor,
+             .limit = limit,
+             .act_mode = 1, // fp32 silu(g) * u, nearest exllamav3's fp16 intermediate
+         };
+         // after: Ling's order, min(silu(g), L) * clip(u, -L, L), on the shared finish's twin (plan_finish_after)
+-        return .{ .format = .exl3, .exl3 = lay, .up = 0, .down = 0, .width = ni, .dims = d, .experts = count, .limit = limit, .after = true };
++        return .{ .format = .exl3, .exl3 = lay, .up = 0, .down = 0, .width = w, .dims = d, .experts = count, .limit = limit, .after = true };
+     }
+ 
+     fn expertModule(b: []u8, i: u32, e: usize, comptime proj: []const u8) ![]const u8 {
+diff --git a/zig/tests/cuda/ling_cmds.zig b/zig/tests/cuda/ling_cmds.zig
+index a758fbc9b..e01e2a615 100644
+--- a/zig/tests/cuda/ling_cmds.zig
++++ b/zig/tests/cuda/ling_cmds.zig
+@@ -15,6 +15,7 @@ pub const usage =
+     \\  ling-exl3-layers <dir> <ref> <out>   real EXL3 layers on exllamav3's inputs (prompt and decode), outputs saved
+     \\  ling-init-faults <dir> [--mtp] [--every N]   the backend opened with each driver call, then each allocation, failing
+     \\  ling-exl3-clamp <dir> [layer]   an EXL3 MoE layer's grouped gate-up in Ling's clamp order vs float64
++    \\  ling-tp <dir> <out> [--layers a,b] [--steps N]   greedy rows at TP=1, or TP=2 over TF_LING_RANK/WORLD
+     \\
+ ;
+ 
+@@ -51,6 +52,8 @@ pub fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !bool {
+         try @import("ling_faults.zig").run(gpu, rest);
+     } else if (eq(u8, cmd, "ling-exl3-clamp")) {
+         try @import("ling_exl3_clamp.zig").run(gpu, rest);
++    } else if (eq(u8, cmd, "ling-tp")) {
++        try @import("ling_tp.zig").run(gpu, rest);
+     } else return false;
+     return true;
+ }
+diff --git a/zig/tests/cuda/ling_exl3_layers.zig b/zig/tests/cuda/ling_exl3_layers.zig
+index 0d70e6e99..cf74458ac 100644
+--- a/zig/tests/cuda/ling_exl3_layers.zig
++++ b/zig/tests/cuda/ling_exl3_layers.zig
+@@ -7,6 +7,7 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const check = @import("check.zig");
+ const rig = @import("ling_forward_rig.zig");
++const ling = @import("ling_cuda");
+ 
+ const F = rig.F;
+ const Rig = rig.Rig;
+@@ -71,6 +72,17 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+         return e;
+     };
+     defer o.ck.close();
++    var shift: u32 = 0; // --rope-shift N: the rope reads positions N.. (keys from 0), as the reference's `position`
++    var k: usize = 3;
++    while (k < rest.len) : (k += 1) {
++        if (std.mem.eql(u8, rest[k], "--yarn")) {
++            o.c.yarn = o.c.rope_scaling orelse ling.rope.cookbook(o.c.max_pos);
++        } else if (std.mem.eql(u8, rest[k], "--rope-shift") and k + 1 < rest.len) {
++            k += 1;
++            shift = try std.fmt.parseInt(u32, rest[k], 10);
++        } else return error.BadArgument;
++    }
++    if (o.c.yarn) |y| std.debug.print("RESULT ling-exl3-layers: YaRN factor {d} over {d}, attention factor {d:.9}, rope from {d}\n", .{ y.factor, y.original, ling.rope.attentionFactor(y), shift });
+     try check.expect(o.c.hidden == D, "hidden {d}, the reference's {d}", .{ o.c.hidden, D });
+     var m = try F.Modules.load(gpu.d, gpu.ctx);
+     defer m.deinit();
+@@ -103,6 +115,7 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+         const moe = w.layers[j].ffn == .moe;
+         // prompt: all T rows in one forward of a fresh sequence
+         const sp = try r.state(T + 8);
++        sp.rope_base = shift;
+         try upload(&r, pb.x, in);
+         try r.fwd(&pb, if (moe) pp else null).one(&.{.{ .st = sp, .row0 = 0, .rows = T }}, j, if (moe) pp else null);
+         try rowsBack(&r, pb.x, got);
+@@ -110,6 +123,7 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+         if (!moe) @memset(ppicks, 0);
+         // decode: one row a forward, each committed, on another fresh sequence
+         const sd = try r.state(T + 8);
++        sd.rope_base = shift;
+         const dpicks = try a.alloc(u8, T * slots * 4);
+         @memset(dpicks, 0);
+         for (0..T) |t| {
+diff --git a/zig/tests/cuda/ling_ref_mla.zig b/zig/tests/cuda/ling_ref_mla.zig
+index f2cc45807..7347383e3 100644
+--- a/zig/tests/cuda/ling_ref_mla.zig
++++ b/zig/tests/cuda/ling_ref_mla.zig
+@@ -8,7 +8,8 @@ const Gpu = check.Gpu;
+ const Rig = qr.RigT;
+ const bf = qr.helpers.bfOf;
+ const latent = glm.latent;
+-const ops = @import("ling_cuda").ops;
++const ling = @import("ling_cuda");
++const ops = ling.ops;
+ var lk: *const ops.Kernels = undefined; // the tf_ling_* entries, loaded in run
+ 
+ const heads = 64;
+@@ -111,43 +112,49 @@ fn projections(r: *Rig) !void {
+ /// rope (q heads into qa, cache rows in place) at two positions vs float64 on fp32 angles; head gate vs float64.
+ fn ropeGate(r: *Rig) !void {
+     const rows = 40;
+-    const freqs = ops.ropeFreqs(6000000);
+-    const dfreq = try r.dev(std.mem.asBytes(&freqs));
++    const plain = ops.ropeFreqs(6000000);
++    const yarn = ling.rope.cookbook(262144); // YaRN at 1M: its inv_freq, cos and sin times the attention factor
++    const yfreqs = ling.rope.yarnFreqs(6000000, yarn);
++    const af: f32 = @floatCast(ling.rope.attentionFactor(yarn));
+     const q = try r.bfs(rows * heads * qk, 1.0);
+     const dq = try r.dev(std.mem.sliceAsBytes(q));
+     const qd = try f64s(r, q);
+     var name: [128]u8 = undefined;
+-    for ([_]i32{ 1000, 261000 }) |p0| {
++    for ([_]i32{ 1000, 261000, 900000 }) |p0| {
++        const y = p0 > 262144;
++        const freqs = if (y) yfreqs else plain;
++        const scale: f32 = if (y) af else 1;
++        const dfreq = try r.dev(std.mem.asBytes(&freqs));
+         const at = try r.dev(std.mem.asBytes(&p0));
+         const qa = try r.zeros(rows * heads * kw * 2);
+         const v: ops.RopeRows = .{ .x = dq + nope * 2, .x_row = heads * qk, .x_head = qk, .out = qa + lw * 2, .o_row = heads * kw, .o_head = kw };
+-        try ops.rope(lk, r.s, v, rows, heads, at, dfreq);
++        try ops.rope(lk, r.s, v, rows, heads, at, dfreq, scale);
+         const want = try r.a.alloc(f64, rows * heads * rw);
+         const tol = try r.a.alloc(f64, rows * heads * rw);
+         for (0..rows) |row| for (0..heads) |h| for (0..rw / 2) |i| {
+             const ang: f64 = freqs[i] * @as(f32, @floatFromInt(p0 + @as(i32, @intCast(row))));
+             const x0 = qd[(row * heads + h) * qk + nope + 2 * i];
+             const x1 = qd[(row * heads + h) * qk + nope + 2 * i + 1];
+-            const c = @cos(ang);
+-            const s = @sin(ang);
++            const c = @cos(ang) * scale;
++            const s = @sin(ang) * scale;
+             const at2 = (row * heads + h) * rw + 2 * i;
+             want[at2] = x0 * c - x1 * s;
+             want[at2 + 1] = x1 * c + x0 * s;
+             for (0..2) |e| tol[at2 + e] = @abs(want[at2 + e]) * std.math.pow(f64, 2, -8) + (@abs(x0) + @abs(x1)) * 8 * u + 1e-30;
+         };
+         const all = try r.back(qa, rows * heads * kw * 2);
+-        try within(r, try std.fmt.bufPrint(&name, "rope: 40 rows x 64 heads at {d} (GPT-J pairs, fp32 angles)", .{p0}), all, kw, lw, rw, want, tol);
++        try within(r, try std.fmt.bufPrint(&name, "rope: 40 rows x 64 heads at {d} (GPT-J pairs, fp32 angles{s})", .{ p0, if (y) ", YaRN" else "" }), all, kw, lw, rw, want, tol);
+         const p1: i32 = p0 + 23;
+         const one = try r.zeros(heads * kw * 2);
+         const v1: ops.RopeRows = .{ .x = dq + (23 * heads * qk + nope) * 2, .x_row = heads * qk, .x_head = qk, .out = one + lw * 2, .o_row = heads * kw, .o_head = kw };
+-        try ops.rope(lk, r.s, v1, 1, heads, try r.dev(std.mem.asBytes(&p1)), dfreq);
++        try ops.rope(lk, r.s, v1, 1, heads, try r.dev(std.mem.asBytes(&p1)), dfreq, scale);
+         const got = try r.back(one, heads * kw * 2);
+         for (0..heads) |h| try check.sameBytes("rope: row 23 alone equals its row", got[(h * kw + lw) * 2 ..][0 .. rw * 2], all[((23 * heads + h) * kw + lw) * 2 ..][0 .. rw * 2]);
+         // a cache row's k_rope in place equals q's rope of the same values at the same position
+         const k = try r.dev(all[(23 * heads * kw) * 2 ..][0 .. kw * 2]);
+         @memcpy(all[(23 * heads * kw + lw) * 2 ..][0 .. rw * 2], std.mem.sliceAsBytes(q[(23 * heads) * qk + nope ..][0..rw]));
+         const kin = try r.dev(all[(23 * heads * kw) * 2 ..][0 .. kw * 2]);
+-        try ops.rope(lk, r.s, .{ .x = kin + lw * 2, .x_row = kw, .x_head = 0, .out = kin + lw * 2, .o_row = kw, .o_head = 0 }, 1, 1, try r.dev(std.mem.asBytes(&p1)), dfreq);
++        try ops.rope(lk, r.s, .{ .x = kin + lw * 2, .x_row = kw, .x_head = 0, .out = kin + lw * 2, .o_row = kw, .o_head = 0 }, 1, 1, try r.dev(std.mem.asBytes(&p1)), dfreq, scale);
+         try check.sameBytes("rope: a cache row in place equals the q rope", try r.back(kin, kw * 2), try r.back(k, kw * 2));
+     }
+     check.pass("rope: within float64 tolerance, a row alone and a cache row in place equal", .{});
+diff --git a/zig/tests/cuda/ling_synth.zig b/zig/tests/cuda/ling_synth.zig
+index 82cf683aa..d0b0fdbd9 100644
+--- a/zig/tests/cuda/ling_synth.zig
++++ b/zig/tests/cuda/ling_synth.zig
+@@ -123,14 +123,20 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+     if (rest.len == 0) return error.MissingArgument;
+     var format: Quant = .fp8_block128;
+     var layers: u32 = 4;
++    var inter: ?u32 = null; // --moe-inter N: routed and shared expert width (256 splits into TP=2's 128-wide blocks)
+     var i: usize = 1;
+     while (i + 1 < rest.len) : (i += 2) {
+-        if (std.mem.eql(u8, rest[i], "--format")) format = try formatOf(rest[i + 1]) else if (std.mem.eql(u8, rest[i], "--layers")) layers = try std.fmt.parseInt(u32, rest[i + 1], 10) else return error.BadArgument;
++        if (std.mem.eql(u8, rest[i], "--format")) format = try formatOf(rest[i + 1]) else if (std.mem.eql(u8, rest[i], "--layers")) layers = try std.fmt.parseInt(u32, rest[i + 1], 10) else if (std.mem.eql(u8, rest[i], "--moe-inter")) inter = try std.fmt.parseInt(u32, rest[i + 1], 10) else return error.BadArgument;
+     }
+     var arena = std.heap.ArenaAllocator.init(gpu.gpa);
+     defer arena.deinit();
+     const a = arena.allocator();
+-    const json = try ling.synth.configJson(a, format, layers);
++    var json = try ling.synth.configJson(a, format, layers);
++    if (inter) |n| {
++        var root = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
++        for ([_][]const u8{ "moe_intermediate_size", "moe_shared_expert_intermediate_size" }) |key| try root.object.put(a, key, .{ .integer = n });
++        json = try std.json.Stringify.valueAlloc(a, root, .{ .whitespace = .indent_2 });
++    }
+     var why: ling.config.Why = .{};
+     const c = ling.config.parse(a, json, &why) catch |e| {
+         std.debug.print("the tiny config does not parse: {s}\n", .{why.text()});
+diff --git a/zig/tests/cuda/ling_tp.zig b/zig/tests/cuda/ling_tp.zig
+new file mode 100644
+index 000000000..3baee4cf9
+--- /dev/null
++++ b/zig/tests/cuda/ling_tp.zig
+@@ -0,0 +1,89 @@
++//! `ling-tp DIR OUT [--layers a,b] [--steps N]`: a prompt then N greedy rows at TP=1, or on both ranks at TP=2.
++
++// TP=2 by TF_LING_RANK, TF_LING_WORLD and NCCL_COMM_ID; rank 1 runs tp.follow (the serving loop) on rank 0's steps.
++
++// OUT (rank 0): "TFLTP001", u32 world, vocab, rows (the prompt's last row, then N), u32 tokens[rows], bf16 logits.
++const std = @import("std");
++const cuda = @import("cuda");
++const check = @import("check.zig");
++const ling = @import("ling_cuda");
++
++const engine = ling.engine;
++
++pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
++    if (rest.len < 2) return error.MissingArgument;
++    var arena = std.heap.ArenaAllocator.init(gpu.gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var layers: ?[]u32 = null;
++    var steps: usize = 64;
++    var k: usize = 2;
++    while (k < rest.len) : (k += 1) {
++        if (std.mem.eql(u8, rest[k], "--layers") and k + 1 < rest.len) {
++            k += 1;
++            var list: std.ArrayList(u32) = .empty;
++            var it = std.mem.splitScalar(u8, rest[k], ',');
++            while (it.next()) |x| try list.append(a, try std.fmt.parseInt(u32, x, 10));
++            layers = list.items;
++        } else if (std.mem.eql(u8, rest[k], "--steps") and k + 1 < rest.len) {
++            k += 1;
++            steps = try std.fmt.parseInt(usize, rest[k], 10);
++        } else return error.BadArgument;
++    }
++    const p = try ling.tp.place(ling.tp.env);
++    var group: ?cuda.tp_group.Group = null;
++    if (p.world > 1) {
++        try cuda.tp_watch.start(gpu.io, p.rank, p.world);
++        group = try ling.tp.group(gpu.io, p);
++    }
++    defer if (group) |*g| g.close();
++    const cap = 512;
++    const e = try engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, rest[0], .{ .capacity = cap, .layers = layers, .group = if (group) |*g| g else null });
++    defer e.deinit();
++    var link: ?ling.tp.Link = null;
++    defer if (link) |*l| l.deinit();
++    if (group) |*g| {
++        link = try ling.tp.Link.init(gpu.gpa, gpu.d, &g.lib, g.comm, e.stream, cap);
++        e.link = &link.?;
++        e.lead = p.rank == 0;
++        var dg: [32]u8 = @splat(0);
++        std.crypto.hash.sha2.Sha256.hash(rest[0], &dg, .{});
++        try cuda.tp_watch.ready(gpu.io, dg);
++        if (p.rank != 0) {
++            try ling.tp.follow(e, gpu.io);
++            check.pass("ling-tp rank {d}: followed rank 0's steps to its end", .{p.rank});
++            return;
++        }
++        e.asleep = cuda.tp_watch.open();
++    }
++    const V: usize = e.c.vocab;
++    const P = 40;
++    var ids: [P]u32 = undefined;
++    var rng = std.Random.DefaultPrng.init(0x6c696e67);
++    for (&ids) |*t| t.* = rng.random().uintLessThan(u32, @intCast(@min(V, 30000)));
++    const rows = steps + 1;
++    const logits = try a.alloc(u16, rows * V);
++    const toks = try a.alloc(u32, rows);
++    try e.bind(0);
++    try e.begin(null);
++    toks[0] = try e.prefill(&ids, null, null, null);
++    try e.stream.synchronize();
++    try e.bp.arena.buf.download(e.bp.logits - e.bp.arena.buf.ptr, std.mem.sliceAsBytes(logits[0..V]));
++    for (1..rows) |s| {
++        var out: [1]u32 = undefined;
++        try e.verify(toks[s - 1 ..][0..1], &out);
++        try e.bd.arena.buf.download(e.bd.logits - e.bd.arena.buf.ptr, std.mem.sliceAsBytes(logits[s * V ..][0..V]));
++        try e.keep(1);
++        toks[s] = out[0];
++    }
++    try e.end();
++    cuda.tp_watch.ended();
++    var buf: std.ArrayList(u8) = .empty;
++    try buf.appendSlice(a, "TFLTP001");
++    for ([_]u32{ p.world, @intCast(V), @intCast(rows) }) |v| try buf.appendSlice(a, std.mem.asBytes(&v));
++    try buf.appendSlice(a, std.mem.sliceAsBytes(toks));
++    try buf.appendSlice(a, std.mem.sliceAsBytes(logits));
++    try std.Io.Dir.cwd().writeFile(gpu.io, .{ .sub_path = rest[1], .data = buf.items });
++    std.debug.print("RESULT ling-tp world {d}: {d} prompt ids, {d} greedy rows; tokens {any}\n", .{ p.world, P, steps, toks[0..@min(rows, 16)] });
++    check.pass("ling-tp world {d}: rows saved in {s}", .{ p.world, rest[1] });
++}
+-- 
+2.53.0
+

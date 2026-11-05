@@ -1,0 +1,729 @@
+From b17cdce00feea3e6f6385b937af5233c50c8493c Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 21:45:53 +1100
+Subject: [PATCH 26/26] ling: kept prompt states on disk
+ (--learn-conversations, --spill-gib) through main's rows store: one image in
+ rank 0's store holding every rank's KDA parts, the MTP layer's rows and each
+ MLA layer's rows by position from the rank holding them (split or not); rank
+ 1's share moves over NCCL in blank/disk_out/disk_in steps; a state read back
+ restores as a copy, settled in place past the native window; the CUDA disk
+ open takes a family's host staging permit (Ling: 4 GiB, 2 GiB past the native
+ window); test-ling registered through cuda_engines.lingHost and the runner's
+ ling_cuda import in the family list, so zig/build/cuda.zig stays at 600 lines
+
+---
+ zig/build/cuda.zig               |   8 +-
+ zig/build/cuda_engines.zig       |   8 +
+ zig/src/families/ling/cuda.zig   |   1 +
+ zig/src/families/ling/disk.zig   | 390 +++++++++++++++++++++++++++++++
+ zig/src/families/ling/engine.zig |   2 +
+ zig/src/families/ling/kept.zig   |  63 ++++-
+ zig/src/families/ling/native.zig |   2 +
+ zig/src/families/ling/tp.zig     |   8 +-
+ zig/src/native/cuda_disk.zig     |  11 +-
+ 9 files changed, 470 insertions(+), 23 deletions(-)
+ create mode 100644 zig/src/families/ling/disk.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 487f09b3c..578206363 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -106,8 +106,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     const glm_cuda = glmCuda(b, target, optimize, cuda, mods.core, mods.lanes, mods.heat, mods.api);
+     runner.addImport("glm_cuda", glm_cuda);
+     @import("minimax_cuda.zig").targets(b, target, optimize, strip, cuda, mods.core, mods.lanes, runner);
+-    runner.addImport("ling_cuda", engines_build.lingCuda(b, target, optimize, cuda, mods.core, mods.lanes, glm_cuda));
+-    for ([_]struct { []const u8, *std.Build.Module }{ .{ "kolibri1", kolibri1Module(b, target, optimize, cuda, mods.core, mods.lanes) }, .{ "dory", @import("dory.zig").module(b, target, optimize, cuda, mods.core, mods.lanes) } }) |m| runner.addImport(m[0], m[1]);
++    for ([_]struct { []const u8, *std.Build.Module }{ .{ "kolibri1", kolibri1Module(b, target, optimize, cuda, mods.core, mods.lanes) }, .{ "dory", @import("dory.zig").module(b, target, optimize, cuda, mods.core, mods.lanes) }, .{ "ling_cuda", engines_build.lingCuda(b, target, optimize, cuda, mods.core, mods.lanes, glm_cuda) } }) |m| runner.addImport(m[0], m[1]);
+     runner.addImport("gemma4_cuda", @import("gemma4_cuda.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
+     runner.addImport("spark25", @import("spark25.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
+     runner.addImport("moss_image_cuda", b.createModule(.{ .root_source_file = b.path("zig/src/families/moss_image/cuda_kernels.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "cuda", .module = cuda }} }));
+@@ -486,10 +485,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     b.step("test-glm-grants-host", "GLM CUDA head-cost policy without a GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"shared head costs:"} })).step);
+     skip_drafts.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"zero grant:"} })).step);
+     @import("glm_family_host.zig").steps(b, cuda, glm, mods, step);
+-    // Ling-3.1-flash's CUDA family on the host: loader, graph, engine and lanes compile; routing as the kernels take it
+-    const ling_run = b.addRunArtifact(b.addTest(.{ .root_module = engines_build.lingCuda(b, host, .debug, cuda, mods.core, mods.lanes, glm) }));
+-    step.dependOn(&ling_run.step);
+-    b.step("test-ling", "Ling-3.1-flash's CUDA family on the host: loader, graph, engine and lanes compile, no GPU work").dependOn(&ling_run.step);
++    engines_build.lingHost(b, host, cuda, mods.core, mods.lanes, glm, step);
+     @import("kolibri.zig").host(b, kolibri1Module(b, host, .debug, cuda, mods.core, mods.lanes), native_modules.api, step);
+     const gemma = @import("gemma4_cuda.zig").module(b, host, .debug, cuda, mods.core, mods.lanes);
+     b.step("test-gemma-grants-host", "Gemma assistant and DFlash head-cost grants without a GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gemma, .filters = &.{"shared head costs:"} })).step);
+diff --git a/zig/build/cuda_engines.zig b/zig/build/cuda_engines.zig
+index 0332c1401..42becafdf 100644
+--- a/zig/build/cuda_engines.zig
++++ b/zig/build/cuda_engines.zig
+@@ -19,9 +19,17 @@ pub fn glmCuda(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+ pub fn lingCuda(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, glm: *std.Build.Module) *std.Build.Module {
+     const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/ling/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     for ([_]struct { []const u8, *std.Build.Module }{ .{ "glm_cuda", glm }, .{ "cuda", cuda }, .{ "core", core }, .{ "lanes", lanes } }) |x| m.addImport(x[0], x[1]);
++    m.addImport("engine_api", glm.import_table.get("engine_api").?); // its disk image names the rows store's types: GLM's, the server's
+     return m;
+ }
+ 
++/// test-ling: Ling-3.1-flash's CUDA family on the host (loader, graph, engine, lanes and routing; no GPU work).
++pub fn lingHost(b: *std.Build, host: std.Build.ResolvedTarget, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, glm: *std.Build.Module, step: *std.Build.Step) void {
++    const run = b.addRunArtifact(b.addTest(.{ .root_module = lingCuda(b, host, .debug, cuda, core, lanes, glm) }));
++    step.dependOn(&run.step);
++    b.step("test-ling", "Ling-3.1-flash's CUDA family on the host: loader, graph, engine and lanes compile, no GPU work").dependOn(&run.step);
++}
++
+ /// LFM2 (d1's decision model) on CUDA: config, weights, kernels and the forward that scores labels.
+ pub fn lfm2Module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module) *std.Build.Module {
+     return b.createModule(.{ .root_source_file = b.path("zig/src/families/lfm2/lfm2.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core } } });
+diff --git a/zig/src/families/ling/cuda.zig b/zig/src/families/ling/cuda.zig
+index be24212b8..5671c075e 100644
+--- a/zig/src/families/ling/cuda.zig
++++ b/zig/src/families/ling/cuda.zig
+@@ -31,6 +31,7 @@ test {
+     _ = @import("config_test.zig");
+     _ = @import("rope.zig");
+     _ = @import("tp.zig");
++    _ = @import("disk.zig");
+     _ = @import("state.zig");
+     _ = @import("engine.zig");
+     _ = @import("weights_cut.zig");
+diff --git a/zig/src/families/ling/disk.zig b/zig/src/families/ling/disk.zig
+new file mode 100644
+index 000000000..b88c0e77c
+--- /dev/null
++++ b/zig/src/families/ling/disk.zig
+@@ -0,0 +1,390 @@
++//! Ling's kept states on disk (--learn-conversations, --spill-gib): every rank's share in rank 0's one image.
++const std = @import("std");
++const cuda = @import("cuda");
++const lanes = @import("lanes");
++const api = @import("engine_api");
++const engine = @import("engine.zig");
++const kept = @import("kept.zig");
++const tp = @import("tp.zig");
++const state = @import("state.zig");
++const rows = api.prompt_cache.rows;
++const Engine = engine.Engine;
++const Snap = kept.Snap;
++const Allocator = std.mem.Allocator;
++
++/// The store's view of a kept state: words, each rank's KDA parts, the MTP layer's rows, then each MLA layer's rows.
++pub const image: rows.Image = .{ .parts = parts, .gather = gather, .blank = blank, .scatter = scatter, .whole = whole };
++
++const row = state.cache_width * 2; // a latent cache row's bytes
++const chunk = @import("graph.zig").latent.chunk; // the split's unit: positions [c * chunk, (c + 1) * chunk) on rank c % world
++const scratch_bytes = 64 << 20; // the ranks' transfer buffer, each
++const piece_max = 16 << 20; // the most bytes one copied piece holds
++const batch_max = 128; // pieces one step names
++
++const Words = extern struct { at: u32, hd_pos: u32, world: u32, hd: u32, head: u32, hd_head: u32, mla: u32, hd_mla: u32 };
++const words = @sizeOf(Words);
++
++/// The image's shape: rank count, each rank's KDA bytes (backbone, MTP layer), MLA layers, and the cache split.
++const Shape = struct { world: usize, head: usize, hd_head: usize, mla: usize, hd_mla: usize, hd: bool, split: ?state.Split };
++
++fn shape(e: *const Engine) !Shape {
++    const q = e.seqs.items[0] orelse return error.NoSequence;
++    const hd = q.hd;
++    return .{ .world = e.w.world, .head = q.st.keptHead(), .hd_head = if (hd) |h| h.keptHead() else 0, .mla = q.st.mla_layers, .hd_mla = if (hd) |h| h.mla_layers else 0, .hd = hd != null, .split = q.st.split };
++}
++
++/// Offsets of the image's parts at `at`: the KDA parts, the MTP rows (positions below at + 1), the MLA rows.
++const Layout = struct {
++    heads: u64,
++    hd_rows: u64,
++    rows: u64,
++    end: u64,
++    fn of(sh: Shape, at: u64) Layout {
++        const heads: u64 = words;
++        const hd_rows = heads + sh.world * (sh.head + sh.hd_head);
++        const mla = hd_rows + sh.hd_mla * (at + 1) * row;
++        return .{ .heads = heads, .hd_rows = hd_rows, .rows = mla, .end = mla + sh.mla * at * row };
++    }
++};
++
++fn parts(ptr: *anyopaque, at: u32, out: *std.ArrayList(rows.image.Part), a: Allocator) anyerror!void {
++    const sh = try shape(eng(ptr));
++    const l = Layout.of(sh, at);
++    try out.append(a, .{ .bytes = words });
++    if (l.hd_rows > l.heads) try out.append(a, .{ .bytes = l.hd_rows - l.heads });
++    if (l.rows > l.hd_rows) try out.append(a, .{ .bytes = l.rows - l.hd_rows }); // MTP rows read token p + 1: own
++    for (0..sh.mla) |_| try out.append(a, .{ .bytes = @as(u64, at) * row, .row = row });
++}
++
++fn eng(ptr: *anyopaque) *Engine {
++    return @ptrCast(@alignCast(ptr));
++}
++
++/// One piece of a range: a rank's region (0: KDA, 1: MTP KDA, 2 + mi: MLA layer mi, 2 + mla + mi: MTP layer mi).
++const Seg = struct { len: usize, rank: usize = 0, region: u32 = 0, local: u64 = 0, kind: enum { words, data, zero } = .data, all: bool = false };
++
++/// The pieces of image bytes [off, off + len) for a state at `at` whose MTP rows stand at `hd_pos`.
++fn segments(sh: Shape, at: u64, hd_pos: u64, off: u64, len: u64, out: *std.ArrayList(Seg), a: Allocator) !void {
++    const l = Layout.of(sh, at);
++    var o = off;
++    const end = off + len;
++    if (end > l.end) return error.BadKeptRange;
++    while (o < end) {
++        var s: Seg = .{ .len = 0 };
++        if (o < words) {
++            s = .{ .len = @intCast(@min(end, words) - o), .kind = .words, .local = o };
++        } else if (o < l.hd_rows) {
++            const x = o - l.heads;
++            const kda = sh.world * sh.head;
++            const one: u64 = if (x < kda) sh.head else sh.hd_head;
++            const y = if (x < kda) x else x - kda;
++            s = .{ .len = 0, .rank = @intCast(y / one), .region = if (x < kda) 0 else 1, .local = y % one };
++            s.len = @intCast(@min(end - o, one - s.local, piece_max));
++        } else if (o < l.rows) {
++            const x = o - l.hd_rows;
++            const n = (at + 1) * row;
++            s = positional(sh, x % n, @min(end - o, n - x % n), hd_pos, @intCast(2 + sh.mla + x / n));
++        } else {
++            const x = o - l.rows;
++            const n = at * row;
++            s = positional(sh, x % n, @min(end - o, n - x % n), at, @intCast(2 + x / n));
++        }
++        try out.append(a, s);
++        o += s.len;
++    }
++}
++
++/// A layer's bytes from `b` (of `n`) by position: the rank holding its chunk, rows past `limit` zero.
++fn positional(sh: Shape, b: u64, most: u64, limit: u64, region: u32) Seg {
++    const p = b / row;
++    const c = p / chunk;
++    var len = @min(most, (c + 1) * chunk * row - b, piece_max);
++    if (b >= limit * row) return .{ .len = @intCast(len), .kind = .zero };
++    len = @min(len, limit * row - b);
++    const s = sh.split orelse return .{ .len = @intCast(len), .region = region, .local = b, .all = true };
++    return .{ .len = @intCast(len), .rank = c % s.world, .region = region, .local = ((c / s.world) * chunk + p % chunk) * row + b % row };
++}
++
++/// Where region `region` of this rank's state `s` starts: its KDA buffers, or its rows (in place, or in the copy).
++fn regionAt(e: *const Engine, s: *const Snap, region: u32) !u64 {
++    const q = e.seqs.items[0] orelse return error.NoSequence;
++    if (region == 0) return s.buf.ptr;
++    const hb = if (s.hd) |*x| x.ptr else 0;
++    if (region == 1) return if (s.hd != null) hb else error.BadKeptRange;
++    const mi: usize = region - 2;
++    if (mi < q.st.mla_layers) {
++        if (s.src) |src| return src.st.cacheAt(mi);
++        return s.buf.ptr + q.st.keptHead() + mi * q.st.below(s.pos) * row;
++    }
++    const h = q.hd orelse return error.BadKeptRange;
++    const hi = mi - q.st.mla_layers;
++    if (s.src) |src| return src.hd.?.cacheAt(hi);
++    if (s.hd == null) return error.BadKeptRange;
++    return hb + h.keptHead() + hi * h.below(if (s.hd_room > 0) s.hd_room else s.hd_pos) * row;
++}
++
++fn snapOf(e: *Engine, saved: api.prompt_cache.Saved) !struct { id: u64, at: u32, s: *Snap } {
++    const k: *const engine.Kept = @ptrCast(@alignCast(saved));
++    return .{ .id = k.id, .at = k.at, .s = e.snaps.getPtr(k.id) orelse return error.NoKeptState };
++}
++
++fn scratch(e: *Engine) !u64 {
++    if (e.disk_buf == null) e.disk_buf = try cuda.DeviceBuffer.alloc(e.d, scratch_bytes);
++    return e.disk_buf.?.ptr;
++}
++
++fn toHost(e: *const Engine, out: []u8, src: u64) !void {
++    try e.d.check(e.d.api.cuMemcpyDtoH_v2(@ptrCast(out.ptr), src, out.len), "cuMemcpyDtoH");
++}
++
++fn toDevice(e: *const Engine, dst: u64, in: []const u8) !void {
++    try e.d.check(e.d.api.cuMemcpyHtoD_v2(dst, @ptrCast(in.ptr), in.len), "cuMemcpyHtoD");
++}
++
++/// Pieces of rank 1's share one step moves: (region, local offset low, high, bytes) each, and where they sit here.
++const Batch = struct {
++    ids: [batch_max * 4]u32 = undefined,
++    at: [batch_max]usize = undefined,
++    n: usize = 0,
++    bytes: usize = 0,
++
++    fn fits(b: *const Batch, len: usize) bool {
++        return b.n < batch_max and b.bytes + len <= scratch_bytes;
++    }
++
++    fn add(b: *Batch, s: Seg, at: usize) void {
++        b.ids[4 * b.n ..][0..4].* = .{ s.region, @truncate(s.local), @intCast(s.local >> 32), @intCast(s.len) };
++        b.at[b.n] = at;
++        b.n += 1;
++        b.bytes += s.len;
++    }
++};
++
++/// Rank 1's pieces of state `id` into rank 0's `out`: one step, one NCCL transfer into the scratch, then to the host.
++fn flushOut(e: *Engine, b: *Batch, id: u64, out: []u8) !void {
++    if (b.n == 0) return;
++    const g = e.g.tp orelse return error.NoGroup;
++    const buf = try scratch(e);
++    try e.sendOn(e.slot, .{ .kind = @backingInt(tp.Kind.disk_out), .a = id }, b.ids[0 .. 4 * b.n]);
++    try g.recv(e.stream, buf, b.bytes, 1);
++    try e.stream.synchronize();
++    var o: usize = 0;
++    for (0..b.n) |i| {
++        const len: usize = b.ids[4 * i + 3];
++        try toHost(e, out[b.at[i]..][0..len], buf + o);
++        o += len;
++    }
++    b.* = .{};
++}
++
++/// Rank 0's gather: its own pieces straight to the host, rank 1's through the scratch, rows past a position zero.
++fn gather(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, out: []u8) anyerror!void {
++    const e = eng(ptr);
++    const k = try snapOf(e, saved);
++    const sh = try shape(e);
++    const w: Words = .{ .at = k.at, .hd_pos = @intCast(k.s.hd_pos), .world = @intCast(sh.world), .hd = @intFromBool(sh.hd), .head = @intCast(sh.head), .hd_head = @intCast(sh.hd_head), .mla = @intCast(sh.mla), .hd_mla = @intCast(sh.hd_mla) };
++    try e.stream.synchronize();
++    var segs: std.ArrayList(Seg) = .empty;
++    defer segs.deinit(e.gpa);
++    var b: Batch = .{};
++    var o: usize = 0;
++    for (ranges) |g| {
++        segs.clearRetainingCapacity();
++        try segments(sh, k.at, k.s.hd_pos, g.off, g.len, &segs, e.gpa);
++        for (segs.items) |s| {
++            const dst = out[o..][0..s.len];
++            switch (s.kind) {
++                .words => @memcpy(dst, std.mem.asBytes(&w)[s.local..][0..s.len]),
++                .zero => @memset(dst, 0),
++                .data => if (s.rank == 0) try toHost(e, dst, try regionAt(e, k.s, s.region) + s.local) else {
++                    if (!b.fits(s.len)) try flushOut(e, &b, k.id, out);
++                    b.add(s, o);
++                },
++            }
++            o += s.len;
++        }
++    }
++    try flushOut(e, &b, k.id, out);
++}
++
++/// Rank 1: the pieces rank 0 names of kept state `id`, back to back into the scratch, sent to rank 0.
++pub fn serveOut(e: *Engine, id: u64, ids: []const u32) !void {
++    const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
++    const g = e.g.tp orelse return error.NoGroup;
++    const buf = try scratch(e);
++    var o: usize = 0;
++    var i: usize = 0;
++    while (i + 4 <= ids.len) : (i += 4) {
++        const len: usize = ids[i + 3];
++        try e.copy(buf + o, try regionAt(e, s, ids[i]) + (@as(u64, ids[i + 2]) << 32 | ids[i + 1]), len);
++        o += len;
++    }
++    try g.send(e.stream, buf, o, 0);
++    try e.stream.synchronize();
++}
++
++/// Rank 1's pieces from the scratch's `b.bytes` (filled here) to rank 1; `hd_pos` + 1 names its MTP position (0: same).
++fn flushIn(e: *Engine, b: *Batch, id: u64, hd_pos: u64) !void {
++    if (b.n == 0 and hd_pos == 0) return;
++    if (e.g.tp == null) {
++        b.* = .{};
++        return;
++    }
++    try e.sendOn(e.slot, .{ .kind = @backingInt(tp.Kind.disk_in), .a = id, .seed = hd_pos }, b.ids[0 .. 4 * b.n]);
++    if (b.bytes > 0) try e.g.tp.?.send(e.stream, try scratch(e), b.bytes, 1);
++    try e.stream.synchronize();
++    b.* = .{};
++}
++
++/// Rank 0's scatter into a blank: its own pieces from the host, rank 1's (and every rank's rows without a split) sent.
++fn scatter(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
++    const e = eng(ptr);
++    const k = try snapOf(e, saved);
++    const sh = try shape(e);
++    try e.stream.synchronize();
++    var segs: std.ArrayList(Seg) = .empty;
++    defer segs.deinit(e.gpa);
++    var b: Batch = .{};
++    var hd_pos: u64 = 0;
++    var o: usize = 0;
++    for (ranges) |g| {
++        segs.clearRetainingCapacity();
++        try segments(sh, k.at, k.s.hd_pos, g.off, g.len, &segs, e.gpa);
++        for (segs.items) |s| {
++            const src = in[o..][0..s.len];
++            o += s.len;
++            switch (s.kind) {
++                .zero => {},
++                .words => {
++                    var w: Words = undefined;
++                    @memcpy(std.mem.asBytes(&w)[s.local..][0..s.len], src);
++                    if (s.local + s.len < words) return error.KeptWordsDiffer; // the words arrive whole
++                    if (w.at != k.at or w.world != sh.world or w.head != sh.head or w.hd_head != sh.hd_head or w.mla != sh.mla or w.hd_mla != sh.hd_mla or w.hd != @intFromBool(sh.hd) or w.hd_pos > k.at + 1) return error.KeptWordsDiffer;
++                    k.s.hd_pos = w.hd_pos;
++                    hd_pos = @as(u64, w.hd_pos) + 1;
++                },
++                .data => {
++                    if (s.rank == 0) try toDevice(e, try regionAt(e, k.s, s.region) + s.local, src);
++                    if (sh.world > 1 and (s.rank != 0 or s.all)) {
++                        if (!b.fits(s.len)) try flushIn(e, &b, k.id, 0);
++                        try toDevice(e, try scratch(e) + b.bytes, src);
++                        b.add(s, 0);
++                    }
++                },
++            }
++        }
++    }
++    try flushIn(e, &b, k.id, hd_pos);
++}
++
++/// Rank 1: rank 0's pieces of kept state `id` from the scratch into place, and its MTP position when named.
++pub fn serveIn(e: *Engine, id: u64, hd_pos: u64, ids: []const u32) !void {
++    const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
++    if (hd_pos > 0) s.hd_pos = @intCast(hd_pos - 1);
++    var n: usize = 0;
++    var i: usize = 0;
++    while (i + 4 <= ids.len) : (i += 4) n += ids[i + 3];
++    if (n == 0) return;
++    const buf = try scratch(e);
++    try e.g.tp.?.recv(e.stream, buf, n, 0);
++    var o: usize = 0;
++    i = 0;
++    while (i + 4 <= ids.len) : (i += 4) {
++        const len: usize = ids[i + 3];
++        try e.copy(try regionAt(e, s, ids[i]) + (@as(u64, ids[i + 2]) << 32 | ids[i + 1]), buf + o, len);
++        o += len;
++    }
++    try e.stream.synchronize();
++}
++
++fn blank(ptr: *anyopaque, at: u32) anyerror!api.prompt_cache.Saved {
++    const e = eng(ptr);
++    const k = try e.gpa.create(engine.Kept);
++    errdefer e.gpa.destroy(k);
++    k.* = .{ .id = try kept.blank(e, at), .at = at };
++    return k;
++}
++
++/// A state whose slot rewrote its rows (an in-place one dropped) is gone: it stays off disk.
++fn whole(ptr: *anyopaque, saved: api.prompt_cache.Saved) bool {
++    const k: *const engine.Kept = @ptrCast(@alignCast(saved));
++    return eng(ptr).holds(k.id);
++}
++
++/// Host bytes the store may stage at once: a ~250K state's image at the native window, half that past it (1M).
++pub fn staging(e: *const Engine) u64 {
++    return if (e.inplace) 2 << 30 else 4 << 30;
++}
++
++/// What the states also depend on: the rank count, the cache split, the MTP layer.
++pub fn facts(e: *const Engine) [3]u64 {
++    return .{ e.w.world, @intFromBool(e.w.kv_split), @intFromBool(e.mtp != null) };
++}
++
++/// A fixed prompt's state at a mark, its whole image hashed (a kernel or arithmetic change moves it), and its rate.
++pub fn probe(a: Allocator, io: std.Io, backend: lanes.backend.Backend, e: *Engine) !struct { hash: u64, rate: f64 } {
++    var toks: [4 * engine.prompt_rows + 47]u32 = undefined;
++    for (&toks, 0..) |*x, i| x.* = @intCast(1000 + i * 7919 % 50000);
++    const Hook = struct {
++        e: *Engine,
++        id: ?u64 = null,
++        failed: ?anyerror = null,
++        fn at(ptr: *anyopaque, _: *lanes.Stream, _: u32) void {
++            const p: *@This() = @ptrCast(@alignCast(ptr));
++            p.id = p.e.keepState() catch |err| {
++                p.failed = err;
++                return;
++            };
++        }
++    };
++    var hook: Hook = .{ .e = e };
++    defer if (hook.id) |id| e.dropState(id);
++    const mark: u32 = 4 * engine.prompt_rows;
++    const marks = [_]u32{mark};
++    var s = try lanes.Stream.init(a, .{ .id = "probe", .prompt = &toks, .max_new = 1, .reuse = .{ .marks = &marks, .hook = .{ .ptr = &hook, .at = Hook.at } } });
++    defer s.deinit(a);
++    const ns = pass: {
++        defer backend.vtable.release(backend.ptr, &s);
++        const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++        try backend.vtable.prefill(backend.ptr, &s);
++        try e.stream.synchronize();
++        break :pass std.Io.Clock.awake.now(io).toNanoseconds() - t0;
++    };
++    var k: engine.Kept = .{ .id = hook.id orelse return hook.failed orelse error.ProbeUnmarked, .at = mark };
++    const sh = try shape(e);
++    const bytes = try a.alloc(u8, @intCast(Layout.of(sh, mark).end));
++    defer a.free(bytes);
++    try gather(e, &k, &.{.{ .off = 0, .len = bytes.len }}, bytes);
++    return .{ .hash = std.hash.Wyhash.hash(0x6c69, bytes), .rate = @as(f64, @floatFromInt(toks.len)) / (@as(f64, @floatFromInt(@max(ns, 1))) / 1e9) };
++}
++
++test "the image: rows by position from the rank holding their chunk, rows past the MTP position zero" {
++    const sh: Shape = .{ .world = 2, .head = 100, .hd_head = 0, .mla = 2, .hd_mla = 1, .hd = true, .split = .{ .world = 2, .rank = 0 } };
++    const at = 3 * chunk;
++    const l = Layout.of(sh, at);
++    try std.testing.expectEqual(@as(u64, words + 200), l.hd_rows);
++    try std.testing.expectEqual(l.hd_rows + (at + 1) * row, l.rows);
++    var segs: std.ArrayList(Seg) = .empty;
++    defer segs.deinit(std.testing.allocator);
++    try segments(sh, at, at - 1, l.rows + at * row, at * row, &segs, std.testing.allocator); // MLA layer 1, whole
++    try std.testing.expectEqual(@as(usize, 3), segs.items.len);
++    for (segs.items, 0..) |s, c| {
++        try std.testing.expectEqual(@as(usize, chunk * row), s.len);
++        try std.testing.expectEqual(c % 2, s.rank);
++        try std.testing.expectEqual(@as(u32, 3), s.region);
++        try std.testing.expectEqual(@as(u64, (c / 2) * chunk * row), s.local);
++    }
++    segs.clearRetainingCapacity();
++    try segments(sh, at, at - 1, l.hd_rows + (at - 2) * row, 3 * row, &segs, std.testing.allocator); // MTP rows at the end
++    try std.testing.expectEqual(@as(usize, 3), segs.items.len); // at - 2 held; at - 1 and at (the next chunk) zero
++    try std.testing.expect(segs.items[0].kind == .data and segs.items[0].len == row and segs.items[1].kind == .zero and segs.items[2].kind == .zero);
++    segs.clearRetainingCapacity();
++    try segments(sh, at, at, words + 50, 100, &segs, std.testing.allocator); // across the two ranks' KDA parts
++    try std.testing.expectEqual(@as(usize, 2), segs.items.len);
++    try std.testing.expect(segs.items[0].rank == 0 and segs.items[0].local == 50 and segs.items[1].rank == 1 and segs.items[1].local == 0);
++    const one: Shape = .{ .world = 1, .head = 8, .hd_head = 0, .mla = 1, .hd_mla = 0, .hd = false, .split = null };
++    segs.clearRetainingCapacity();
++    try segments(one, 10, 0, words + 8, 10 * row, &segs, std.testing.allocator);
++    try std.testing.expect(segs.items.len == 1 and segs.items[0].all and segs.items[0].local == 0);
++    try std.testing.expectError(error.BadKeptRange, segments(one, 10, 0, 0, Layout.of(one, 10).end + 1, &segs, std.testing.allocator));
++}
+diff --git a/zig/src/families/ling/engine.zig b/zig/src/families/ling/engine.zig
+index 1d634b57d..1de17bda9 100644
+--- a/zig/src/families/ling/engine.zig
++++ b/zig/src/families/ling/engine.zig
+@@ -105,6 +105,7 @@ pub const Engine = struct {
+     dropped: std.ArrayList(u64) = .empty, // kept states dropped since the last step: rank 1 drops them first
+     graphs: ?*steps.Graphs = null, // one sequence's verify windows and MTP chains as CUDA graphs (TF_LING_GRAPHS=0: off)
+     inplace: bool = false, // kept states leave their cache rows in place (kept.zig, TF_LING_KEEP_INPLACE)
++    disk_buf: ?cuda.DeviceBuffer = null, // kept states to and from disk: the ranks' transfer scratch (disk.zig)
+ 
+     /// The checkpoint at `dir` in its own format.
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, dir: []const u8, o: Options) !*Engine {
+@@ -206,6 +207,7 @@ pub const Engine = struct {
+         e.snaps.deinit(e.gpa);
+         e.snaps = .empty; // free() below looks for states naming each slot
+         e.dropped.deinit(e.gpa);
++        if (e.disk_buf) |*b| b.free();
+         for (0..e.seqs.items.len) |i| e.free(i);
+         e.seqs.deinit(e.gpa);
+         e.pairs.free();
+diff --git a/zig/src/families/ling/kept.zig b/zig/src/families/ling/kept.zig
+index c2a69c8e7..1185e8d61 100644
+--- a/zig/src/families/ling/kept.zig
++++ b/zig/src/families/ling/kept.zig
+@@ -13,7 +13,7 @@ const Seq = engine.Seq;
+ const cache_row = @import("state.zig").cache_width * 2;
+ 
+ /// A kept state: its KDA part (and with `src` null, its cache rows) in `buf` and `hd`, and the host fields beside it.
+-pub const Snap = struct { buf: cuda.DeviceBuffer, hd: ?cuda.DeviceBuffer, pos: usize, hd_pos: usize, cur: []u1, src: ?*Seq = null, ids: []u32 = &.{} };
++pub const Snap = struct { buf: cuda.DeviceBuffer, hd: ?cuda.DeviceBuffer, pos: usize, hd_pos: usize, cur: []u1, src: ?*Seq = null, ids: []u32 = &.{}, hd_room: usize = 0 };
+ 
+ /// TF_LING_KEEP_INPLACE=on|off|auto: auto keeps rows in place past the native window (a full copy does not fit there).
+ pub fn inplaceFor(context: usize) !bool {
+@@ -41,12 +41,12 @@ fn headCopy(e: *const Engine, st: *const fw.State, kept: u64, cur: []const u1, o
+     }
+ }
+ 
+-/// Each MLA layer's rows below `at` between a State's caches and a kept buffer after its head (`out`: into the buffer).
+-fn rowsCopy(e: *const Engine, st: *const fw.State, kept: u64, at: usize, out: bool) !void {
++/// MLA rows below `at` between a State's caches and a kept buffer of `room` positions a layer, after its head.
++fn rowsCopy(e: *const Engine, st: *const fw.State, kept: u64, at: usize, room: usize, out: bool) !void {
+     const rows = st.below(at) * cache_row;
+     if (rows == 0) return;
+     for (0..st.mla_layers) |mi| {
+-        const dst = kept + st.keptHead() + mi * rows;
++        const dst = kept + st.keptHead() + mi * st.below(room) * cache_row;
+         try (if (out) e.copy(dst, st.cacheAt(mi), rows) else e.copy(st.cacheAt(mi), dst, rows));
+     }
+ }
+@@ -67,13 +67,13 @@ pub fn keep(e: *Engine) !u64 {
+     var buf = try cuda.DeviceBuffer.alloc(e.d, bytes(&q.st, q.st.pos, in));
+     errdefer if (weights.drains(e.stream)) buf.free(); // else leaked: the copy into it may be queued
+     try headCopy(e, &q.st, buf.ptr, q.st.cur, true);
+-    if (!in) try rowsCopy(e, &q.st, buf.ptr, q.st.pos, true);
++    if (!in) try rowsCopy(e, &q.st, buf.ptr, q.st.pos, q.st.pos, true);
+     var hd: ?cuda.DeviceBuffer = null;
+     errdefer if (hd) |*x| if (weights.drains(e.stream)) x.free();
+     if (q.hd) |h| {
+         hd = try cuda.DeviceBuffer.alloc(e.d, bytes(&h, h.pos, in));
+         try headCopy(e, &h, hd.?.ptr, h.cur, true);
+-        if (!in) try rowsCopy(e, &h, hd.?.ptr, h.pos, true);
++        if (!in) try rowsCopy(e, &h, hd.?.ptr, h.pos, h.pos, true);
+     }
+     try e.stream.synchronize();
+     const cur = try e.gpa.dupe(u1, q.st.cur);
+@@ -93,7 +93,7 @@ pub fn restore(e: *Engine, id: u64) !void {
+     try headCopy(e, &q.st, s.buf.ptr, s.cur, false);
+     if (s.src) |src| {
+         if (src != q) try rowsAcross(e, &src.st, &q.st, s.pos);
+-    } else try rowsCopy(e, &q.st, s.buf.ptr, s.pos, false);
++    } else try rowsCopy(e, &q.st, s.buf.ptr, s.pos, s.pos, false);
+     @memcpy(q.st.cur, s.cur);
+     q.st.pending = 0;
+     q.st.prompt = false;
+@@ -103,7 +103,7 @@ pub fn restore(e: *Engine, id: u64) !void {
+         try headCopy(e, h, hb.ptr, h.cur, false);
+         if (s.src) |src| {
+             if (src != q) try rowsAcross(e, &src.hd.?, h, s.hd_pos);
+-        } else try rowsCopy(e, h, hb.ptr, s.hd_pos, false);
++        } else try rowsCopy(e, h, hb.ptr, s.hd_pos, hdRoom(s), false);
+         h.pending = 0;
+         try h.setPos(e.stream, s.hd_pos);
+     }
+@@ -111,6 +111,49 @@ pub fn restore(e: *Engine, id: u64) !void {
+     q.ids.clearRetainingCapacity(); // the ids below the restored position, when the state names them
+     if (s.ids.len == s.pos) try q.ids.appendSlice(e.gpa, s.ids);
+     try e.stream.synchronize();
++    if (e.inplace and s.src == null and s.ids.len == 0) try settleInPlace(e, s, q);
++}
++
++/// A copied state (one read back from disk) restored where rows stay in place: its rows now lead `q`'s caches.
++fn settleInPlace(e: *Engine, s: *Snap, q: *Seq) !void {
++    var buf = try cuda.DeviceBuffer.alloc(e.d, q.st.keptHead());
++    errdefer if (weights.drains(e.stream)) buf.free();
++    try e.copy(buf.ptr, s.buf.ptr, q.st.keptHead());
++    var hd: ?cuda.DeviceBuffer = null;
++    if (q.hd) |h| {
++        hd = try cuda.DeviceBuffer.alloc(e.d, h.keptHead());
++        if (h.keptHead() > 0) try e.copy(hd.?.ptr, s.hd.?.ptr, h.keptHead());
++    }
++    try e.stream.synchronize();
++    s.buf.free();
++    s.buf = buf;
++    if (s.hd) |*x| x.free();
++    s.hd = hd;
++    s.hd_room = 0;
++    s.src = q;
++}
++
++/// Positions a layer the kept MTP buffer holds rows for: its own position, or a blank's room.
++fn hdRoom(s: *const Snap) usize {
++    return if (s.hd_room > 0) s.hd_room else s.hd_pos;
++}
++
++/// A new copied state of `at` positions under the next id, filled from disk (disk.zig), restored as any other.
++pub fn blank(e: *Engine, at: usize) !u64 {
++    const q = e.seqs.items[0] orelse return error.NoSequence;
++    try e.sendOn(e.slot, .{ .kind = @backingInt(@import("tp.zig").Kind.blank), .a = e.next_snap, .seed = at }, &.{});
++    var buf = try cuda.DeviceBuffer.alloc(e.d, bytes(&q.st, at, false));
++    errdefer if (weights.drains(e.stream)) buf.free();
++    var hd: ?cuda.DeviceBuffer = null;
++    errdefer if (hd) |*x| if (weights.drains(e.stream)) x.free();
++    if (q.hd) |h| hd = try cuda.DeviceBuffer.alloc(e.d, bytes(&h, at + 1, false));
++    const cur = try e.gpa.alloc(u1, q.st.cur.len);
++    errdefer e.gpa.free(cur);
++    @memset(cur, 0);
++    const id = e.next_snap;
++    try e.snaps.put(e.gpa, id, .{ .buf = buf, .hd = hd, .pos = at, .hd_pos = at + 1, .cur = cur, .hd_room = at + 1 });
++    e.next_snap += 1;
++    return id;
+ }
+ 
+ /// Before a prompt chunk writes `new` from `at`: in-place states past `at` stay only if their ids match.
+@@ -177,12 +220,12 @@ fn copyOut(e: *Engine, q: *Seq) !void {
+         var buf = try cuda.DeviceBuffer.alloc(e.d, bytes(&q.st, s.pos, false));
+         errdefer if (weights.drains(e.stream)) buf.free();
+         try e.copy(buf.ptr, s.buf.ptr, q.st.keptHead());
+-        try rowsCopy(e, &q.st, buf.ptr, s.pos, true);
++        try rowsCopy(e, &q.st, buf.ptr, s.pos, s.pos, true);
+         var hd: ?cuda.DeviceBuffer = null;
+         if (q.hd) |*h| {
+             hd = try cuda.DeviceBuffer.alloc(e.d, bytes(h, s.hd_pos, false));
+             try e.copy(hd.?.ptr, s.hd.?.ptr, h.keptHead());
+-            try rowsCopy(e, h, hd.?.ptr, s.hd_pos, true);
++            try rowsCopy(e, h, hd.?.ptr, s.hd_pos, s.hd_pos, true);
+         }
+         try e.stream.synchronize();
+         s.buf.free();
+diff --git a/zig/src/families/ling/native.zig b/zig/src/families/ling/native.zig
+index ad7f6a65b..e65306d74 100644
+--- a/zig/src/families/ling/native.zig
++++ b/zig/src/families/ling/native.zig
+@@ -12,6 +12,8 @@ pub const formats: []const []const u8 = &.{ "bf16", "fp8-block", "modelopt-nvfp4
+ pub const default_context: i64 = 8192;
+ pub const max_segments: u32 = 1;
+ pub const prompt_rows: u32 = engine.prompt_rows;
++/// Kept states on disk (--learn-conversations, --spill-gib): every rank's share in rank 0's store.
++pub const kept_disk = @import("disk.zig");
+ 
+ pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false };
+ 
+diff --git a/zig/src/families/ling/tp.zig b/zig/src/families/ling/tp.zig
+index 7fc7136c3..b056d40e7 100644
+--- a/zig/src/families/ling/tp.zig
++++ b/zig/src/families/ling/tp.zig
+@@ -3,12 +3,13 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const glm = @import("glm_cuda");
+ const engine = @import("engine.zig");
++const disk = @import("disk.zig");
+ 
+ pub const Link = glm.follow.Link;
+ pub const Header = glm.follow.Header;
+ 
+ /// The steps rank 1 replays, in rank 0's order (Header.kind).
+-pub const Kind = enum(u32) { begin = 1, restore, chunk, verify, shared, keep, draft, keep_state, drop, release, idle, end };
++pub const Kind = enum(u32) { begin = 1, restore, chunk, verify, shared, keep, draft, keep_state, drop, release, idle, blank, disk_out, disk_in, end };
+ 
+ /// This rank's place: TF_LING_RANK of TF_LING_WORLD (both unset: one GPU).
+ pub const Place = struct { rank: u32, world: u32 };
+@@ -73,7 +74,7 @@ pub fn follow(e: *engine.Engine, io: std.Io) !void {
+         if (h.kind < 1 or h.kind > @backingInt(Kind.end)) return error.BadStep;
+         const kind: Kind = @fromBackingInt(@intCast(h.kind));
+         switch (kind) {
+-            .drop, .idle, .end, .shared, .release => {},
++            .drop, .idle, .end, .shared, .release, .disk_out, .disk_in => {},
+             else => try e.bind(h.slot),
+         }
+         switch (kind) {
+@@ -102,6 +103,9 @@ pub fn follow(e: *engine.Engine, io: std.Io) !void {
+             .keep => try e.keep(@intCast(h.a)),
+             .draft => try e.draft(h.flags & 1 != 0, step.ids, h.depth, &drafts),
+             .keep_state => if (try e.keepState() != h.a) return error.RanksOutOfStep,
++            .blank => if (try @import("kept.zig").blank(e, @intCast(h.seed)) != h.a) return error.RanksOutOfStep,
++            .disk_out => try disk.serveOut(e, h.a, step.ids),
++            .disk_in => try disk.serveIn(e, h.a, h.seed, step.ids),
+             .drop => for (step.ids) |id| e.dropState(id),
+             .release => e.release(h.slot),
+             .idle => cuda.tp_watch.sleep(io),
+diff --git a/zig/src/native/cuda_disk.zig b/zig/src/native/cuda_disk.zig
+index d81da092a..968b2dbc4 100644
+--- a/zig/src/native/cuda_disk.zig
++++ b/zig/src/native/cuda_disk.zig
+@@ -154,7 +154,7 @@ fn probe(a: Allocator, io: std.Io, backend: lanes.backend.Backend, t: *Target) !
+ pub fn attach(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, root: []const u8, kernels: ?[]const u8, loaded: anytype, store: *api.prompt_cache.Store) !void {
+     loaded.target.ctx = ctx;
+     const id = try identity(a, io, ctx, o.dir, kernels, loaded.backend, loaded.target);
+-    try open(o, root, id.id, id.rate, store, "nemotron");
++    try open(o, root, id.id, id.rate, store, "nemotron", 1 << 30);
+ }
+ 
+ /// The disk module of a family's kept states (image, probe, facts), or null: Nemotron's is this file's own.
+@@ -170,18 +170,19 @@ pub fn attachKept(comptime K: type, name: []const u8, a: Allocator, io: std.Io,
+         const p = try K.probe(a, io, loaded.backend, loaded.target);
+         const facts = K.facts(loaded.target); // an array, or a slice
+         const list: []const u64 = if (@typeInfo(@TypeOf(facts)) == .pointer) facts else &facts;
+-        try open(o, root, try identityOf(a, io, ctx, o.dir, kernels, list, p.hash), p.rate, store, name);
++        const staging: u64 = if (@hasDecl(K, "staging")) K.staging(loaded.target) else 1 << 30; // a family's host permit
++        try open(o, root, try identityOf(a, io, ctx, o.dir, kernels, list, p.hash), p.rate, store, name, staging);
+     }
+ }
+ 
+-fn open(o: api.Open, root: []const u8, id: u64, rate: f64, store: *api.prompt_cache.Store, name: []const u8) !void {
++fn open(o: api.Open, root: []const u8, id: u64, rate: f64, store: *api.prompt_cache.Store, name: []const u8, staging: u64) !void {
+     const gibs = struct {
+         fn bytes(g: f64) u64 {
+             return @intFromFloat(g * (1 << 30));
+         }
+     }.bytes;
+     // --spill-gib: evicted states only (or with --learn-conversations, both); --checkpoint-slots bounds RAM beside it
+-    const r = try api.prompt_cache.rows.attach(store.gpa, store, .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = store.rules.lookahead, .planned = store.rules.planned, .grid = store.rules.grid, .spill = o.spill, .slots = @import("disk_spill.zig").slots(o) });
++    const r = try api.prompt_cache.rows.attach(store.gpa, store, .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = store.rules.lookahead, .planned = store.rules.planned, .grid = store.rules.grid, .spill = o.spill, .slots = @import("disk_spill.zig").slots(o), .staging_bytes = staging });
+     r.prefill_rate = rate;
+     std.log.info("{s}: conversation states on disk in {s} ({d} states, {d} MiB of {d} MiB)", .{ name, r.dir, r.states.items.len, r.held() >> 20, r.cap >> 20 });
+ }
+@@ -209,7 +210,7 @@ test "CUDA disk open: --spill-gib's mode and --checkpoint-slots reach the store"
+     // a disk module that opens the store itself, through this file's open, under a fixed identity and no device
+     const K = struct {
+         pub fn attach(_: Allocator, _: std.Io, _: *const cuda.Context, o: api.Open, root: []const u8, _: ?[]const u8, _: anytype, store: *api.prompt_cache.Store) !void {
+-            try open(o, root, 7, 1.0, store, "fake");
++            try open(o, root, 7, 1.0, store, "fake", 1 << 30);
+         }
+         fn bytes(_: *anyopaque, _: u32) u64 {
+             return 0;
+-- 
+2.53.0
+

@@ -1,0 +1,837 @@
+From 4a797502dc8fcdd101e3fa5c9123e84094c960db Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 02:36:07 +1100
+Subject: [PATCH 12/26] ling: kernel-contract gates 1-4 for the last four Ling
+ launches: tf_ling_chunks_r16 (576-wide q and keys over a linear cache,
+ through tf_glm_merge), tf_exl3_plan_finish_after (gate-up with and without
+ the limit, fp32 down), the Ling-order FP8 gate-up decode and prompt instances
+ (with and without the limit). The FP8 twin's clamps compare, so a NaN stays
+ NaN as in torch.clamp (finite bits unchanged; decode instance 155 -> 156
+ registers on sm_120/121, records updated for nvcc 13.0 and 13.3)
+
+---
+ docs/kernel-contract.md                       |   6 +-
+ zig/kernels/cuda/experts.cuh                  |   6 +-
+ zig/src/core/contract/ling_cuda_records.zig   |   2 +-
+ .../contract/measurements/pending_133.zig     |   2 +-
+ zig/tests/cuda/contract_ling.zig              |   5 +-
+ zig/tests/cuda/contract_ling_fp8.zig          | 220 ++++++++
+ zig/tests/cuda/contract_ling_more.zig         | 481 ++++++++++++++++++
+ 7 files changed, 714 insertions(+), 8 deletions(-)
+ create mode 100644 zig/tests/cuda/contract_ling_fp8.zig
+ create mode 100644 zig/tests/cuda/contract_ling_more.zig
+
+diff --git a/docs/kernel-contract.md b/docs/kernel-contract.md
+index 8addea512..fc84e2531 100644
+--- a/docs/kernel-contract.md
++++ b/docs/kernel-contract.md
+@@ -261,8 +261,10 @@ CUDA also checks Ling-3.1-flash's own kernels (`tf-cuda-test ling-contract`): li
+ gate, MoE combine (by slot and by expert) and row copy; glm_glue's Ling twins, the SwiGLU in Ling's order at both
+ blocks with its 64-sums, the rope (plain and with YaRN's attention factor at 900,000 positions), the 128-wide
+ absorb_q and expand_v, and the group-limited top-k (a stated rule: lower id and lower group on ties, a NaN never
+-picked); and modelopt_pack's FP8 expert packing. Its MLA chunks (`tf_ling_chunks_r16`), the EXL3 finish twin and the
+-Ling-order FP8 expert instances hold gate-5 records only so far.
++picked); and modelopt_pack's FP8 expert packing. It also checks Ling's MLA chunks (`tf_ling_chunks_r16`, 576-wide q
++and keys over a linear cache, through `tf_glm_merge`), the EXL3 grouped finish twin (`tf_exl3_plan_finish_after`:
++gate-up with the limit on silu's output and without, and the fp32 down epilogue), and the Ling-order FP8 gate-up
++instances (decode and prompt, with and without the limit; their clamps compare, so a NaN stays NaN).
+ 
+ HIP also checks the router over the rows a checkpoint already holds in bf16 (`tf_router_bf16`, and its fp16-activation
+ form), bit-equal to the fp32-rows router it replaces at 1 to 16 rows, with both kinds' non-finite plants through gate 1
+diff --git a/zig/kernels/cuda/experts.cuh b/zig/kernels/cuda/experts.cuh
+index db79892bc..b20404081 100644
+--- a/zig/kernels/cuda/experts.cuh
++++ b/zig/kernels/cuda/experts.cuh
+@@ -53,13 +53,13 @@ __device__ __forceinline__ float swiglu(float g, float u, float limit) {
+   return bf(gv / (1.f + expf(-gv))) * uv;
+ }
+ 
+-// Ling's order (EPI 4): the limit on silu's output, min(silu(g), L) * clip(u, -L, L).
++// Ling's order (EPI 4): min(silu(g), L) * clip(u, -L, L), by comparisons so a NaN stays NaN as in torch.clamp.
+ __device__ __forceinline__ float swiglu_after(float g, float u, float limit) {
+   const float gv = bf(g);
+   float uv = bf(u), s = bf(gv / (1.f + expf(-gv)));
+   if (limit > 0.f) {
+-    s = fminf(s, limit);
+-    uv = fminf(fmaxf(uv, -limit), limit);
++    s = s > limit ? limit : s;
++    uv = uv > limit ? limit : (uv < -limit ? -limit : uv);
+   }
+   return s * uv;
+ }
+diff --git a/zig/src/core/contract/ling_cuda_records.zig b/zig/src/core/contract/ling_cuda_records.zig
+index 897a6926d..e4b39b0cf 100644
+--- a/zig/src/core/contract/ling_cuda_records.zig
++++ b/zig/src/core/contract/ling_cuda_records.zig
+@@ -15,7 +15,7 @@ pub const records = [_]registry.CudaRecord{
+     .{ .launch = .{ .name = "ling_glue tf_ling_combine", .symbol = "tf_ling_combine", .image = "ling_glue", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 38, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } }, .later_pending = true },
+     .{ .launch = .{ .name = "ling_glue tf_ling_copy_rows", .symbol = "tf_ling_copy_rows", .image = "ling_glue", .threads = 256 }, .usage = .{ .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } }, .later_pending = true },
+     .{ .launch = .{ .name = "exl3_experts tf_exl3_plan_finish_after", .symbol = "tf_exl3_plan_finish_after", .image = "exl3_experts", .threads = 32 }, .usage = .{ .{ .regs = 39, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } }, .later_pending = true },
+-    .{ .launch = .{ .name = "fp8_experts decode gate-up (Ling's clamp order)", .symbol = "_ZN14tf_fp8_experts17fp8_expert_kernelILi2ELi4ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi", .image = "fp8_experts", .threads = 128 }, .usage = .{ .{ .regs = 155, .static = 0, .bound = 128 }, .{ .regs = 155, .static = 0, .bound = 128 }, .{ .regs = 155, .static = 0, .bound = 128 }, .{ .regs = 155, .static = 0, .bound = 128 }, .{ .regs = 155, .static = 0, .bound = 128 } }, .later_pending = true },
++    .{ .launch = .{ .name = "fp8_experts decode gate-up (Ling's clamp order)", .symbol = "_ZN14tf_fp8_experts17fp8_expert_kernelILi2ELi4ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi", .image = "fp8_experts", .threads = 128 }, .usage = .{ .{ .regs = 155, .static = 0, .bound = 128 }, .{ .regs = 155, .static = 0, .bound = 128 }, .{ .regs = 155, .static = 0, .bound = 128 }, .{ .regs = 156, .static = 0, .bound = 128 }, .{ .regs = 156, .static = 0, .bound = 128 } }, .later_pending = true },
+     .{ .launch = .{ .name = "fp8_experts prompt gate-up (Ling's clamp order)", .symbol = "_ZN14tf_fp8_experts24fp8_expert_prompt_kernelILi2ELi4ELi2ELi2EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi", .image = "fp8_experts", .threads = 128 }, .usage = .{ .{ .regs = 199, .static = 32768, .bound = 128 }, .{ .regs = 199, .static = 32768, .bound = 128 }, .{ .regs = 199, .static = 32768, .bound = 128 }, .{ .regs = 218, .static = 32768, .bound = 128 }, .{ .regs = 218, .static = 32768, .bound = 128 } }, .later_pending = true },
+     .{ .launch = .{ .name = "modelopt_pack tf_pack_fp8_experts", .symbol = "tf_pack_fp8_experts", .image = "modelopt_pack", .threads = 256 }, .usage = .{ .{ .regs = 13, .static = 0, .bound = 256 }, .{ .regs = 14, .static = 0, .bound = 256 }, .{ .regs = 14, .static = 0, .bound = 256 }, .{ .regs = 14, .static = 0, .bound = 256 }, .{ .regs = 14, .static = 0, .bound = 256 } }, .later_pending = true },
+ };
+diff --git a/zig/src/core/contract/measurements/pending_133.zig b/zig/src/core/contract/measurements/pending_133.zig
+index d2b488b0b..1dea6206e 100644
+--- a/zig/src/core/contract/measurements/pending_133.zig
++++ b/zig/src/core/contract/measurements/pending_133.zig
+@@ -70,7 +70,7 @@ pub const records = [_]Override{
+     .{ .name = "ling_glue tf_ling_combine", .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
+     .{ .name = "ling_glue tf_ling_copy_rows", .usage = .{ .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
+     .{ .name = "exl3_experts tf_exl3_plan_finish_after", .usage = .{ .{ .regs = 39, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
+-    .{ .name = "fp8_experts decode gate-up (Ling's clamp order)", .usage = .{ .{ .regs = 155, .static = 0, .bound = 128 }, .{ .regs = 155, .static = 0, .bound = 128 }, .{ .regs = 155, .static = 0, .bound = 128 }, .{ .regs = 155, .static = 0, .bound = 128 }, .{ .regs = 155, .static = 0, .bound = 128 } } },
++    .{ .name = "fp8_experts decode gate-up (Ling's clamp order)", .usage = .{ .{ .regs = 155, .static = 0, .bound = 128 }, .{ .regs = 155, .static = 0, .bound = 128 }, .{ .regs = 155, .static = 0, .bound = 128 }, .{ .regs = 156, .static = 0, .bound = 128 }, .{ .regs = 156, .static = 0, .bound = 128 } } },
+     .{ .name = "fp8_experts prompt gate-up (Ling's clamp order)", .usage = .{ .{ .regs = 199, .static = 32768, .bound = 128 }, .{ .regs = 199, .static = 32768, .bound = 128 }, .{ .regs = 199, .static = 32768, .bound = 128 }, .{ .regs = 218, .static = 32768, .bound = 128 }, .{ .regs = 218, .static = 32768, .bound = 128 } } },
+     .{ .name = "modelopt_pack tf_pack_fp8_experts", .usage = .{ .{ .regs = 13, .static = 0, .bound = 256 }, .{ .regs = 14, .static = 0, .bound = 256 }, .{ .regs = 14, .static = 0, .bound = 256 }, .{ .regs = 14, .static = 0, .bound = 256 }, .{ .regs = 14, .static = 0, .bound = 256 } } },
+ };
+diff --git a/zig/tests/cuda/contract_ling.zig b/zig/tests/cuda/contract_ling.zig
+index 4c0176ac9..89190fe8a 100644
+--- a/zig/tests/cuda/contract_ling.zig
++++ b/zig/tests/cuda/contract_ling.zig
+@@ -519,6 +519,7 @@ pub const Set = struct {
+     glue: [entries.len]Glue = undefined,
+     copies: [entries.len]Copy = undefined,
+     mla: *@import("contract_ling_mla.zig").Set,
++    more: *@import("contract_ling_more.zig").Set,
+ 
+     /// The set, its kernels appended to `list`.
+     pub fn init(gpu: check.Gpu, s: cuda.Stream, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel)) !*Set {
+@@ -528,7 +529,7 @@ pub const Set = struct {
+         errdefer lg.unload();
+         var gg = try cuda.Module.load(gpu.d, cuda.kernels.glm_glue);
+         errdefer gg.unload();
+-        set.* = .{ .gpa = gpu.gpa, .mods = .{ lg, gg }, .mla = undefined };
++        set.* = .{ .gpa = gpu.gpa, .mods = .{ lg, gg }, .mla = undefined, .more = undefined };
+         set.fns = .{
+             .add = try lg.function("tf_ling_add"),
+             .gate = try lg.function("tf_ling_gate"),
+@@ -543,10 +544,12 @@ pub const Set = struct {
+         }
+         for (&set.glue, &set.copies, entries) |*x, *y, e| try list.append(a, if (e.kind == .copy) y.kernel() else x.kernel());
+         set.mla = try @import("contract_ling_mla.zig").Set.init(gpu, s, a, gg, list);
++        set.more = try @import("contract_ling_more.zig").Set.init(gpu, s, a, gg, list);
+         return set;
+     }
+ 
+     pub fn deinit(set: *Set) void {
++        set.more.deinit();
+         set.mla.deinit();
+         for (&set.glue, &set.copies) |*x, *y| {
+             x.deinit();
+diff --git a/zig/tests/cuda/contract_ling_fp8.zig b/zig/tests/cuda/contract_ling_fp8.zig
+new file mode 100644
+index 000000000..2f17de32a
+--- /dev/null
++++ b/zig/tests/cuda/contract_ling_fp8.zig
+@@ -0,0 +1,220 @@
++//! Ling-3.1-flash's FP8 gate-up instances in Ling's clamp order (Layer.after) under the contract.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const rig_ = @import("contract_rig.zig");
++const pages = @import("contract_glm_pages.zig");
++const more = @import("contract_ling_more.zig");
++
++const contract = core.contract;
++const c = contract.spec;
++const g = contract.gates;
++const fp8 = core.quant.fp8;
++const fx8 = cuda.experts.Fp8Experts;
++const experts = more.experts;
++const act = more.act;
++const bf = more.bf;
++
++pub const Fp8Entry = struct { name: []const u8, prompt: bool, limit: f32 = 0 };
++
++pub const fp8_entries = [_]Fp8Entry{
++    .{ .name = "cuda ling fp8_experts decode gate-up in Ling's clamp order (fp8_expert_kernel<2,4,4>, no limit)", .prompt = false },
++    .{ .name = "cuda ling fp8_experts decode gate-up in Ling's clamp order (fp8_expert_kernel<2,4,4>, limit 10)", .prompt = false, .limit = 10 },
++    .{ .name = "cuda ling fp8_experts prompt gate-up in Ling's clamp order (fp8_expert_prompt_kernel<2,4,2,2>, no limit)", .prompt = true },
++    .{ .name = "cuda ling fp8_experts prompt gate-up in Ling's clamp order (fp8_expert_prompt_kernel<2,4,2,2>, limit 10)", .prompt = true, .limit = 10 },
++};
++
++/// A 128-block: eight k16 MMAs of up to 17-term chains, then one fma a block of the scales.
++fn fp8Depth(s: c.Shape) usize {
++    return 8 * 17 + s.k / 128;
++}
++
++const fp8_decode = [_]c.Shape{ .{ .rows = 1, .n = 1280, .k = 4096 }, .{ .rows = 8, .n = 640, .k = 4096 } };
++const fp8_prompt = [_]c.Shape{ .{ .rows = 3, .n = 1280, .k = 4096 }, .{ .rows = 70, .n = 640, .k = 4096 } };
++const slots = 2;
++
++fn fp8Spec(e: Fp8Entry) c.Spec {
++    return .{ .name = e.name, .accum = .f32, .depth = fp8Depth, .mids = 3, .out = .bf16, .served = if (e.prompt) &fp8_prompt else &fp8_decode };
++}
++
++/// Fp8Experts.run's gate-up with Layer.after: token rows x, e4m3 gate and up [E][n][k], fp32 scales a 128 x 128 block.
++pub const Fp8 = struct {
++    rig: rig_.Rig,
++    ex: *const fx8,
++    entry: Fp8Entry,
++    shape: c.Shape = undefined,
++    fill: g.Fill = .random,
++    x: []u16 = &.{},
++    w: []u8 = &.{}, // [2][E][n][k] codes: gate then up
++    sc: []f32 = &.{}, // [E][2][n/128][k/128]
++    picks: []u8 = &.{},
++    extra: []f64 = &.{},
++    layer: cuda.experts.Layer = undefined,
++    plan: cuda.grouped.Plan = undefined,
++    items: usize = 0,
++    xd: u64 = 0,
++    out: u64 = 0,
++
++    pub fn deinit(self: *Fp8) void {
++        self.free();
++        self.rig.deinit();
++    }
++
++    fn free(self: *Fp8) void {
++        const a = self.rig.gpu.gpa;
++        a.free(self.x);
++        a.free(self.w);
++        a.free(self.sc);
++        a.free(self.picks);
++        a.free(self.extra);
++        self.x = &.{};
++        self.w = &.{};
++        self.sc = &.{};
++        self.picks = &.{};
++        self.extra = &.{};
++    }
++
++    pub fn kernel(self: *Fp8) g.Kernel {
++        return .{ .spec = fp8Spec(self.entry), .ctx = self, .vt = &vt };
++    }
++
++    const vt = g.hooks(Fp8);
++
++    fn code(v: i32) u8 {
++        var b: u8 = 0;
++        while (fp8.e4m3(b) != @as(f64, @floatFromInt(v))) b += 1;
++        return b;
++    }
++
++    /// Random: x in [-1, 1), |w| < 4, scales in [2^-6, 2^-5); stress: g 1024 (silu exact), u 1, halves a step apart.
++    pub fn prepare(self: *Fp8, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        const n = shape.n;
++        const k = shape.k;
++        if (shape.rows == 0 or n % 128 != 0 or k % 128 != 0) return false;
++        self.free();
++        self.rig.reset();
++        self.shape = shape;
++        self.fill = fill;
++        const a = self.rig.gpu.gpa;
++        var prng = std.Random.DefaultPrng.init(seed);
++        const rng = prng.random();
++        const pairs = shape.rows * slots;
++        self.x = try a.alloc(u16, shape.rows * k);
++        self.w = try a.alloc(u8, 2 * experts * n * k);
++        self.sc = try a.alloc(f32, experts * 2 * (n / 128) * (k / 128));
++        self.picks = try a.alloc(u8, pairs);
++        for (0..shape.rows) |r| {
++            self.picks[r * slots] = if (self.entry.prompt) 0 else rng.uintLessThan(u8, experts / 2);
++            self.picks[r * slots + 1] = experts / 2 + rng.uintLessThan(u8, experts / 2);
++        }
++        if (fill == .stress) {
++            var tab: [33]u8 = undefined;
++            for (&tab, 0..) |*t, i| t.* = code(@as(i32, @intCast(i)) - 16);
++            const h = k / 2;
++            for (0..shape.rows) |r| for (0..h) |i| {
++                const v: f32 = if (i == 5) 1 else if (i == 7) 64 else @floatFromInt(1 + rng.uintLessThan(u32, 127));
++                self.x[r * k + i] = c.toBf16(v);
++                self.x[r * k + h + (i + 1) % h] = c.toBf16(v);
++            };
++            @memset(self.w[0 .. experts * n * k], tab[16]);
++            for (0..experts * n) |row| {
++                self.w[row * k + 7] = tab[32];
++                const up = self.w[(experts * n + row) * k ..][0..k];
++                for (0..h) |i| {
++                    const v: i32 = 1 + @as(i32, @intCast(rng.uintLessThan(u32, 16)));
++                    up[i] = tab[@intCast(16 + v)];
++                    up[h + (i + 1) % h] = tab[@intCast(16 - v + @as(i32, @intFromBool(i == 5)))];
++                }
++            }
++            @memset(self.sc, 1);
++        } else {
++            for (self.x) |*v| v.* = c.toBf16(rng.float(f32) * 2 - 1);
++            for (self.w) |*b| b.* = (@as(u8, rng.uintLessThan(u8, 2)) << 7) | (rng.uintLessThan(u8, 9) << 3) | rng.uintLessThan(u8, 8);
++            for (self.sc) |*s| s.* = (1 + rng.float(f32)) * 0x1p-6;
++        }
++        if (fill == .nonfinite) {
++            self.x[5] = c.toBf16(std.math.nan(f32));
++            if (shape.rows > 1) self.x[k + 9] = c.toBf16(std.math.inf(f32));
++            if (shape.rows > 2) {
++                self.x[2 * k + 3] = c.toBf16(std.math.inf(f32));
++                self.x[2 * k + 200] = c.toBf16(-std.math.inf(f32));
++            }
++        }
++        const one = n * k;
++        const pu = try a.alloc(u32, experts * one / 2);
++        defer a.free(pu);
++        for (0..experts) |e| try fx8.packGateUp(a, pu[e * one / 2 ..][0 .. one / 2], self.w[e * one ..][0..one], self.w[(experts + e) * one ..][0..one], n, k);
++        const plan = try more.Plan.make(a, self.picks, experts, if (self.entry.prompt) 64 else 16);
++        defer plan.deinit(a);
++        self.items = plan.n;
++        const cnt: i32 = @intCast(plan.n);
++        self.plan = .{ .items = try self.rig.input(std.mem.sliceAsBytes(plan.items[0 .. 3 * plan.n])), .counts = try self.rig.input(std.mem.asBytes(&cnt)), .members = try self.rig.input(std.mem.sliceAsBytes(plan.members)), .rank = 0, .hist = 0 };
++        self.xd = try self.rig.input(std.mem.sliceAsBytes(self.x));
++        const up = try self.rig.input(std.mem.sliceAsBytes(pu));
++        const scd = try self.rig.input(std.mem.sliceAsBytes(self.sc));
++        self.layer = .{ .format = .fp8g, .up = up, .down = 0, .up_scale = scd, .width = n, .dims = k, .experts = experts, .limit = self.entry.limit, .after = true };
++        self.out = try self.rig.output(pairs * n * 2);
++        return true;
++    }
++
++    pub fn run(self: *Fp8) !void {
++        try self.ex.run(self.rig.s, .up, .{ .x = self.xd, .stride = self.shape.k, .slots = slots }, self.layer, self.plan, self.entry.prompt, self.out, self.items, -1);
++        try self.rig.s.synchronize();
++    }
++
++    pub fn count(self: *Fp8) usize {
++        return self.shape.rows * slots * self.shape.n;
++    }
++
++    /// Output o's products for matrix m (0 gate, 1 up), each times its block's scale.
++    fn terms(self: *const Fp8, m: usize, o: usize, t: []f64) void {
++        const n = self.shape.n;
++        const k = self.shape.k;
++        const p = o / n;
++        const col = o % n;
++        const e: usize = self.picks[p];
++        const w = self.w[((m * experts + e) * n + col) * k ..][0..k];
++        const sc = self.sc[((e * 2 + m) * (n / 128) + col / 128) * (k / 128) ..][0 .. k / 128];
++        for (t, 0..) |*v, i| v.* = bf(self.x[(p / slots) * k + i]) * fp8.e4m3(w[i]) * sc[i / 128];
++    }
++
++    pub fn reference(self: *Fp8, want: []f64, mag: []f64) !void {
++        const a = self.rig.gpu.gpa;
++        a.free(self.extra);
++        self.extra = try a.alloc(f64, want.len);
++        const t = try a.alloc(f64, self.shape.k);
++        defer a.free(t);
++        const gam = c.gamma(@floatFromInt(fp8Depth(self.shape)), 0x1p-24);
++        for (want, mag, self.extra, 0..) |*w, *m, *x, o| {
++            var v: [2]f64 = undefined;
++            var e: [2]f64 = undefined;
++            for (0..2) |mi| {
++                self.terms(mi, o, t);
++                var abs: f64 = 0;
++                for (t) |y| abs += @abs(y);
++                v[mi] = pages.sumIn(.none, .sequential, t);
++                e[mi] = gam * abs;
++            }
++            w.* = act(v[0], v[1], self.entry.limit);
++            m.* = 0;
++            x.* = if (self.fill == .stress) 0 else more.actSpread(v[0], v[1], e[0], e[1], 0x1p-8);
++        }
++    }
++
++    pub fn bounds(self: *Fp8, _: []const f64, _: []const f64, allow: []f64) !void {
++        more.widen(allow, self.extra);
++    }
++
++    pub fn simulate(self: *Fp8, acc: c.Accum, order: g.Order, out: []f64) !void {
++        const t = try self.rig.gpu.gpa.alloc(f64, self.shape.k);
++        defer self.rig.gpu.gpa.free(t);
++        for (out, 0..) |*v, o| {
++            var x: [2]f64 = undefined;
++            for (0..2) |mi| {
++                self.terms(mi, o, t);
++                x[mi] = pages.sumIn(acc, order, t);
++            }
++            v.* = act(x[0], x[1], self.entry.limit);
++        }
++    }
++};
+diff --git a/zig/tests/cuda/contract_ling_more.zig b/zig/tests/cuda/contract_ling_more.zig
+new file mode 100644
+index 000000000..10e0a40d0
+--- /dev/null
++++ b/zig/tests/cuda/contract_ling_more.zig
+@@ -0,0 +1,481 @@
++//! Ling-3.1-flash's MLA chunks, the EXL3 grouped finish in Ling's clamp order and the Ling-order FP8 gate-up.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const check = @import("check.zig");
++const rig_ = @import("contract_rig.zig");
++const pages = @import("contract_glm_pages.zig");
++
++const contract = core.contract;
++const c = contract.spec;
++const g = contract.gates;
++const lf = @import("contract_ling_fp8.zig");
++const fx8 = cuda.experts.Fp8Experts;
++
++const lw = 512; // the latent: the values
++const kw = 576; // q and key rows: the latent, then the 64 roped columns
++const chunk = 512;
++const att_scale: f32 = 0.07216878364870322; // 1 / sqrt(192), as fp32
++const had: f64 = @as(f32, 0.08838834764831845); // tf_exl3::HAD_SCALE
++const soft_why = "online softmax over 512-key chunks, then the chunk merge: no input makes its sums exact in fp32";
++const act_why = "silu and the clamps follow the sums; the down entry proves fp32 sums on the same stage";
++
++pub fn bf(h: u16) f64 {
++    return c.fromBf16(h);
++}
++
++fn half(h: u16) f64 {
++    return @as(f16, @bitCast(h));
++}
++
++fn toHalf(v: f32) u16 {
++    return @bitCast(@as(f16, @floatCast(v)));
++}
++
++fn silu(x: f64) f64 {
++    return x / (1 + @exp(-x));
++}
++
++/// torch's order: min(silu(g), L) * clip(u, -L, L) for L > 0 (comparisons, a NaN kept), else silu(g) * u.
++pub fn act(gv: f64, uv: f64, lim: f64) f64 {
++    var s = silu(gv);
++    var u = uv;
++    if (lim > 0) {
++        s = if (s > lim) lim else s;
++        u = if (u > lim) lim else if (u < -lim) -lim else u;
++    }
++    return s * u;
++}
++
++/// act's error when g and u are off by eg and eu, with `mid` bf16 roundings of g, u and silu(g) on top (0 or 2^-8).
++pub fn actSpread(gv: f64, uv: f64, eg0: f64, eu0: f64, mid: f64) f64 {
++    const sg = 1 / (1 + @exp(-gv));
++    const dg = mid * @abs(gv) + eg0;
++    const ds = (@abs(sg * (1 + gv * (1 - sg))) + 0.55 * dg) * dg + (mid + 0x1p-20) * @abs(silu(gv));
++    const du = mid * @abs(uv) + eu0;
++    const x = 1.25 * (@abs(uv) * ds + @abs(silu(gv)) * du + ds * du);
++    return if (std.math.isFinite(x)) x else 0;
++}
++
++pub fn widen(allow: []f64, extra: []const f64) void {
++    for (allow, extra) |*l, x| l.* = if (std.math.isFinite(l.* + x)) l.* + x else std.math.floatMax(f64);
++}
++
++/// A key's 576 products, then a chunk's 512 keys and the merge's chunks.
++fn attnDepth(s: c.Shape) usize {
++    return kw + chunk + s.k / chunk + 1;
++}
++
++const chunk_shapes = [_]c.Shape{ .{ .rows = 8, .n = 32 * lw, .k = 2 * chunk }, .{ .rows = 4, .n = 64 * lw, .k = 2 * chunk }, .{ .rows = 64, .n = 32 * lw, .k = chunk } };
++
++fn chunkSpec() c.Spec {
++    return .{ .name = "cuda ling glm_glue tf_ling_chunks_r16 (576-wide q and keys, dense over a linear cache), with tf_glm_merge", .accum = .f32, .depth = attnDepth, .ops = 8, .out = .bf16, .served = &chunk_shapes, .sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = soft_why } };
++}
++
++pub fn chunksSmem() u32 {
++    return (16 * kw + 2 * 32 * kw + 16 * 32) * 2 + (16 * 4 + 2 * 16) * 4;
++}
++
++/// tf_ling_chunks_r16 as ops.attention calls it: rows x heads x 576 queries, keys 0..pos + r of a linear cache.
++pub const Chunks = struct {
++    rig: rig_.Rig,
++    f: cuda.Function,
++    merge: cuda.Function,
++    shape: c.Shape = undefined,
++    q: []u16 = &.{},
++    cache: []u16 = &.{},
++    tol: []f64 = &.{},
++    at: usize = 0,
++    nch: usize = 0,
++    heads: usize = 0,
++    in: [3]u64 = @splat(0), // q, cache, the merge's counts (unread when dense)
++    pos: u64 = 0,
++    parts: [3]u64 = @splat(0),
++    out: u64 = 0,
++
++    pub fn deinit(self: *Chunks) void {
++        self.free();
++        self.rig.deinit();
++    }
++
++    fn free(self: *Chunks) void {
++        const a = self.rig.gpu.gpa;
++        a.free(self.q);
++        a.free(self.cache);
++        a.free(self.tol);
++        self.q = &.{};
++        self.cache = &.{};
++        self.tol = &.{};
++    }
++
++    pub fn kernel(self: *Chunks) g.Kernel {
++        return .{ .spec = chunkSpec(), .ctx = self, .vt = &vt };
++    }
++
++    const vt = g.hooks(Chunks);
++
++    /// Queries and keys in [-1, 1); row r at position k - rows / 2 + r, so the rows straddle a chunk edge.
++    pub fn prepare(self: *Chunks, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (shape.n % lw != 0 or shape.rows == 0 or shape.k == 0) return false;
++        self.free();
++        self.rig.reset();
++        self.shape = shape;
++        self.heads = shape.n / lw;
++        const a = self.rig.gpu.gpa;
++        var prng = std.Random.DefaultPrng.init(seed);
++        const rng = prng.random();
++        self.at = shape.k - @min(shape.k, shape.rows / 2);
++        const span = self.at + shape.rows;
++        self.nch = (span + chunk - 1) / chunk;
++        self.q = try a.alloc(u16, shape.rows * self.heads * kw);
++        self.cache = try a.alloc(u16, span * kw);
++        for (self.q) |*v| v.* = c.toBf16(rng.float(f32) * 2 - 1);
++        for (self.cache) |*v| v.* = c.toBf16(rng.float(f32) * 2 - 1);
++        if (fill == .nonfinite) {
++            self.q[3] = c.toBf16(std.math.nan(f32));
++            self.q[kw + 540] = c.toBf16(std.math.nan(f32)); // head 1, a roped column
++            self.cache[9] = c.toBf16(std.math.inf(f32));
++            self.cache[2 * kw + 530] = c.toBf16(-std.math.inf(f32)); // key 2, a roped column: scores only
++        }
++        const p: i32 = @intCast(self.at);
++        const cnt: i32 = 0;
++        self.in[0] = try self.rig.input(std.mem.sliceAsBytes(self.q));
++        self.in[1] = try self.rig.input(std.mem.sliceAsBytes(self.cache));
++        self.in[2] = try self.rig.input(std.mem.asBytes(&cnt));
++        self.pos = try self.rig.input(std.mem.asBytes(&p));
++        const n = self.nch * shape.rows * self.heads;
++        self.parts = .{ try self.rig.scratch(n * lw * 4), try self.rig.scratch(n * 4), try self.rig.scratch(n * 4) };
++        self.out = try self.rig.output(shape.rows * self.heads * lw * 2);
++        return true;
++    }
++
++    pub fn run(self: *Chunks) !void {
++        const rows: i64 = @intCast(self.shape.rows);
++        const heads: i64 = @intCast(self.heads);
++        var a: cuda.Args = .{};
++        inline for (.{ self.in[0], self.in[1], self.pos, @as(u64, 0), @as(u64, 0), self.parts[0], self.parts[1], self.parts[2], rows, heads, @as(i64, 0), att_scale, @as(c_int, 0), @as(u64, 0), @as(i64, 0) }) |v| a.add(v);
++        try cuda.launch.launch(self.f, .{ .grid = .{ .x = @intCast(self.shape.rows), .y = @intCast((self.heads + 15) / 16), .z = @intCast(self.nch) }, .block = .{ .x = 256 }, .shared = chunksSmem() }, self.rig.s, &a);
++        var m: cuda.Args = .{};
++        inline for (.{ self.parts[0], self.parts[1], self.parts[2], self.out, self.in[2], rows, heads, @as(c_int, @intCast(self.nch)), @as(c_int, 0) }) |v| m.add(v);
++        try cuda.launch.launch(self.merge, .{ .grid = .{ .x = @intCast(self.shape.rows), .y = @intCast(self.heads) }, .block = .{ .x = 128 } }, self.rig.s, &m);
++        try self.rig.s.synchronize();
++    }
++
++    pub fn count(self: *Chunks) usize {
++        return self.shape.rows * self.heads * lw;
++    }
++
++    /// Row r, head h: softmax(q . k scale) . v over keys 0..at + r, sums in `acc` (null: float64), into `o`.
++    fn attend(self: *Chunks, r: usize, h: usize, acc: ?c.Accum, order: g.Order, o: []f64, tol: ?[]f64) !void {
++        const a = self.rig.gpu.gpa;
++        const n = self.at + r + 1;
++        const s = try a.alloc(f64, 3 * n);
++        defer a.free(s);
++        const ds = s[n .. 2 * n];
++        const p = s[2 * n ..];
++        var terms: [kw]f64 = undefined;
++        var most = -std.math.inf(f64);
++        const sc: f64 = att_scale;
++        for (0..n) |i| {
++            var abs: f64 = 0;
++            for (&terms, 0..) |*x, d| {
++                x.* = bf(self.q[(r * self.heads + h) * kw + d]) * bf(self.cache[i * kw + d]);
++                abs += @abs(x.*);
++            }
++            s[i] = (if (acc) |k| pages.sumIn(k, order, &terms) else pages.sumIn(.none, .sequential, &terms)) * sc;
++            ds[i] = abs * sc * (kw + 8) * 0x1p-24;
++            most = pages.maxNan(most, s[i]);
++        }
++        for (p, s[0..n]) |*x, v| x.* = @exp(v - most);
++        const l = if (acc) |k| pages.sumIn(k, order, p) else pages.sumIn(.none, .sequential, p);
++        const col = try a.alloc(f64, n);
++        defer a.free(col);
++        for (o, 0..) |*od, d| {
++            var spread: f64 = 0;
++            for (col, p, 0..) |*x, w, i| {
++                const v = bf(self.cache[i * kw + d]);
++                x.* = w * v;
++                spread += w * @abs(v) * (0x1p-8 + ds[i]);
++            }
++            od.* = (if (acc) |k| pages.sumIn(k, order, col) else pages.sumIn(.none, .sequential, col)) / l;
++            if (tol) |t| t[d] = @abs(od.*) * 0x1p-8 + spread / l + 1e-30;
++        }
++    }
++
++    /// float64 o = sum p v / sum p, p = exp(s - max); bound: bf16 out and p (2^-8 each), 584 2^-24 scale sum |q k|.
++    pub fn reference(self: *Chunks, want: []f64, mag: []f64) !void {
++        const a = self.rig.gpu.gpa;
++        a.free(self.tol);
++        self.tol = try a.alloc(f64, want.len);
++        for (0..self.shape.rows) |r| for (0..self.heads) |h| {
++            const at = (r * self.heads + h) * lw;
++            try self.attend(r, h, null, .sequential, want[at..][0..lw], self.tol[at..][0..lw]);
++        };
++        for (mag, want) |*m, w| m.* = @abs(w);
++    }
++
++    pub fn bounds(self: *Chunks, _: []const f64, _: []const f64, allow: []f64) !void {
++        for (allow, self.tol) |*l, t| l.* = if (std.math.isFinite(t)) t else std.math.floatMax(f64);
++    }
++
++    pub fn simulate(self: *Chunks, acc: c.Accum, order: g.Order, out: []f64) !void {
++        for (0..self.shape.rows) |r| for (0..self.heads) |h| {
++            const at = (r * self.heads + h) * lw;
++            try self.attend(r, h, acc, order, out[at..][0..lw], null);
++            for (out[at..][0..lw]) |*v| v.* = bf(c.toBf16(@floatCast(v.*)));
++        };
++    }
++};
++
++/// A host plan as grouped.zig's router writes it: pairs by expert, items of at most `per` pairs.
++pub const Plan = struct {
++    items: []i32,
++    members: []i32,
++    n: usize,
++
++    pub fn make(a: std.mem.Allocator, picks: []const u8, ne: usize, per: usize) !Plan {
++        var p: Plan = .{ .items = try a.alloc(i32, 3 * (picks.len + ne)), .members = try a.alloc(i32, picks.len), .n = 0 };
++        var at: usize = 0;
++        for (0..ne) |e| {
++            const first = at;
++            for (picks, 0..) |x, i| if (x == e) {
++                p.members[at] = @intCast(i);
++                at += 1;
++            };
++            var o = first;
++            while (o < at) : (o += per) {
++                p.items[3 * p.n ..][0..3].* = .{ @intCast(e), @intCast(o), @intCast(@min(per, at - o)) };
++                p.n += 1;
++            }
++        }
++        return p;
++    }
++
++    pub fn deinit(p: Plan, a: std.mem.Allocator) void {
++        a.free(p.items);
++        a.free(p.members);
++    }
++};
++
++const Stage = extern struct { items: u64, counts: u64, members: u64, x: u64, su0: u64, su1: u64, sv0: u64, sv1: u64, x0: u64, x1: u64, z: u64, out: u64, k: i32, n: i32, p: i32, sk: i32, slots: i32, stride: i32, skip: i32, epi: i32, act_mode: i32, limit: f32 };
++
++pub const FinishEntry = struct { name: []const u8, up: bool, limit: f32 = 0 };
++
++pub const finish_entries = [_]FinishEntry{
++    .{ .name = "cuda ling exl3_experts tf_exl3_plan_finish_after (gate-up: the limit 10 on silu's output, fp32 activation)", .up = true, .limit = 10 },
++    .{ .name = "cuda ling exl3_experts tf_exl3_plan_finish_after (gate-up, no limit, fp32 activation)", .up = true },
++    .{ .name = "cuda ling exl3_experts tf_exl3_plan_finish_after (down, fp32 out)", .up = false },
++};
++
++/// The split-K slices in turn, then the 128-point Hadamard's seven butterfly levels.
++fn finishDepth(s: c.Shape) usize {
++    return s.k / 128 + 7;
++}
++
++const finish_up = [_]c.Shape{ .{ .rows = 8, .n = 1280, .k = 512 }, .{ .rows = 70, .n = 640, .k = 512 } };
++const finish_down = [_]c.Shape{ .{ .rows = 8, .n = 4096, .k = 128 }, .{ .rows = 70, .n = 4096, .k = 128 } };
++pub const experts = 8;
++
++fn finishSpec(e: FinishEntry) c.Spec {
++    if (e.up) return .{ .name = e.name, .accum = .f32, .depth = finishDepth, .out = .bf16, .served = &finish_up, .sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = act_why } };
++    return .{ .name = e.name, .accum = .f32, .depth = finishDepth, .ops = 2, .out = .f32, .served = &finish_down };
++}
++
++/// The grouped finish: z's slices summed, the Hadamard, times HAD_SCALE and svh; gate-up then silu, clamps, product.
++pub const Finish = struct {
++    rig: rig_.Rig,
++    f: cuda.Function,
++    entry: FinishEntry,
++    shape: c.Shape = undefined,
++    fill: g.Fill = .random,
++    z: []f32 = &.{},
++    sv: []u16 = &.{}, // [2][E][n]: gate then up (down: the first)
++    picks: []u8 = &.{},
++    extra: []f64 = &.{},
++    items: usize = 0,
++    stage: Stage = undefined,
++
++    pub fn deinit(self: *Finish) void {
++        self.free();
++        self.rig.deinit();
++    }
++
++    fn free(self: *Finish) void {
++        const a = self.rig.gpu.gpa;
++        a.free(self.z);
++        a.free(self.sv);
++        a.free(self.picks);
++        a.free(self.extra);
++        self.z = &.{};
++        self.sv = &.{};
++        self.picks = &.{};
++        self.extra = &.{};
++    }
++
++    pub fn kernel(self: *Finish) g.Kernel {
++        return .{ .spec = finishSpec(self.entry), .ctx = self, .vt = &vt };
++    }
++
++    const vt = g.hooks(Finish);
++
++    fn sk(self: *const Finish) usize {
++        return self.shape.k / 128;
++    }
++
++    /// z [mats * sk][pairs][n] in [-4, 4); stress (down): integers within 2^14, svh 1, every partial exact in fp32.
++    pub fn prepare(self: *Finish, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (shape.rows == 0 or shape.n % 128 != 0 or shape.k % 128 != 0 or shape.k == 0) return false;
++        self.free();
++        self.rig.reset();
++        self.shape = shape;
++        self.fill = fill;
++        const a = self.rig.gpu.gpa;
++        var prng = std.Random.DefaultPrng.init(seed);
++        const rng = prng.random();
++        const mats: usize = if (self.entry.up) 2 else 1;
++        self.z = try a.alloc(f32, mats * self.sk() * shape.rows * shape.n);
++        self.sv = try a.alloc(u16, 2 * experts * shape.n);
++        self.picks = try a.alloc(u8, shape.rows);
++        const stress = fill == .stress and !self.entry.up;
++        for (self.z) |*v| v.* = if (stress) @floatFromInt(@as(i32, @intCast(rng.uintLessThan(u32, 1 << 15))) - (1 << 14)) else (rng.float(f32) * 2 - 1) * 4;
++        for (self.sv) |*v| v.* = toHalf(if (stress) 1 else 0.5 + rng.float(f32));
++        for (self.picks) |*p| p.* = rng.uintLessThan(u8, experts);
++        if (fill == .nonfinite) {
++            const n = shape.n;
++            self.z[3] = std.math.nan(f32);
++            self.z[n + 130] = std.math.inf(f32);
++            self.z[2 * n + 5] = std.math.inf(f32);
++            self.z[2 * n + 9] = -std.math.inf(f32);
++            if (self.entry.up) self.z[(self.sk() * shape.rows + 3) * n + 7] = std.math.nan(f32); // an up NaN
++        }
++        const plan = try Plan.make(a, self.picks, experts, 64);
++        defer plan.deinit(a);
++        self.items = plan.n;
++        const cnt: i32 = @intCast(plan.n);
++        const items = try self.rig.input(std.mem.sliceAsBytes(plan.items[0 .. 3 * plan.n]));
++        const counts = try self.rig.input(std.mem.asBytes(&cnt));
++        const members = try self.rig.input(std.mem.sliceAsBytes(plan.members));
++        const zd = try self.rig.input(std.mem.sliceAsBytes(self.z));
++        const svd = try self.rig.input(std.mem.sliceAsBytes(self.sv));
++        const out = try self.rig.output(shape.rows * shape.n * @as(usize, if (self.entry.up) 2 else 4));
++        self.stage = .{ .items = items, .counts = counts, .members = members, .x = 0, .su0 = 0, .su1 = 0, .sv0 = svd, .sv1 = svd + experts * shape.n * 2, .x0 = 0, .x1 = 0, .z = zd, .out = out, .k = 0, .n = @intCast(shape.n), .p = @intCast(shape.rows), .sk = @intCast(self.sk()), .slots = 0, .stride = 0, .skip = -1, .epi = if (self.entry.up) 2 else 0, .act_mode = 1, .limit = self.entry.limit };
++        return true;
++    }
++
++    pub fn run(self: *Finish) !void {
++        var a: cuda.Args = .{};
++        a.add(self.stage);
++        try cuda.launch.launch(self.f, .{ .grid = .{ .x = @intCast(self.items), .y = @intCast(self.shape.n / 128) }, .block = .{ .x = 32 } }, self.rig.s, &a);
++        try self.rig.s.synchronize();
++    }
++
++    pub fn count(self: *Finish) usize {
++        return self.shape.rows * self.shape.n;
++    }
++
++    /// Output o's terms: +-z over the slices of matrix m and its block's 128 columns, the Hadamard's signs.
++    fn terms(self: *const Finish, m: usize, o: usize, t: []f64) void {
++        const n = self.shape.n;
++        const p = o / n;
++        const col = o % n;
++        const i = col % 128;
++        const base = col - i;
++        for (0..self.sk()) |s| for (0..128) |j| {
++            const z: f64 = self.z[((m * self.sk() + s) * self.shape.rows + p) * n + base + j];
++            t[s * 128 + j] = if (@popCount(i & j) % 2 == 0) z else -z;
++        };
++    }
++
++    fn svOf(self: *const Finish, m: usize, o: usize) f64 {
++        const n = self.shape.n;
++        return half(self.sv[(m * experts + self.picks[o / n]) * n + o % n]);
++    }
++
++    fn one(self: *Finish, acc: c.Accum, order: g.Order, o: usize, t: []f64) [2]f64 {
++        var v: [2]f64 = .{ 0, 0 };
++        for (0..@as(usize, if (self.entry.up) 2 else 1)) |m| {
++            self.terms(m, o, t);
++            v[m] = pages.sumIn(acc, order, t) * had * self.svOf(m, o);
++        }
++        return v;
++    }
++
++    pub fn reference(self: *Finish, want: []f64, mag: []f64) !void {
++        const a = self.rig.gpu.gpa;
++        a.free(self.extra);
++        self.extra = try a.alloc(f64, want.len);
++        @memset(self.extra, 0);
++        const t = try a.alloc(f64, self.shape.k);
++        defer a.free(t);
++        const lim: f64 = self.entry.limit;
++        for (want, mag, self.extra, 0..) |*w, *m, *x, o| {
++            var e: [2]f64 = .{ 0, 0 };
++            var v: [2]f64 = .{ 0, 0 };
++            for (0..@as(usize, if (self.entry.up) 2 else 1)) |mi| {
++                self.terms(mi, o, t);
++                var abs: f64 = 0;
++                for (t) |y| abs += @abs(y);
++                const sc = had * @abs(self.svOf(mi, o));
++                v[mi] = pages.sumIn(.none, .sequential, t) * had * self.svOf(mi, o);
++                e[mi] = c.gamma(@floatFromInt(finishDepth(self.shape)), 0x1p-24) * abs * sc + 2 * 0x1p-24 * @abs(v[mi]);
++                if (!self.entry.up) m.* = abs * sc;
++            }
++            w.* = if (self.entry.up) act(v[0], v[1], lim) else v[0];
++            if (self.entry.up) {
++                m.* = 0;
++                x.* = actSpread(v[0], v[1], e[0], e[1], 0);
++            }
++        }
++    }
++
++    pub fn bounds(self: *Finish, _: []const f64, _: []const f64, allow: []f64) !void {
++        widen(allow, self.extra);
++    }
++
++    pub fn simulate(self: *Finish, acc: c.Accum, order: g.Order, out: []f64) !void {
++        const t = try self.rig.gpu.gpa.alloc(f64, self.shape.k);
++        defer self.rig.gpu.gpa.free(t);
++        for (out, 0..) |*v, o| {
++            const x = self.one(acc, order, o, t);
++            v.* = if (self.entry.up) act(x[0], x[1], self.entry.limit) else x[0];
++        }
++    }
++};
++
++/// The three kinds on the heap: the gates hold pointers to them.
++pub const Set = struct {
++    gpa: std.mem.Allocator,
++    chunks: Chunks = undefined,
++    finish: [finish_entries.len]Finish = undefined,
++    fp8s: [lf.fp8_entries.len]lf.Fp8 = undefined,
++    exl3: cuda.Module = undefined,
++    ex: fx8 = undefined,
++
++    pub fn init(gpu: check.Gpu, s: cuda.Stream, a: std.mem.Allocator, glue: cuda.Module, list: *std.ArrayList(g.Kernel)) !*Set {
++        const set = try gpu.gpa.create(Set);
++        errdefer gpu.gpa.destroy(set);
++        set.* = .{ .gpa = gpu.gpa };
++        const f = try glue.function("tf_ling_chunks_r16");
++        try f.allowDynamicShared(chunksSmem());
++        set.chunks = .{ .rig = .{ .gpu = gpu, .s = s }, .f = f, .merge = try glue.function("tf_glm_merge") };
++        set.exl3 = try cuda.Module.load(gpu.d, cuda.kernels.exl3_experts);
++        errdefer set.exl3.unload();
++        const fin = try set.exl3.function("tf_exl3_plan_finish_after");
++        for (&set.finish, finish_entries) |*x, e| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = fin, .entry = e };
++        set.ex = try fx8.load(gpu.d, @intCast(try gpu.ctx.attribute(.multiprocessor_count)));
++        for (&set.fp8s, lf.fp8_entries) |*x, e| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .ex = &set.ex, .entry = e };
++        try list.append(a, set.chunks.kernel());
++        for (&set.finish) |*x| try list.append(a, x.kernel());
++        for (&set.fp8s) |*x| try list.append(a, x.kernel());
++        return set;
++    }
++
++    pub fn deinit(set: *Set) void {
++        set.chunks.deinit();
++        for (&set.finish) |*x| x.deinit();
++        for (&set.fp8s) |*x| x.deinit();
++        set.ex.unload();
++        set.exl3.unload();
++        set.gpa.destroy(set);
++    }
++};
+-- 
+2.53.0
+

@@ -1,0 +1,42 @@
+From 324034de335fb266f4e01021363291b553bd0cb2 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 07:52:11 +1100
+Subject: [PATCH 17/26] ling: gate-5 records for tf_ling_chunks_split_r16 and
+ tf_ling_merge_part (nvcc 13.0 from the host's /usr/local/cuda-13.0, 13.3 from
+ the build image, five-SM fatbins as the build compiles glm_glue; 13.2
+ pending)
+
+---
+ zig/src/core/contract/ling_cuda_records.zig        | 2 ++
+ zig/src/core/contract/measurements/pending_133.zig | 2 ++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/zig/src/core/contract/ling_cuda_records.zig b/zig/src/core/contract/ling_cuda_records.zig
+index e4b39b0cf..22e004c3b 100644
+--- a/zig/src/core/contract/ling_cuda_records.zig
++++ b/zig/src/core/contract/ling_cuda_records.zig
+@@ -4,6 +4,8 @@ const registry = @import("registry.zig");
+ /// nvcc 13.0's usage (host /usr/local/cuda-13.0, five-SM fatbins); 13.2 pending, 13.3 in measurements/pending_133.zig.
+ pub const records = [_]registry.CudaRecord{
+     .{ .launch = .{ .name = "glm_glue tf_ling_chunks_r16", .symbol = "tf_ling_chunks_r16", .image = "glm_glue", .threads = 256, .dynamic = 93568, .opt_in = true, .min_sm = 80 }, .usage = .{ .{ .regs = 76, .static = 0, .bound = 256 }, .{ .regs = 76, .static = 0, .bound = 256 }, .{ .regs = 76, .static = 0, .bound = 256 }, .{ .regs = 126, .static = 0, .bound = 256 }, .{ .regs = 126, .static = 0, .bound = 256 } }, .later_pending = true },
++    .{ .launch = .{ .name = "glm_glue tf_ling_chunks_split_r16", .symbol = "tf_ling_chunks_split_r16", .image = "glm_glue", .threads = 256, .dynamic = 93568, .opt_in = true, .min_sm = 80 }, .usage = .{ .{ .regs = 74, .static = 0, .bound = 256 }, .{ .regs = 79, .static = 0, .bound = 256 }, .{ .regs = 79, .static = 0, .bound = 256 }, .{ .regs = 119, .static = 0, .bound = 256 }, .{ .regs = 119, .static = 0, .bound = 256 } }, .later_pending = true },
++    .{ .launch = .{ .name = "glm_glue tf_ling_merge_part", .symbol = "tf_ling_merge_part", .image = "glm_glue", .threads = 128, .min_sm = 80 }, .usage = .{ .{ .regs = 30, .static = 0, .bound = 128 }, .{ .regs = 31, .static = 0, .bound = 128 }, .{ .regs = 31, .static = 0, .bound = 128 }, .{ .regs = 32, .static = 0, .bound = 128 }, .{ .regs = 32, .static = 0, .bound = 128 } }, .later_pending = true },
+     .{ .launch = .{ .name = "glm_glue tf_ling_absorb_q_128", .symbol = "tf_ling_absorb_q_128", .image = "glm_glue", .threads = 128, .min_sm = 80 }, .usage = .{ .{ .regs = 56, .static = 512, .bound = 128 }, .{ .regs = 56, .static = 512, .bound = 128 }, .{ .regs = 56, .static = 512, .bound = 128 }, .{ .regs = 56, .static = 512, .bound = 128 }, .{ .regs = 56, .static = 512, .bound = 128 } }, .later_pending = true },
+     .{ .launch = .{ .name = "glm_glue tf_ling_expand_v_128", .symbol = "tf_ling_expand_v_128", .image = "glm_glue", .threads = 128, .min_sm = 80 }, .usage = .{ .{ .regs = 96, .static = 128, .bound = 128 }, .{ .regs = 96, .static = 128, .bound = 128 }, .{ .regs = 96, .static = 128, .bound = 128 }, .{ .regs = 95, .static = 128, .bound = 128 }, .{ .regs = 95, .static = 128, .bound = 128 } }, .later_pending = true },
+     .{ .launch = .{ .name = "glm_glue tf_ling_rope", .symbol = "tf_ling_rope", .image = "glm_glue", .threads = 32, .min_sm = 80 }, .usage = .{ .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 22, .static = 0, .bound = 32 }, .{ .regs = 22, .static = 0, .bound = 32 } }, .later_pending = true },
+diff --git a/zig/src/core/contract/measurements/pending_133.zig b/zig/src/core/contract/measurements/pending_133.zig
+index 1dea6206e..cb28e7cb1 100644
+--- a/zig/src/core/contract/measurements/pending_133.zig
++++ b/zig/src/core/contract/measurements/pending_133.zig
+@@ -59,6 +59,8 @@ pub const records = [_]Override{
+     .{ .name = "w4a8_prefill tf_w4a8_quantize", .usage = .{ .{ .regs = 27, .static = 0, .bound = 128 }, .{ .regs = 27, .static = 0, .bound = 128 }, .{ .regs = 27, .static = 0, .bound = 128 }, .{ .regs = 27, .static = 0, .bound = 128 }, .{ .regs = 27, .static = 0, .bound = 128 } } },
+     .{ .name = "qwen35_keep tf_q35k_apply_pend", .usage = .{ .{ .regs = 32, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 } } },
+     .{ .name = "glm_glue tf_ling_chunks_r16", .usage = .{ .{ .regs = 76, .static = 0, .bound = 256 }, .{ .regs = 76, .static = 0, .bound = 256 }, .{ .regs = 76, .static = 0, .bound = 256 }, .{ .regs = 126, .static = 0, .bound = 256 }, .{ .regs = 126, .static = 0, .bound = 256 } } },
++    .{ .name = "glm_glue tf_ling_chunks_split_r16", .usage = .{ .{ .regs = 74, .static = 0, .bound = 256 }, .{ .regs = 79, .static = 0, .bound = 256 }, .{ .regs = 79, .static = 0, .bound = 256 }, .{ .regs = 120, .static = 0, .bound = 256 }, .{ .regs = 120, .static = 0, .bound = 256 } } },
++    .{ .name = "glm_glue tf_ling_merge_part", .usage = .{ .{ .regs = 30, .static = 0, .bound = 128 }, .{ .regs = 31, .static = 0, .bound = 128 }, .{ .regs = 31, .static = 0, .bound = 128 }, .{ .regs = 34, .static = 0, .bound = 128 }, .{ .regs = 34, .static = 0, .bound = 128 } } },
+     .{ .name = "glm_glue tf_ling_absorb_q_128", .usage = .{ .{ .regs = 56, .static = 512, .bound = 128 }, .{ .regs = 56, .static = 512, .bound = 128 }, .{ .regs = 56, .static = 512, .bound = 128 }, .{ .regs = 56, .static = 512, .bound = 128 }, .{ .regs = 56, .static = 512, .bound = 128 } } },
+     .{ .name = "glm_glue tf_ling_expand_v_128", .usage = .{ .{ .regs = 96, .static = 128, .bound = 128 }, .{ .regs = 96, .static = 128, .bound = 128 }, .{ .regs = 96, .static = 128, .bound = 128 }, .{ .regs = 96, .static = 128, .bound = 128 }, .{ .regs = 96, .static = 128, .bound = 128 } } },
+     .{ .name = "glm_glue tf_ling_rope", .usage = .{ .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 22, .static = 0, .bound = 32 }, .{ .regs = 22, .static = 0, .bound = 32 } } },
+-- 
+2.53.0
+

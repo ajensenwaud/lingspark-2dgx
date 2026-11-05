@@ -1,0 +1,371 @@
+From 39266ac1415824e3f017dccbe37ebc3b96966d87 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 12:31:02 +1100
+Subject: [PATCH 21/26] ling: kept prompt states in place
+ (TF_LING_KEEP_INPLACE=auto|on|off, auto past the native window): a kept state
+ holds the KDA part alone and names its slot's cache rows; a forward writing
+ below a state's position drops it first, a freed slot copies its states out
+ (their old size); restore copies rows only across slots. kept.zig holds the
+ kept-state code (engine.zig 553 lines). TP=1 trial pack: resumed at 9,000 ==
+ fresh 9/9, byte-equal to the copied state's run
+
+---
+ zig/src/families/ling/engine.zig |  82 ++++-----------
+ zig/src/families/ling/kept.zig   | 167 +++++++++++++++++++++++++++++++
+ 2 files changed, 185 insertions(+), 64 deletions(-)
+ create mode 100644 zig/src/families/ling/kept.zig
+
+diff --git a/zig/src/families/ling/engine.zig b/zig/src/families/ling/engine.zig
+index 0ae505bb6..4ac45fbc6 100644
+--- a/zig/src/families/ling/engine.zig
++++ b/zig/src/families/ling/engine.zig
+@@ -63,7 +63,7 @@ pub const Marks = struct { at: []const u32, ctx: *anyopaque, call: *const fn (ct
+ pub const Step = struct { at: usize, first: ?u32 };
+ 
+ /// A stream's sequence: the layers' caches, the MTP layer's, its sampling rule, the rows its next draft reads.
+-const Seq = struct {
++pub const Seq = struct {
+     st: fw.State,
+     hd: ?fw.State = null, // the MTP layer's MLA cache at its own position
+     hold: ?cuda.DeviceBuffer = null, // the prompt's last final-norm row: the first draft's hidden row
+@@ -72,8 +72,8 @@ const Seq = struct {
+     rows_at: u64 = 0, // the last verify's final-norm rows (bf16 [rows][hidden]): the next draft's hidden rows
+ };
+ 
+-/// A kept state: the sequence's arena copied whole, and the host fields beside it.
+-const Snap = struct { buf: cuda.DeviceBuffer, hd: ?cuda.DeviceBuffer, pos: usize, hd_pos: usize, cur: []u1 };
++const kept = @import("kept.zig");
++const Snap = kept.Snap;
+ 
+ pub const Engine = struct {
+     gpa: std.mem.Allocator,
+@@ -103,6 +103,7 @@ pub const Engine = struct {
+     asleep: bool = false, // rank 0: the other ranks sleep on their lines until its next step
+     dropped: std.ArrayList(u64) = .empty, // kept states dropped since the last step: rank 1 drops them first
+     graphs: ?*steps.Graphs = null, // one sequence's verify windows and MTP chains as CUDA graphs (TF_LING_GRAPHS=0: off)
++    inplace: bool = false, // kept states leave their cache rows in place (kept.zig, TF_LING_KEEP_INPLACE)
+ 
+     /// The checkpoint at `dir` in its own format.
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, dir: []const u8, o: Options) !*Engine {
+@@ -123,6 +124,7 @@ pub const Engine = struct {
+         const e = try gpa.create(Engine);
+         errdefer gpa.destroy(e);
+         e.* = .{ .gpa = gpa, .d = d, .c = c, .m = undefined, .stream = undefined, .w = undefined, .main = undefined, .g = undefined, .att = undefined, .bp = undefined, .bd = undefined, .bs = undefined, .smp = undefined, .pairs = undefined, .capacity = o.capacity, .chunk = o.prompt_rows };
++        e.inplace = try kept.inplaceFor(o.context orelse o.capacity);
+         e.m = try fw.Modules.load(d, ctx);
+         errdefer e.m.deinit();
+         e.stream = try cuda.Stream.init(d, false);
+@@ -201,6 +203,7 @@ pub const Engine = struct {
+         var it = e.snaps.valueIterator();
+         while (it.next()) |s| e.freeSnap(s);
+         e.snaps.deinit(e.gpa);
++        e.snaps = .empty; // free() below looks for states naming each slot
+         e.dropped.deinit(e.gpa);
+         for (0..e.seqs.items.len) |i| e.free(i);
+         e.seqs.deinit(e.gpa);
+@@ -242,7 +245,7 @@ pub const Engine = struct {
+     }
+ 
+     /// TP: rank 0's step on `slot` to the other ranks, the drops queued before it first (nothing elsewhere).
+-    fn sendOn(e: *Engine, slot: u32, h: tp.Header, ids: []const u32) !void {
++    pub fn sendOn(e: *Engine, slot: u32, h: tp.Header, ids: []const u32) !void {
+         const l = e.link orelse return;
+         if (!e.lead) return;
+         if (e.asleep) { // the other ranks wait on their lines, not in NCCL: wake them for this step
+@@ -291,6 +294,7 @@ pub const Engine = struct {
+     fn free(e: *Engine, slot: usize) void {
+         const q = e.seqs.items[slot] orelse return;
+         e.stream.synchronize() catch {};
++        kept.orphan(e, q);
+         e.freeSeq(q);
+         e.gpa.destroy(q);
+         e.seqs.items[slot] = null;
+@@ -376,6 +380,7 @@ pub const Engine = struct {
+         if (stop <= at or stop > len or part.len < @min(len, stop + 1) - at or at != e.cur.st.pos) return error.BadChunk;
+         const ids = part;
+         const rows = stop - at;
++        kept.guard(e, e.cur); // in-place kept states past `at` lose their rows to this chunk
+         const f = e.forward(&e.bp);
+         steps.eager(e.graphs, rows, true); // the prompt path's scratch may move: graphs are captured again after it
+         const seg = [_]fw.Seg{.{ .st = &e.cur.st, .row0 = 0, .rows = rows }};
+@@ -405,6 +410,7 @@ pub const Engine = struct {
+         try e.send(.verify, .{ .kind = 0 }, ids);
+         const f = e.forward(&e.bd);
+         const at = e.cur.st.pos;
++        kept.guard(e, e.cur);
+         try steps.run(e.graphs, f, &.{.{ .st = &e.cur.st, .row0 = 0, .rows = ids.len }}, @ptrCast(ids));
+         e.cur.rows_at = e.bd.normed;
+         try e.draw(e.bd.logits, ids.len, at + 1, out);
+@@ -432,6 +438,7 @@ pub const Engine = struct {
+             if (p.ids.len == 0 or p.ids.len > window_rows or rows + p.ids.len > shared_rows) return error.WindowTooWide;
+             for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
+             try e.bind(p.slot);
++            kept.guard(e, e.cur);
+             segs[i] = .{ .st = &e.cur.st, .row0 = rows, .rows = p.ids.len };
+             @memcpy(ids[rows..][0..p.ids.len], p.ids);
+             rows += p.ids.len;
+@@ -461,6 +468,7 @@ pub const Engine = struct {
+         const D: usize = e.c.hidden;
+         try hd.setPos(e.stream, hd.pos - q.in_head); // the last chain's rows go
+         q.in_head = 0;
++        kept.guard(e, q);
+         const hidden = if (from_prompt) q.hold.?.ptr else q.rows_at;
+         var s0: usize = 0;
+         while (s0 < follow.len) : (s0 += window_rows) {
+@@ -501,74 +509,20 @@ pub const Engine = struct {
+         for (out[0..rows], got[0..rows]) |*o, p| o.* = p[1];
+     }
+ 
+-    /// Bytes a state kept at `at` takes: the committed KDA part, each MLA layer's rows below `at`, the MTP head's too.
++    /// Bytes a state kept at `at` takes: the KDA part, each MLA layer's rows below `at` (none in place), the MTP head's.
+     pub fn stateBytes(e: *const Engine, at: usize) u64 {
+         const q = e.cur;
+-        return keptBytes(&q.st, at) + if (q.hd) |h| keptBytes(&h, at + 1) else 0;
++        return kept.bytes(&q.st, at, e.inplace) + if (q.hd) |h| kept.bytes(&h, at + 1, e.inplace) else 0;
+     }
+ 
+-    /// A kept State: its conv windows and each KDA layer's committed state, then each layer's cache rows below `at`.
+-    fn keptBytes(st: *const fw.State, at: usize) usize {
+-        return st.keptHead() + st.mla_layers * st.below(at) * cache_row;
+-    }
+-
+-    /// The State into `kept` (out) or back from it: conv windows, the KDA copies `cur` names, the rows below `at`.
+-    fn keptCopy(e: *const Engine, st: *const fw.State, kept: u64, at: usize, cur: []const u1, out: bool) !void {
+-        const conv = st.kda_layers * 3 * st.convWidth() * 2;
+-        if (conv > 0) try (if (out) e.copy(kept, st.conv, conv) else e.copy(st.conv, kept, conv));
+-        for (0..st.kda_layers) |li| {
+-            const k = kept + conv + li * st.rec_layer;
+-            try (if (out) e.copy(k, st.recAt(cur[li], li), st.rec_layer) else e.copy(st.recAt(cur[li], li), k, st.rec_layer));
+-        }
+-        const rows = st.below(at) * cache_row;
+-        if (rows == 0) return;
+-        const lead = st.keptHead();
+-        for (0..st.mla_layers) |mi| {
+-            const dst = kept + lead + mi * rows;
+-            try (if (out) e.copy(dst, st.cacheAt(mi), rows) else e.copy(st.cacheAt(mi), dst, rows));
+-        }
+-    }
+-
+-    /// A copy of the bound sequence's state under a new id (the pass standing at a mark).
++    /// The bound sequence's state kept under a new id (the pass standing at a mark): kept.keep.
+     pub fn keepState(e: *Engine) !u64 {
+-        const q = e.cur;
+-        if (q.st.pending != 0 or (q.hd != null and q.in_head != 0)) return error.NotCommitted;
+-        try e.send(.keep_state, .{ .kind = 0, .a = e.next_snap }, &.{});
+-        var buf = try cuda.DeviceBuffer.alloc(e.d, keptBytes(&q.st, q.st.pos));
+-        errdefer if (weights.drains(e.stream)) buf.free(); // else leaked: the copy into it may be queued
+-        try e.keptCopy(&q.st, buf.ptr, q.st.pos, q.st.cur, true);
+-        var hd: ?cuda.DeviceBuffer = null;
+-        errdefer if (hd) |*x| if (weights.drains(e.stream)) x.free();
+-        if (q.hd) |h| {
+-            if (q.in_head != 0) return error.NotCommitted;
+-            hd = try cuda.DeviceBuffer.alloc(e.d, keptBytes(&h, h.pos));
+-            try e.keptCopy(&h, hd.?.ptr, h.pos, h.cur, true);
+-        }
+-        try e.stream.synchronize();
+-        const cur = try e.gpa.dupe(u1, q.st.cur);
+-        errdefer e.gpa.free(cur);
+-        const id = e.next_snap;
+-        try e.snaps.put(e.gpa, id, .{ .buf = buf, .hd = hd, .pos = q.st.pos, .hd_pos = if (q.hd) |h| h.pos else 0, .cur = cur });
+-        e.next_snap += 1;
+-        return id;
++        return kept.keep(e);
+     }
+ 
+-    /// The bound sequence made kept state `id`'s.
++    /// The bound sequence made kept state `id`'s: kept.restore.
+     pub fn restoreState(e: *Engine, id: u64) !void {
+-        const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
+-        const q = e.cur;
+-        try e.keptCopy(&q.st, s.buf.ptr, s.pos, s.cur, false);
+-        @memcpy(q.st.cur, s.cur);
+-        q.st.pending = 0;
+-        q.st.prompt = false;
+-        try q.st.setPos(e.stream, s.pos);
+-        if (q.hd) |*h| {
+-            try e.keptCopy(h, (s.hd orelse return error.NoKeptState).ptr, s.hd_pos, h.cur, false);
+-            h.pending = 0;
+-            try h.setPos(e.stream, s.hd_pos);
+-        }
+-        q.in_head = 0;
+-        try e.stream.synchronize();
++        return kept.restore(e, id);
+     }
+ 
+     pub fn holds(e: *const Engine, id: u64) bool {
+diff --git a/zig/src/families/ling/kept.zig b/zig/src/families/ling/kept.zig
+new file mode 100644
+index 000000000..40fbfb6e5
+--- /dev/null
++++ b/zig/src/families/ling/kept.zig
+@@ -0,0 +1,167 @@
++//! Ling's kept prompt states: a copy of the sequence's state, or (TF_LING_KEEP_INPLACE) its KDA part, rows in place.
++
++// The rows stay in the slot's caches until it writes below the state's position (dropped) or is freed (copied out).
++const std = @import("std");
++const cuda = @import("cuda");
++const engine = @import("engine.zig");
++const fw = @import("forward.zig");
++const rope = @import("rope.zig");
++const weights = @import("weights.zig");
++
++const Engine = engine.Engine;
++const Seq = engine.Seq;
++const cache_row = @import("state.zig").cache_width * 2;
++
++/// A kept state: its KDA part (and with `src` null, its cache rows) in `buf` and `hd`, and the host fields beside it.
++pub const Snap = struct { buf: cuda.DeviceBuffer, hd: ?cuda.DeviceBuffer, pos: usize, hd_pos: usize, cur: []u1, src: ?*Seq = null };
++
++/// TF_LING_KEEP_INPLACE=on|off|auto: auto keeps rows in place past the native window (a full copy does not fit there).
++pub fn inplaceFor(context: usize) !bool {
++    const v = std.c.getenv("TF_LING_KEEP_INPLACE") orelse return context > engine.split_from;
++    const m = std.meta.stringToEnum(rope.Mode, std.mem.span(v)) orelse return error.BadSetting;
++    return switch (m) {
++        .on => true,
++        .off => false,
++        .auto => context > engine.split_from,
++    };
++}
++
++/// Bytes a State kept at `at` holds: its conv windows and each KDA layer's committed state, and the rows unless in place.
++pub fn bytes(st: *const fw.State, at: usize, inplace: bool) usize {
++    return st.keptHead() + if (inplace) 0 else st.mla_layers * st.below(at) * cache_row;
++}
++
++/// The State's KDA part into `kept` (out) or back from it: conv windows, the KDA copies `cur` names.
++fn headCopy(e: *const Engine, st: *const fw.State, kept: u64, cur: []const u1, out: bool) !void {
++    const conv = st.kda_layers * 3 * st.convWidth() * 2;
++    if (conv > 0) try (if (out) e.copy(kept, st.conv, conv) else e.copy(st.conv, kept, conv));
++    for (0..st.kda_layers) |li| {
++        const k = kept + conv + li * st.rec_layer;
++        try (if (out) e.copy(k, st.recAt(cur[li], li), st.rec_layer) else e.copy(st.recAt(cur[li], li), k, st.rec_layer));
++    }
++}
++
++/// Each MLA layer's rows below `at` between a State's caches and a kept buffer after its head (`out`: into the buffer).
++fn rowsCopy(e: *const Engine, st: *const fw.State, kept: u64, at: usize, out: bool) !void {
++    const rows = st.below(at) * cache_row;
++    if (rows == 0) return;
++    for (0..st.mla_layers) |mi| {
++        const dst = kept + st.keptHead() + mi * rows;
++        try (if (out) e.copy(dst, st.cacheAt(mi), rows) else e.copy(st.cacheAt(mi), dst, rows));
++    }
++}
++
++/// Each MLA layer's rows below `at` from one State's caches into another's.
++fn rowsAcross(e: *const Engine, from: *const fw.State, to: *const fw.State, at: usize) !void {
++    const rows = from.below(at) * cache_row;
++    if (rows == 0) return;
++    for (0..from.mla_layers) |mi| try e.copy(to.cacheAt(mi), from.cacheAt(mi), rows);
++}
++
++/// A copy of the bound sequence's state under a new id (the pass standing at a mark).
++pub fn keep(e: *Engine) !u64 {
++    const q = e.cur;
++    if (q.st.pending != 0 or (q.hd != null and q.in_head != 0)) return error.NotCommitted;
++    try e.sendOn(e.slot, .{ .kind = @backingInt(@import("tp.zig").Kind.keep_state), .a = e.next_snap }, &.{});
++    const in = e.inplace;
++    var buf = try cuda.DeviceBuffer.alloc(e.d, bytes(&q.st, q.st.pos, in));
++    errdefer if (weights.drains(e.stream)) buf.free(); // else leaked: the copy into it may be queued
++    try headCopy(e, &q.st, buf.ptr, q.st.cur, true);
++    if (!in) try rowsCopy(e, &q.st, buf.ptr, q.st.pos, true);
++    var hd: ?cuda.DeviceBuffer = null;
++    errdefer if (hd) |*x| if (weights.drains(e.stream)) x.free();
++    if (q.hd) |h| {
++        hd = try cuda.DeviceBuffer.alloc(e.d, bytes(&h, h.pos, in));
++        try headCopy(e, &h, hd.?.ptr, h.cur, true);
++        if (!in) try rowsCopy(e, &h, hd.?.ptr, h.pos, true);
++    }
++    try e.stream.synchronize();
++    const cur = try e.gpa.dupe(u1, q.st.cur);
++    errdefer e.gpa.free(cur);
++    const id = e.next_snap;
++    try e.snaps.put(e.gpa, id, .{ .buf = buf, .hd = hd, .pos = q.st.pos, .hd_pos = if (q.hd) |h| h.pos else 0, .cur = cur, .src = if (in) q else null });
++    e.next_snap += 1;
++    return id;
++}
++
++/// The bound sequence made kept state `id`'s: rows copied back, or from the slot holding them (none if it is this one).
++pub fn restore(e: *Engine, id: u64) !void {
++    const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
++    const q = e.cur;
++    try headCopy(e, &q.st, s.buf.ptr, s.cur, false);
++    if (s.src) |src| {
++        if (src != q) try rowsAcross(e, &src.st, &q.st, s.pos);
++    } else try rowsCopy(e, &q.st, s.buf.ptr, s.pos, false);
++    @memcpy(q.st.cur, s.cur);
++    q.st.pending = 0;
++    q.st.prompt = false;
++    try q.st.setPos(e.stream, s.pos);
++    if (q.hd) |*h| {
++        const hb = s.hd orelse return error.NoKeptState;
++        try headCopy(e, h, hb.ptr, h.cur, false);
++        if (s.src) |src| {
++            if (src != q) try rowsAcross(e, &src.hd.?, h, s.hd_pos);
++        } else try rowsCopy(e, h, hb.ptr, s.hd_pos, false);
++        h.pending = 0;
++        try h.setPos(e.stream, s.hd_pos);
++    }
++    q.in_head = 0;
++    try e.stream.synchronize();
++}
++
++/// Before `q` writes cache rows from its positions on: its in-place states standing past them are dropped.
++pub fn guard(e: *Engine, q: *Seq) void {
++    dropWhere(e, q, false);
++}
++
++/// Every in-place state of `q` dropped (its rows could not be copied out).
++fn dropWhere(e: *Engine, q: *Seq, all: bool) void {
++    var gone: [16]u64 = undefined;
++    while (true) {
++        var n: usize = 0;
++        var it = e.snaps.iterator();
++        while (it.next()) |kv| {
++            const s = kv.value_ptr;
++            if (s.src != q) continue;
++            const past = all or s.pos > q.st.pos or (if (q.hd) |h| s.hd_pos > h.pos else false);
++            if (past and n < gone.len) {
++                gone[n] = kv.key_ptr.*;
++                n += 1;
++            }
++        }
++        for (gone[0..n]) |id| e.dropState(id);
++        if (n < gone.len) return;
++    }
++}
++
++/// Before slot sequence `q` is freed: its in-place states get their rows copied out (they were always this big before).
++pub fn orphan(e: *Engine, q: *Seq) void {
++    copyOut(e, q) catch |err| {
++        std.log.warn("kept states of a freed slot dropped, rows not copied out: {s}", .{@errorName(err)});
++        dropWhere(e, q, true);
++    };
++}
++
++fn copyOut(e: *Engine, q: *Seq) !void {
++    var it = e.snaps.iterator();
++    while (it.next()) |kv| {
++        const s = kv.value_ptr;
++        if (s.src != q) continue;
++        var buf = try cuda.DeviceBuffer.alloc(e.d, bytes(&q.st, s.pos, false));
++        errdefer if (weights.drains(e.stream)) buf.free();
++        try e.copy(buf.ptr, s.buf.ptr, q.st.keptHead());
++        try rowsCopy(e, &q.st, buf.ptr, s.pos, true);
++        var hd: ?cuda.DeviceBuffer = null;
++        if (q.hd) |*h| {
++            hd = try cuda.DeviceBuffer.alloc(e.d, bytes(h, s.hd_pos, false));
++            try e.copy(hd.?.ptr, s.hd.?.ptr, h.keptHead());
++            try rowsCopy(e, h, hd.?.ptr, s.hd_pos, true);
++        }
++        try e.stream.synchronize();
++        s.buf.free();
++        s.buf = buf;
++        if (s.hd) |*x| x.free();
++        s.hd = hd;
++        s.src = null;
++    }
++}
+-- 
+2.53.0
+

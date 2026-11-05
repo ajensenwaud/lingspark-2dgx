@@ -1,0 +1,177 @@
+From 8369c28725d68bb645e0d69178baca83682688d0 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 21:54:04 +1100
+Subject: [PATCH 06/26] ling: lean limits (one-line comments under 120 columns;
+ experts.zig back to 600 lines, the fp8 Ling-order gate-up as a fourth fns
+ entry)
+
+---
+ zig/build/cuda.zig                     |  2 +-
+ zig/src/cuda/experts.zig               | 25 +++++++------------------
+ zig/src/families/ling/config.zig       |  2 +-
+ zig/src/families/ling/ops.zig          |  5 +++--
+ zig/src/families/ling/weights_proj.zig |  4 ++--
+ zig/tests/cuda/ling_exl3_clamp.zig     |  3 +--
+ zig/tests/cuda/ling_exl3_layers.zig    |  7 ++++---
+ 7 files changed, 19 insertions(+), 29 deletions(-)
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 136082087..487f09b3c 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -486,7 +486,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     b.step("test-glm-grants-host", "GLM CUDA head-cost policy without a GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"shared head costs:"} })).step);
+     skip_drafts.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"zero grant:"} })).step);
+     @import("glm_family_host.zig").steps(b, cuda, glm, mods, step);
+-    // Ling-3.1-flash's CUDA family on the host: its loader, layer graph, engine and lane backend compile; routing as the kernels take it
++    // Ling-3.1-flash's CUDA family on the host: loader, graph, engine and lanes compile; routing as the kernels take it
+     const ling_run = b.addRunArtifact(b.addTest(.{ .root_module = engines_build.lingCuda(b, host, .debug, cuda, mods.core, mods.lanes, glm) }));
+     step.dependOn(&ling_run.step);
+     b.step("test-ling", "Ling-3.1-flash's CUDA family on the host: loader, graph, engine and lanes compile, no GPU work").dependOn(&ling_run.step);
+diff --git a/zig/src/cuda/experts.zig b/zig/src/cuda/experts.zig
+index c6e42b297..bbe7f6fff 100644
+--- a/zig/src/cuda/experts.zig
++++ b/zig/src/cuda/experts.zig
+@@ -242,10 +242,8 @@ pub const RowsExperts = @import("experts_rows.zig").RowsExperts;
+ /// Block-FP8 experts (fp8/experts.cu): the Python packing, kernels and grid choice, decode and prompt forms.
+ pub const Fp8Experts = struct {
+     mod: Module,
+-    fns: [2][3]Function, // decode, prompt; by Epi
+-    resident: [2][3]usize, // blocks the grid may hold: per SM times SMs
+-    after: [2]Function, // decode, prompt: gate-up in Ling's clamp order (Layer.after)
+-    after_resident: [2]usize,
++    fns: [2][4]Function, // decode, prompt; by Epi, then gate-up in Ling's clamp order (Layer.after)
++    resident: [2][4]usize, // blocks the grid may hold: per SM times SMs
+ 
+     pub const cols = 32; // output columns a warp
+     pub const block = 128; // the checkpoint's scale block, both ways
+@@ -265,16 +263,12 @@ pub const Fp8Experts = struct {
+         if (!kernels.available) return error.BuiltWithoutKernels;
+         var mod = try Module.load(d, kernels.fp8_experts);
+         errdefer mod.unload();
+-        var e: Fp8Experts = .{ .mod = mod, .fns = undefined, .resident = undefined, .after = undefined, .after_resident = undefined };
+-        const names = [2][3][:0]const u8{ .{ symbols.gate_up, symbols.down_f32, symbols.down_bf16 }, .{ symbols.p_gate_up, symbols.p_down_f32, symbols.p_down_bf16 } };
++        var e: Fp8Experts = .{ .mod = mod, .fns = undefined, .resident = undefined };
++        const names = [2][4][:0]const u8{ .{ symbols.gate_up, symbols.down_f32, symbols.down_bf16, symbols.gate_up_after }, .{ symbols.p_gate_up, symbols.p_down_f32, symbols.p_down_bf16, symbols.p_gate_up_after } };
+         for (names, 0..) |set, i| for (set, 0..) |name, j| {
+             e.fns[i][j] = try mod.function(name);
+             e.resident[i][j] = @max(1, try e.fns[i][j].occupancy(128, 0)) * sms;
+         };
+-        for ([2][:0]const u8{ symbols.gate_up_after, symbols.p_gate_up_after }, 0..) |name, i| {
+-            e.after[i] = try mod.function(name);
+-            e.after_resident[i] = @max(1, try e.after[i].occupancy(128, 0)) * sms;
+-        }
+         return e;
+     }
+ 
+@@ -289,13 +283,8 @@ pub const Fp8Experts = struct {
+         const nb = (if (gate) l.width else l.dims) / cols;
+         const n = if (gate) l.width else l.dims;
+         const pi: usize = @intFromBool(prompt);
+-        const ei: usize = @backingInt(epi);
+-        const after = gate and l.after;
+-        const resident = if (after) e.after_resident[pi] else e.resident[pi][ei];
+-        const grid: usize = if (prompt) blk: {
+-            const cw: usize = if (gate) 2 else 4;
+-            break :blk @min(items * (nb / cw), resident);
+-        } else @min((items * nb + 3) / 4, resident);
++        const ei: usize = if (gate and l.after) 3 else @backingInt(epi);
++        const grid: usize = if (prompt) @min(items * (nb / @as(usize, if (gate) 2 else 4)), e.resident[pi][ei]) else @min((items * nb + 3) / 4, e.resident[pi][ei]);
+         if (grid < 1) return;
+         var a: launch_.Args = .{};
+         a.add(in.x);
+@@ -309,7 +298,7 @@ pub const Fp8Experts = struct {
+         a.add(@as(i32, @intCast(n)));
+         a.add(if (gate) l.limit else @as(f32, 0.0));
+         a.add(skip);
+-        try launch_.launch(if (after) e.after[pi] else e.fns[pi][ei], .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &a);
++        try launch_.launch(e.fns[pi][ei], .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &a);
+     }
+ 
+     /// e4m3 [n, k] of one expert as int32 [n/32][k/32][32][2][4]: lane (gq, t)'s half h, tile j (fp8/experts.py pack).
+diff --git a/zig/src/families/ling/config.zig b/zig/src/families/ling/config.zig
+index 365adb664..8efc511c1 100644
+--- a/zig/src/families/ling/config.zig
++++ b/zig/src/families/ling/config.zig
+@@ -16,7 +16,7 @@ pub const Limits = struct { routed: f32, shared: f32, dense: f32 };
+ /// MLA's rope pairs: rope_interleave true is exllamav3's RopeStyle.GPTJ (adjacent pairs), false NeoX (halves).
+ pub const RopeStyle = enum { gptj, neox };
+ 
+-/// A linear's format: bf16, FP8 128x128 blocks, ModelOpt NVFP4, or EXL3 (exllamav3's trellis, on main's shared kernels).
++/// A linear's format: bf16, FP8 128x128 blocks, ModelOpt NVFP4, or EXL3 (exllamav3's trellis, main's shared kernels).
+ pub const Quant = enum { bf16, fp8_block128, nvfp4, exl3 };
+ 
+ /// Why parse refused the config, one sentence for the caller's log line (tests read it too).
+diff --git a/zig/src/families/ling/ops.zig b/zig/src/families/ling/ops.zig
+index 9ee528d0b..775cddd5d 100644
+--- a/zig/src/families/ling/ops.zig
++++ b/zig/src/families/ling/ops.zig
+@@ -1,5 +1,6 @@
+-//! Ling-3.1's launches on GLM's glue image: group-limited select, SwiGLU in Ling's order, the 128-wide absorbed MLA
+-//! with 64 roped columns. The kernels are GLM's device code at Ling's shapes (glm_glue_moe/latent/attn.cuh).
++//! Ling-3.1's launches on GLM's glue image: group-limited select, Ling's SwiGLU order, the 128-wide absorbed MLA.
++
++// The kernels are GLM's device code at Ling's shapes (glm_glue_moe/latent/attn.cuh), 64 roped columns.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const glm = @import("glm_cuda");
+diff --git a/zig/src/families/ling/weights_proj.zig b/zig/src/families/ling/weights_proj.zig
+index 997af3837..150f822ad 100644
+--- a/zig/src/families/ling/weights_proj.zig
++++ b/zig/src/families/ling/weights_proj.zig
+@@ -176,7 +176,7 @@ pub const Reader = struct {
+         return .{ .trellis = t, .suh = suh, .svh = svh, .halves = @intCast(halves), .codebook = codebook, .n = np };
+     }
+ 
+-    /// An n-by-k EXL3 projection with its trellis as stored (exl3.Dense reads the stored layout), on qlinear's exl3 arm.
++    /// An n-by-k EXL3 projection, its trellis as stored (exl3.Dense reads the stored layout), on qlinear's exl3 arm.
+     fn exl3Linear(r: *Reader, module: []const u8, n: usize, k: usize) !cuda.exl3.Weight {
+         const g = try r.exl3Group(module, n, k);
+         const st = cuda.exl3.strides(k, g.n, g.halves, false);
+@@ -413,7 +413,7 @@ pub const Reader = struct {
+             .limit = limit,
+             .act_mode = 1, // fp32 silu(g) * u, nearest exllamav3's fp16 intermediate
+         };
+-        // after: Ling's order, min(silu(g), L) * clip(u, -L, L), on the shared finish's twin (tf_exl3_plan_finish_after)
++        // after: Ling's order, min(silu(g), L) * clip(u, -L, L), on the shared finish's twin (plan_finish_after)
+         return .{ .format = .exl3, .exl3 = lay, .up = 0, .down = 0, .width = ni, .dims = d, .experts = count, .limit = limit, .after = true };
+     }
+ 
+diff --git a/zig/tests/cuda/ling_exl3_clamp.zig b/zig/tests/cuda/ling_exl3_clamp.zig
+index 873eca2e7..a3d8135e4 100644
+--- a/zig/tests/cuda/ling_exl3_clamp.zig
++++ b/zig/tests/cuda/ling_exl3_clamp.zig
+@@ -1,5 +1,4 @@
+ //! `ling-exl3-clamp DIR [LAYER]`: an EXL3 MoE layer's grouped gate-up in Ling's clamp order vs float64 on its own g, u.
+-//! g and u come from the same grouped kernels run as down projections over the gate and up tables (fp32, unrounded).
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const ling = @import("ling_cuda");
+@@ -15,7 +14,7 @@ fn silu(g: f64) f64 {
+     return g / (1 + @exp(-g));
+ }
+ 
+-/// `l`'s gate (or up) tables as a down projection: dims and width swapped, so the down epilogue writes fp32 g (or u).
++/// `l`'s gate (or up) tables as a down projection, dims and width swapped: the down epilogue writes fp32 g (or u).
+ fn asDown(l: ex.Layer, up: bool) ex.Layer {
+     var x = l.exl3.?;
+     x.down = if (up) x.up else x.gate;
+diff --git a/zig/tests/cuda/ling_exl3_layers.zig b/zig/tests/cuda/ling_exl3_layers.zig
+index 19235c1f9..0d70e6e99 100644
+--- a/zig/tests/cuda/ling_exl3_layers.zig
++++ b/zig/tests/cuda/ling_exl3_layers.zig
+@@ -1,7 +1,8 @@
+ //! `ling-exl3-layers DIR REF OUT`: real EXL3 layers, each on the reference's own input rows (teacher-forced).
+-//! REF (tools/g2/ling_layers_ref.py, exllamav3): "TFLX3L01", u32 T, D, n, i32 ids[T], u32 layer[n], then per layer
+-//! f32 in[T][D] and out[T][D]. OUT: "TFLX3O01", u32 T, D, n, top, then per layer f32 prompt[T][D], decode[T][D],
+-//! i32 prompt picks[T][top + 1], decode picks[T][top + 1] (zeros on a dense layer). The comparison is the script's.
++
++// REF (tools/g2/ling_layers_ref.py, exllamav3): "TFLX3L01", u32 T, D, n, i32 ids[T], u32 layer[n], f32 in, out a layer
++
++// OUT: "TFLX3O01", u32 T, D, n, top, per layer f32 prompt[T][D], decode[T][D], i32 picks[T][top + 1] prompt, decode
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const check = @import("check.zig");
+-- 
+2.53.0
+

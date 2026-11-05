@@ -1,0 +1,2398 @@
+From 9ddff75045a2147ebcc4195ca09d02fc32c7a919 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 20:53:31 +1100
+Subject: [PATCH 02/26] ling: the #874 family on v1.2.0's GLM kernels, lanes
+ ABI and host package; EXL3 through main's shared operators
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Port of the previous commit onto v1.2.0:
+- main's ling host package wins (config, names, synth and their tests); the family reads Config.groups() and
+  layerLimits() from it.
+- Ling's kernels are new tf_ling_* entries of GLM's glue image, templated off GLM's device code so every
+  tf_glm_* entry instantiates the old parameters: absorb_q/expand_v at 128-wide heads, GPT-J rope over the
+  64 roped columns, the chunked attention 576 wide (16-head blocks), group-limited top-k (8 groups keep 4).
+  Their launches sit in ling/ops.zig; GLM's API gains only cuda_latent.merge as pub.
+- experts.zig keeps v1.2.0's layout; Layer.after selects the FP8 experts' EPI 4 instances (Ling's clamp
+  order). NVFP4 has no such instance on main: a clamped NVFP4 layer is refused.
+- lanes backend: prefill_step's row cap (new ABI) taken and ignored; the fake driver answers the VMM attributes.
+- tests/cuda: Ling's commands in ling_cmds.zig, wired from main.zig; checks of GLM's old fatbin bytes dropped
+  (main's GLM kernels are unchanged, proved by SASS identity instead).
+EXL3 (exllamav3 packs): config admits quant_method exl3 (mul1, mcg, 3inst codebooks); every quantized
+linear is main's exl3.Weight on qlinear's exl3 arm (cuda.exl3.Dense), the fused qkv_proj as three column
+views, kv_a_proj_with_mqa at its stored 640 columns (read past the padding); routed experts as main's
+exl3_experts.Layer through exl3_grouped; unquantized fp16 tensors rounded to bf16. Clamped EXL3 expert
+layers are refused until the shared EXL3 epilogue has Ling's clamp order.
+ling-exl3-layers: real layers on exllamav3's inputs, prompt and decode, outputs saved for the parity script.
+
+Co-authored-by: Jürgen Schmied <600316+jschmied@users.noreply.github.com>
+---
+ zig/build/cuda.zig                     |   5 +
+ zig/build/cuda_engines.zig             |  11 +-
+ zig/build/cuda_kernels.zig             |   1 +
+ zig/kernels/cuda/experts.cuh           |  14 ++
+ zig/kernels/cuda/glm_glue_attn.cuh     |  55 +++---
+ zig/kernels/cuda/glm_glue_latent.cuh   |  70 +++++--
+ zig/kernels/cuda/glm_glue_moe.cuh      | 176 ++++++++++++++----
+ zig/src/cuda/experts.zig               |  23 ++-
+ zig/src/cuda/kernels.zig               |   1 +
+ zig/src/families/glm/cuda_latent.zig   |   3 +-
+ zig/src/families/ling/block_ffn.zig    |   4 +-
+ zig/src/families/ling/block_mla.zig    |  18 +-
+ zig/src/families/ling/config.zig       |  19 +-
+ zig/src/families/ling/config_test.zig  |  12 +-
+ zig/src/families/ling/cuda.zig         |  44 +----
+ zig/src/families/ling/fake_driver.zig  |   1 +
+ zig/src/families/ling/forward.zig      |  10 +
+ zig/src/families/ling/graph.zig        |  35 +++-
+ zig/src/families/ling/lanes.zig        |   3 +-
+ zig/src/families/ling/names.zig        |   1 +
+ zig/src/families/ling/ops.zig          | 128 +++++++++++++
+ zig/src/families/ling/state.zig        |   6 +-
+ zig/src/families/ling/synth.zig        |   2 +
+ zig/src/families/ling/weights.zig      |  38 +++-
+ zig/src/families/ling/weights_proj.zig | 146 ++++++++++++++-
+ zig/src/native/cuda.zig                |   3 +-
+ zig/tests/cuda/ling_ckpt.zig           |   2 +
+ zig/tests/cuda/ling_clamp.zig          | 115 +-----------
+ zig/tests/cuda/ling_cmds.zig           |  53 ++++++
+ zig/tests/cuda/ling_exl3_layers.zig    | 132 ++++++++++++++
+ zig/tests/cuda/ling_ref_mla.zig        |  51 +++---
+ zig/tests/cuda/ling_route.zig          | 241 +++++++++++++++++++++++++
+ zig/tests/cuda/ling_synth.zig          |   1 +
+ zig/tests/cuda/ling_weights_tests.zig  |   2 +
+ zig/tests/cuda/main.zig                |   3 +-
+ 35 files changed, 1145 insertions(+), 284 deletions(-)
+ create mode 100644 zig/src/families/ling/ops.zig
+ create mode 100644 zig/tests/cuda/ling_cmds.zig
+ create mode 100644 zig/tests/cuda/ling_exl3_layers.zig
+ create mode 100644 zig/tests/cuda/ling_route.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 56dfa42c4..136082087 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -106,6 +106,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     const glm_cuda = glmCuda(b, target, optimize, cuda, mods.core, mods.lanes, mods.heat, mods.api);
+     runner.addImport("glm_cuda", glm_cuda);
+     @import("minimax_cuda.zig").targets(b, target, optimize, strip, cuda, mods.core, mods.lanes, runner);
++    runner.addImport("ling_cuda", engines_build.lingCuda(b, target, optimize, cuda, mods.core, mods.lanes, glm_cuda));
+     for ([_]struct { []const u8, *std.Build.Module }{ .{ "kolibri1", kolibri1Module(b, target, optimize, cuda, mods.core, mods.lanes) }, .{ "dory", @import("dory.zig").module(b, target, optimize, cuda, mods.core, mods.lanes) } }) |m| runner.addImport(m[0], m[1]);
+     runner.addImport("gemma4_cuda", @import("gemma4_cuda.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
+     runner.addImport("spark25", @import("spark25.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
+@@ -485,6 +486,10 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     b.step("test-glm-grants-host", "GLM CUDA head-cost policy without a GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"shared head costs:"} })).step);
+     skip_drafts.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"zero grant:"} })).step);
+     @import("glm_family_host.zig").steps(b, cuda, glm, mods, step);
++    // Ling-3.1-flash's CUDA family on the host: its loader, layer graph, engine and lane backend compile; routing as the kernels take it
++    const ling_run = b.addRunArtifact(b.addTest(.{ .root_module = engines_build.lingCuda(b, host, .debug, cuda, mods.core, mods.lanes, glm) }));
++    step.dependOn(&ling_run.step);
++    b.step("test-ling", "Ling-3.1-flash's CUDA family on the host: loader, graph, engine and lanes compile, no GPU work").dependOn(&ling_run.step);
+     @import("kolibri.zig").host(b, kolibri1Module(b, host, .debug, cuda, mods.core, mods.lanes), native_modules.api, step);
+     const gemma = @import("gemma4_cuda.zig").module(b, host, .debug, cuda, mods.core, mods.lanes);
+     b.step("test-gemma-grants-host", "Gemma assistant and DFlash head-cost grants without a GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gemma, .filters = &.{"shared head costs:"} })).step);
+diff --git a/zig/build/cuda_engines.zig b/zig/build/cuda_engines.zig
+index b8886f360..0332c1401 100644
+--- a/zig/build/cuda_engines.zig
++++ b/zig/build/cuda_engines.zig
+@@ -15,6 +15,13 @@ pub fn glmCuda(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     return m;
+ }
+ 
++/// The Ling-3.1-flash CUDA family over the runtime, the core, the lane core and the GLM kernels it reuses.
++pub fn lingCuda(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, glm: *std.Build.Module) *std.Build.Module {
++    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/ling/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    for ([_]struct { []const u8, *std.Build.Module }{ .{ "glm_cuda", glm }, .{ "cuda", cuda }, .{ "core", core }, .{ "lanes", lanes } }) |x| m.addImport(x[0], x[1]);
++    return m;
++}
++
+ /// LFM2 (d1's decision model) on CUDA: config, weights, kernels and the forward that scores labels.
+ pub fn lfm2Module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module) *std.Build.Module {
+     return b.createModule(.{ .root_source_file = b.path("zig/src/families/lfm2/lfm2.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core } } });
+@@ -35,6 +42,7 @@ pub fn flashnextModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize
+ /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
+ pub fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, heat: *std.Build.Module, qwen35: *std.Build.Module, qwen_vision: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
+     const api = qwen35.import_table.get("engine_api").?; // family()'s, so the server and qwen3_5 share one
++    const glm = glmCuda(b, target, optimize, cuda, core, lanes, heat, api);
+     const mod = b.createModule(.{
+         .root_source_file = b.path("zig/src/native/cuda.zig"),
+         .target = target,
+@@ -49,8 +57,9 @@ pub fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+             .{ .name = "lfm2", .module = lfm2Module(b, target, optimize, cuda, core) },
+             .{ .name = "core", .module = core },
+             .{ .name = "flashnext", .module = flashnextModule(b, target, optimize, cuda, core, lanes, qwen_vision, api) },
+-            .{ .name = "glm_cuda", .module = glmCuda(b, target, optimize, cuda, core, lanes, heat, api) },
++            .{ .name = "glm_cuda", .module = glm },
+             .{ .name = "minimax_m3_cuda", .module = @import("minimax_cuda.zig").module(b, target, optimize, cuda, core, lanes) },
++            .{ .name = "ling_cuda", .module = lingCuda(b, target, optimize, cuda, core, lanes, glm) },
+             .{ .name = "qwen35", .module = qwen35 },
+             .{ .name = "kolibri1", .module = @import("kolibri.zig").module(b, target, optimize, cuda, core, lanes) },
+             .{ .name = "gemma4_cuda", .module = @import("gemma4_cuda.zig").module(b, target, optimize, cuda, core, lanes) },
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index c0d496d61..43622f331 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -126,6 +126,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "modelopt_pack", .flags = &.{"-O3"} }, // ours: ModelOpt tensors into the lane, prompt and expert layouts
+     .{ .name = "glm_kda", .flags = &.{ "-O3", "--fmad=false" } }, // GLM: the Python family's glm5_next/cuda/kda.cu
+     .{ .name = "glm_glue", .flags = &.{"-O3"} }, // ours: the Python family's Triton glue by hand, its PTX op for op
++    .{ .name = "ling_glue", .flags = glue }, // ours: Ling-3.1's bf16 glue at the HF model's rounding points
+     .{ .name = "glm_ops", .flags = &.{"-O3"} }, // ours: GLM's integer work the Python family did in torch (the DSA token lists)
+     .{ .name = "glm_index", .flags = &.{"-O3"} }, // a prompt chunk's DSA scores and top-512 pools
+     .{ .name = "minimax_m3", .flags = glue }, // ours: MiniMax-M3.1-Flash's glue (norms, RoPE prep, routing, DSpark, tower RoPE)
+diff --git a/zig/kernels/cuda/experts.cuh b/zig/kernels/cuda/experts.cuh
+index 6984dec72..db79892bc 100644
+--- a/zig/kernels/cuda/experts.cuh
++++ b/zig/kernels/cuda/experts.cuh
+@@ -53,6 +53,17 @@ __device__ __forceinline__ float swiglu(float g, float u, float limit) {
+   return bf(gv / (1.f + expf(-gv))) * uv;
+ }
+ 
++// Ling's order (EPI 4): the limit on silu's output, min(silu(g), L) * clip(u, -L, L).
++__device__ __forceinline__ float swiglu_after(float g, float u, float limit) {
++  const float gv = bf(g);
++  float uv = bf(u), s = bf(gv / (1.f + expf(-gv)));
++  if (limit > 0.f) {
++    s = fminf(s, limit);
++    uv = fminf(fmaxf(uv, -limit), limit);
++  }
++  return s * uv;
++}
++
+ // a < 0 ? 0 : a, not fmaxf, which would make a NaN sum 0.
+ __device__ __forceinline__ float relu2(float a) {
+   const float b = bf(a), u = b < 0.f ? 0.f : b;
+@@ -80,6 +91,9 @@ __device__ __forceinline__ void epilogue(const float (&acc)[M][RT][NTW][4], int
+         } else if constexpr (EPI == 2) {
+           o0 = swiglu(a0, acc[M - 1][r][j][2 * h], limit);
+           o1 = swiglu(a1, acc[M - 1][r][j][2 * h + 1], limit);
++        } else if constexpr (EPI == 4) {
++          o0 = swiglu_after(a0, acc[M - 1][r][j][2 * h], limit);
++          o1 = swiglu_after(a1, acc[M - 1][r][j][2 * h + 1], limit);
+         } else {
+           o0 = a0;
+           o1 = a1;
+diff --git a/zig/kernels/cuda/glm_glue_attn.cuh b/zig/kernels/cuda/glm_glue_attn.cuh
+index 1a4363b15..8b1e5c061 100644
+--- a/zig/kernels/cuda/glm_glue_attn.cuh
++++ b/zig/kernels/cuda/glm_glue_attn.cuh
+@@ -31,26 +31,29 @@ __device__ __forceinline__ void ldm4(uint32_t* r, const void* p) {
+   else qmm_frag::ldmatrix4(r, a);
+ }
+ 
+-// A 512-wide bf16 row's 16-byte unit u in shared memory, swizzled by the row so ldmatrix's eight rows hit eight banks.
+-__device__ __forceinline__ int wide(int row, int u) { return row * LW + ((u ^ (row & 7)) << 3); }
++// A KW-wide bf16 row's 16-byte unit u in shared memory, swizzled by the row so ldmatrix's eight rows hit eight banks.
++template <int KW = LW>
++__device__ __forceinline__ int wide(int row, int u) { return row * KW + ((u ^ (row & 7)) << 3); }
+ // p's [32][32] rows (64 bytes): unit u of row r.
+ __device__ __forceinline__ int narrow(int row, int u) { return row * KT + ((u ^ ((row >> 1) & 3)) << 3); }
+ 
+ // latent._dense_chunks/_sparse_chunks (sparse 0/1), block (row, HB heads, chunk), 8 warps: online softmax by 32 keys.
+-template <int HB>
++template <int HB, int RW = 0>
+ constexpr int wide_smem() {
+-  return (HB * LW + 2 * KT * LW + HB * KT) * 2 + (HB * 4 + 2 * HB) * 4;
++  return (HB * (LW + RW) + 2 * KT * (LW + RW) + HB * KT) * 2 + (HB * 4 + 2 * HB) * 4;
+ }
+ 
+-template <int HB, bool FP8 = false>
++// RW roped columns (Ling's 64) follow the latent in q and keys: scores over LW + RW, values from the latent alone.
++template <int HB, bool FP8 = false, int RW = 0>
+ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
+                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
+                             float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr) {
+-  constexpr int MT = HB / 16;
++  static_assert(!(FP8 && RW != 0), "the E4M3 cache holds the latent alone");
++  constexpr int MT = HB / 16, KW = LW + RW;
+   extern __shared__ __align__(16) unsigned char smem[];
+   __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(smem);
+-  __nv_bfloat16* kvs = qs + HB * LW;
+-  __nv_bfloat16* ps = kvs + 2 * KT * LW;
++  __nv_bfloat16* kvs = qs + HB * KW;
++  __nv_bfloat16* ps = kvs + 2 * KT * KW;
+   float* red = reinterpret_cast<float*>(ps + HB * KT);
+   float* stat = red + HB * 4;
+   const int t = threadIdx.x, lane = t & 31, warp = t >> 5, g = lane >> 2, q = lane & 3;
+@@ -59,12 +62,12 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+   const int64_t n = sparse ? cnt[r] : 0, limit = sparse ? 0 : (int64_t)pos[0] + r, start = c * CH;
+   const bool live = sparse ? start < n : start <= limit;
+   // a dense chunk's 512 keys are one page, its rows from that page's; a sparse key's row comes as the token list has it
+-  const __nv_bfloat16* keys_at = !FP8 && pt && !sparse && live ? lc + ((int64_t)pt[c] * (pstep / 2) - start * LW) : lc;
++  const __nv_bfloat16* keys_at = !FP8 && pt && !sparse && live ? lc + ((int64_t)pt[c] * (pstep / 2) - start * KW) : lc;
+   auto load_kv = [&](int tile) {
+-    __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
++    __nv_bfloat16* dst = kvs + (tile & 1) * KT * KW;
+     const int64_t first = start + tile * KT;
+-    for (int idx = t; idx < KT * (LW / 8); idx += blockDim.x) {
+-      const int key = idx / (LW / 8), u = idx % (LW / 8);
++    for (int idx = t; idx < KT * (KW / 8); idx += blockDim.x) {
++      const int key = idx / (KW / 8), u = idx % (KW / 8);
+       const int64_t ki = first + key;
+       const bool ok = sparse ? ki < n : ki <= limit;
+       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+@@ -80,7 +83,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+           dst[wide(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, row_scale));
+         }
+       } else {
+-        cp16(dst + wide(key, u), keys_at + src * LW + u * 8, ok);
++        cp16(dst + wide<KW>(key, u), keys_at + src * KW + u * 8, ok);
+       }
+     }
+   };
+@@ -92,10 +95,10 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+       for (int e = 0; e < 4; ++e) o[i][j][e] = 0.0f;
+   constexpr int tiles = CH / KT;
+   if (live) {
+-    for (int idx = t; idx < HB * (LW / 8); idx += blockDim.x) {
+-      const int hd = idx / (LW / 8), u = idx % (LW / 8);
++    for (int idx = t; idx < HB * (KW / 8); idx += blockDim.x) {
++      const int hd = idx / (KW / 8), u = idx % (KW / 8);
+       const bool ok = h0 + hd < heads;
+-      cp16(qs + wide(hd, u), qa + (r * heads + (ok ? h0 + hd : 0)) * LW + u * 8, ok);
++      cp16(qs + wide<KW>(hd, u), qa + (r * heads + (ok ? h0 + hd : 0)) * KW + u * 8, ok);
+     }
+     load_kv(0);
+     commit();
+@@ -112,17 +115,17 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+         wait<0>();
+     }
+     __syncthreads();
+-    const __nv_bfloat16* kv = kvs + (tile & 1) * KT * LW;
++    const __nv_bfloat16* kv = kvs + (tile & 1) * KT * KW;
+     const int64_t first = start + tile * KT;
+     float sc[4];
+     if (hh < MT) {
+       float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+ #pragma unroll 4
+-      for (int kk = 0; kk < LW; kk += 32) {
++      for (int kk = 0; kk < KW; kk += 32) {
+         uint32_t a0[4], a1[4], b[4];
+-        ldm4<false>(a0, qs + wide(hh * 16 + (lane & 15), (kk >> 3) + (lane >> 4)));
+-        ldm4<false>(a1, qs + wide(hh * 16 + (lane & 15), ((kk + 16) >> 3) + (lane >> 4)));
+-        ldm4<false>(b, kv + wide(kg * 8 + (lane & 7), (kk >> 3) + (lane >> 3)));
++        ldm4<false>(a0, qs + wide<KW>(hh * 16 + (lane & 15), (kk >> 3) + (lane >> 4)));
++        ldm4<false>(a1, qs + wide<KW>(hh * 16 + (lane & 15), ((kk + 16) >> 3) + (lane >> 4)));
++        ldm4<false>(b, kv + wide<KW>(kg * 8 + (lane & 7), (kk >> 3) + (lane >> 3)));
+         glm_router::mma16816(acc, a0, b);
+         glm_router::mma16816(acc, a1, b + 2);
+       }
+@@ -183,7 +186,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+ #pragma unroll
+       for (int j = 0; j < 8; j += 2) {
+         uint32_t b[4];
+-        ldm4<true>(b, kv + wide(k16 + (lane & 15), ((warp * 64 + j * 8) >> 3) + (lane >> 4)));
++        ldm4<true>(b, kv + wide<KW>(k16 + (lane & 15), ((warp * 64 + j * 8) >> 3) + (lane >> 4)));
+         for (int i = 0; i < MT; ++i) {
+           glm_router::mma16816(o[i][j], a[i], b);
+           glm_router::mma16816(o[i][j + 1], a[i], b + 2);
+@@ -226,6 +229,14 @@ extern "C" __global__ void __launch_bounds__(256)
+   glm_attn::chunks_wide<32>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, pt, pstep);
+ }
+ 
++// Ling's 16-head form: 576-wide q and keys (latent, then 64 roped columns), in wide_smem<16, 64>() bytes.
++extern "C" __global__ void __launch_bounds__(256)
++    tf_ling_chunks_r16(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok, const int* cnt,
++                       float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse,
++                       const int* pt, int64_t pstep) {
++  glm_attn::chunks_wide<16, false, 64>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, pt, pstep);
++}
++
+ // E4M3 cache variants reconstruct the existing BF16 shared tile before the unchanged attention math.
+ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_16_fp8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
+diff --git a/zig/kernels/cuda/glm_glue_latent.cuh b/zig/kernels/cuda/glm_glue_latent.cuh
+index 2abdd9610..ec2aadabe 100644
+--- a/zig/kernels/cuda/glm_glue_latent.cuh
++++ b/zig/kernels/cuda/glm_glue_latent.cuh
+@@ -6,23 +6,24 @@
+ using namespace glm_triton;
+ 
+ // latent._absorb_q(_rows), block (head, 32 latent columns, row block) of 128 threads; rows per block change no bits.
+-extern "C" __global__ void __launch_bounds__(128)
+-    tf_glm_absorb_q(const __nv_bfloat16* q, const __nv_bfloat16* wk, __nv_bfloat16* qa, int64_t rows, int64_t heads,
+-                    int64_t rb) {
+-  constexpr int D = 256, LW = 512;
++// q_nope D wide (GLM 256, Ling 128) in q rows qs apart per head, qa rows qaw apart (GLM's entry: D, 512).
++template <int D>
++__device__ __forceinline__ void absorb_q(const __nv_bfloat16* q, const __nv_bfloat16* wk, __nv_bfloat16* qa,
++                                         int64_t rows, int64_t heads, int64_t rb, int64_t qs, int64_t qaw) {
++  constexpr int LW = 512, R = D / 32;
+   __shared__ float smem[128];
+   const int t = threadIdx.x, k0 = t >> 2, nq = t & 3, warp = t >> 5;
+   const int64_t h = blockIdx.x, n0 = (int64_t)blockIdx.y * 32 + nq * 8, r0 = blockIdx.z * rb;
+-  float w[8][8];
+-  for (int rep = 0; rep < 8; ++rep)
++  float w[R][8];
++  for (int rep = 0; rep < R; ++rep)
+     for (int j = 0; j < 8; ++j) w[rep][j] = bf(wk[(h * D + k0 + 32 * rep) * LW + n0 + j]);
+   for (int64_t r = r0; r < r0 + rb && r < rows; ++r) {
+-    float qv[8];
+-    for (int rep = 0; rep < 8; ++rep) qv[rep] = bf(q[(r * heads + h) * D + k0 + 32 * rep]);
++    float qv[R];
++    for (int rep = 0; rep < R; ++rep) qv[rep] = bf(q[(r * heads + h) * qs + k0 + 32 * rep]);
+     for (int j = 0; j < 8; ++j) {
+       float a = fmul(w[1][j], qv[1]);
+       a = __fmaf_rn(w[0][j], qv[0], a);
+-      for (int rep = 2; rep < 8; ++rep) a = __fmaf_rn(w[rep][j], qv[rep], a);
++      for (int rep = 2; rep < R; ++rep) a = __fmaf_rn(w[rep][j], qv[rep], a);
+       for (int o = 16; o >= 4; o >>= 1) a = a + __shfl_xor_sync(0xffffffffu, a, o);
+       if ((t & 28) == 0) smem[(nq * 8 + j) * 4 + warp] = a;
+     }
+@@ -30,16 +31,22 @@ extern "C" __global__ void __launch_bounds__(128)
+     float v = smem[t];
+     v = v + __shfl_xor_sync(0xffffffffu, v, 2);
+     v = v + __shfl_xor_sync(0xffffffffu, v, 1);
+-    if ((t & 3) == 0) qa[(r * heads + h) * LW + (int64_t)blockIdx.y * 32 + t / 4] = __float2bfloat16_rn(v);
++    if ((t & 3) == 0) qa[(r * heads + h) * qaw + (int64_t)blockIdx.y * 32 + t / 4] = __float2bfloat16_rn(v);
+     __syncthreads();
+   }
+ }
+ 
+-// latent._expand_v(_rows), block (head, 16 outputs, row block) of 128 threads: o . wv by fma, lanes xor 16 .. 1.
+ extern "C" __global__ void __launch_bounds__(128)
+-    tf_glm_expand_v(const __nv_bfloat16* ol, const __nv_bfloat16* wv, __nv_bfloat16* out, int64_t rows,
+-                    int64_t heads, int64_t rb) {
+-  constexpr int DV = 256, LW = 512;
++    tf_glm_absorb_q(const __nv_bfloat16* q, const __nv_bfloat16* wk, __nv_bfloat16* qa, int64_t rows, int64_t heads,
++                    int64_t rb) {
++  absorb_q<256>(q, wk, qa, rows, heads, rb, 256, 512);
++}
++
++// latent._expand_v(_rows), block (head, 16 outputs, row block) of 128 threads: o . wv by fma, lanes xor 16 .. 1.
++template <int DV>  // v heads DV wide: GLM 256, Ling 128
++__device__ __forceinline__ void expand_v(const __nv_bfloat16* ol, const __nv_bfloat16* wv, __nv_bfloat16* out,
++                                         int64_t rows, int64_t heads, int64_t rb) {
++  constexpr int LW = 512;
+   __shared__ float smem[32];
+   const int t = threadIdx.x, lane = t & 31, warp = t >> 5, kb = (warp & 1) * 256 + lane * 8, nb = warp >> 1;
+   const int64_t h = blockIdx.x, n0 = (int64_t)blockIdx.y * 16, r0 = blockIdx.z * rb;
+@@ -66,6 +73,41 @@ extern "C" __global__ void __launch_bounds__(128)
+   }
+ }
+ 
++extern "C" __global__ void __launch_bounds__(128)
++    tf_glm_expand_v(const __nv_bfloat16* ol, const __nv_bfloat16* wv, __nv_bfloat16* out, int64_t rows,
++                    int64_t heads, int64_t rb) {
++  expand_v<256>(ol, wv, out, rows, heads, rb);
++}
++
++// Ling: q_nope the first 128 of each head's qs columns, qa rows qaw (576: the latent, then the roped q_rope).
++extern "C" __global__ void __launch_bounds__(128)
++    tf_ling_absorb_q_128(const __nv_bfloat16* q, const __nv_bfloat16* wk, __nv_bfloat16* qa, int64_t rows,
++                         int64_t heads, int64_t rb, int64_t qs, int64_t qaw) {
++  absorb_q<128>(q, wk, qa, rows, heads, rb, qs, qaw);
++}
++
++// Ling's 128-wide v heads.
++extern "C" __global__ void __launch_bounds__(128)
++    tf_ling_expand_v_128(const __nv_bfloat16* ol, const __nv_bfloat16* wv, __nv_bfloat16* out, int64_t rows,
++                         int64_t heads, int64_t rb) {
++  expand_v<128>(ol, wv, out, rows, heads, rb);
++}
++
++// Ling's rope (exl3's GPT-J pairs), block (row, head) of 32: x + r xs + h xh into out + r os + h oh, in place ok.
++extern "C" __global__ void __launch_bounds__(32)
++    tf_ling_rope(const __nv_bfloat16* x, int64_t xs, int64_t xh, __nv_bfloat16* out, int64_t os, int64_t oh,
++                 const int* pos, const float* inv_freq) {
++  const int64_t r = blockIdx.x, h = blockIdx.y;
++  const int i = threadIdx.x;  // pair i at angle fp32 inv_freq[i] (pos + r); explicit rn ops, no fma contraction
++  const __nv_bfloat16* src = x + r * xs + h * xh + 2 * i;
++  const float x0 = bf(src[0]), x1 = bf(src[1]);
++  float s, c;
++  sincosf(__fmul_rn(inv_freq[i], (float)((int64_t)pos[0] + r)), &s, &c);
++  __nv_bfloat16* dst = out + r * os + h * oh + 2 * i;
++  dst[0] = __float2bfloat16_rn(__fsub_rn(__fmul_rn(x0, c), __fmul_rn(x1, s)));
++  dst[1] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(x1, c), __fmul_rn(x0, s)));
++}
++
+ namespace glm_pages {
+ 
+ // Row r's first element in a cache of `width`-element rows: in order (pt null), or row r % P of page pt[r / P].
+diff --git a/zig/kernels/cuda/glm_glue_moe.cuh b/zig/kernels/cuda/glm_glue_moe.cuh
+index 7f2a27d6b..688ab5686 100644
+--- a/zig/kernels/cuda/glm_glue_moe.cuh
++++ b/zig/kernels/cuda/glm_glue_moe.cuh
+@@ -16,45 +16,140 @@ __device__ __forceinline__ float group64(const float* q) {
+   return g;
+ }
+ 
++// AFTER false: GLM's silu(min(g, L)); true: Ling's min(silu(g), L) (inclusionAI's SwigluStepAndMul). Both clip u.
++template <bool AFTER>
+ __device__ __forceinline__ float swiglu1(float g, float u, float limit) {
+-  g = fminf(g, limit);
++  if (!AFTER) g = fminf(g, limit);
+   u = fminf(fmaxf(u, 0.0f - limit), limit);
+-  const float s = rbf(div_full(g, exp_approx(0.0f - g) + 1.0f));
++  float s = rbf(div_full(g, exp_approx(0.0f - g) + 1.0f));
++  if (AFTER) s = fminf(s, limit);
+   return rbf(__fmul_rn(u, s));
+ }
+ 
++// Group-limited routing: -inf on every expert outside the `keep` groups of the best top-2 sums (ties to lower group).
++template <int MAXE>
++__device__ __forceinline__ void keep_groups(float* choice, int lane, int ne, int gs, int ng, int keep) {
++  float gscore = -INFINITY;  // lane g: group g's top-2 sum
++  const bool whole = gs % 32 == 0 && ne % 32 == 0;  // groups of whole i: one pass, no divisions (Ling's 64)
++  if (whole) {
++    const int per = gs / 32, ni = ne / 32;
++    float a = -INFINITY, b = -INFINITY;
++    int g = 0, left = per;
++#pragma unroll
++    for (int i = 0; i < MAXE; ++i) {
++      if (i >= ni) break;
++      const float c = choice[i];
++      if (c > a) {
++        b = a;
++        a = c;
++      } else if (c > b) {
++        b = c;
++      }
++      if (--left == 0) {
++        for (int o = 16; o > 0; o >>= 1) {
++          const float oa = __shfl_xor_sync(0xffffffffu, a, o), ob = __shfl_xor_sync(0xffffffffu, b, o);
++          b = fmaxf(fminf(a, oa), fmaxf(b, ob));
++          a = fmaxf(a, oa);
++        }
++        if (lane == g) gscore = a + b;
++        a = b = -INFINITY;
++        ++g;
++        left = per;
++      }
++    }
++  }
++  for (int g = 0; g < (whole ? 0 : ng); ++g) {
++    float a = -INFINITY, b = -INFINITY;  // this lane's best two in group g, a >= b
++    for (int i = 0; i < MAXE; ++i) {
++      const int e = i * 32 + lane;
++      if (e < ne && e / gs == g) {
++        const float c = choice[i];
++        if (c > a) {
++          b = a;
++          a = c;
++        } else if (c > b) {
++          b = c;
++        }
++      }
++    }
++    for (int o = 16; o > 0; o >>= 1) {
++      const float oa = __shfl_xor_sync(0xffffffffu, a, o), ob = __shfl_xor_sync(0xffffffffu, b, o);
++      b = fmaxf(fminf(a, oa), fmaxf(b, ob));
++      a = fmaxf(a, oa);
++    }
++    if (lane == g) gscore = a + b;
++  }
++  bool live = lane < ng;
++  unsigned kept = 0u;
++  for (int k = 0; k < keep; ++k) {
++    float mx = live ? gscore : -INFINITY;
++    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
++    const unsigned at = __ballot_sync(0xffffffffu, live && gscore == mx);
++    if (at == 0u) break;
++    const int id = __ffs(at) - 1;
++    kept |= 1u << id;
++    if (lane == id) live = false;
++  }
++  if (whole) {
++    const int per = gs / 32, ni = ne / 32;
++    int g = 0, left = per;
++#pragma unroll
++    for (int i = 0; i < MAXE; ++i) {
++      if (i >= ni) break;
++      if (!((kept >> g) & 1u)) choice[i] = -INFINITY;
++      if (--left == 0) {
++        ++g;
++        left = per;
++      }
++    }
++    return;
++  }
++  for (int i = 0; i < MAXE; ++i) {
++    const int e = i * 32 + lane;
++    if (e < ne && !((kept >> (e / gs)) & 1u)) choice[i] = -INFINITY;
++  }
++}
++
+ }  // namespace glm_moe
+ 
+ // glue._swiglu with BLOCK 512 (128 threads, 4 values each, 64-group sums over 16 lanes), column block blockIdx.y.
+-extern "C" __global__ void __launch_bounds__(128)
+-    tf_glm_swiglu_512(const __nv_bfloat16* gu, __nv_bfloat16* out, float* xs, float limit, int64_t w) {
+-  const int64_t r = blockIdx.x, d0 = blockIdx.y * 512 + threadIdx.x * 4;
+-  const uint2 gv = *reinterpret_cast<const uint2*>(gu + r * 2 * w + d0);
+-  const uint2 uv = *reinterpret_cast<const uint2*>(gu + r * 2 * w + w + d0);
+-  const __nv_bfloat16* gh = reinterpret_cast<const __nv_bfloat16*>(&gv);
+-  const __nv_bfloat16* uh = reinterpret_cast<const __nv_bfloat16*>(&uv);
+-  float a[4];
+-  uint2 ov;
+-  __nv_bfloat16* oh = reinterpret_cast<__nv_bfloat16*>(&ov);
+-  for (int j = 0; j < 4; ++j) {
+-    a[j] = glm_moe::swiglu1(bf(gh[j]), bf(uh[j]), limit);
+-    oh[j] = __float2bfloat16_rn(a[j]);
++#define TF_GLM_SWIGLU_512(NAME, AFTER)                                                                               \
++  extern "C" __global__ void __launch_bounds__(128)                                                                  \
++      NAME(const __nv_bfloat16* gu, __nv_bfloat16* out, float* xs, float limit, int64_t w) {                         \
++    const int64_t r = blockIdx.x, d0 = blockIdx.y * 512 + threadIdx.x * 4;                                           \
++    const uint2 gv = *reinterpret_cast<const uint2*>(gu + r * 2 * w + d0);                                           \
++    const uint2 uv = *reinterpret_cast<const uint2*>(gu + r * 2 * w + w + d0);                                       \
++    const __nv_bfloat16* gh = reinterpret_cast<const __nv_bfloat16*>(&gv);                                           \
++    const __nv_bfloat16* uh = reinterpret_cast<const __nv_bfloat16*>(&uv);                                           \
++    float a[4];                                                                                                      \
++    uint2 ov;                                                                                                        \
++    __nv_bfloat16* oh = reinterpret_cast<__nv_bfloat16*>(&ov);                                                       \
++    for (int j = 0; j < 4; ++j) {                                                                                    \
++      a[j] = glm_moe::swiglu1<AFTER>(bf(gh[j]), bf(uh[j]), limit);                                                   \
++      oh[j] = __float2bfloat16_rn(a[j]);                                                                             \
++    }                                                                                                                \
++    *reinterpret_cast<uint2*>(out + r * w + d0) = ov;                                                                \
++    const float g = glm_moe::group64<4>(a);                                                                          \
++    if ((threadIdx.x & 15) == 0) xs[r * (w / 64) + d0 / 64] = g;                                                     \
+   }
+-  *reinterpret_cast<uint2*>(out + r * w + d0) = ov;
+-  const float g = glm_moe::group64<4>(a);
+-  if ((threadIdx.x & 15) == 0) xs[r * (w / 64) + d0 / 64] = g;
+-}
+ 
+ // glue._swiglu with BLOCK 64 (the TP=3 shared expert's 704): one value a thread, the warp's butterfly, then 2 warps.
+-extern "C" __global__ void __launch_bounds__(64)
+-    tf_glm_swiglu_64(const __nv_bfloat16* gu, __nv_bfloat16* out, float* xs, float limit, int64_t w) {
+-  __shared__ float smem[2];
+-  const int64_t r = blockIdx.x, d = blockIdx.y * 64 + threadIdx.x;
+-  const float a = glm_moe::swiglu1(bf(gu[r * 2 * w + d]), bf(gu[r * 2 * w + w + d]), limit);
+-  out[r * w + d] = __float2bfloat16_rn(a);
+-  const float g = block_sum<2>(a, smem);
+-  if (threadIdx.x == 0) xs[r * (w / 64) + blockIdx.y] = g;
+-}
++#define TF_GLM_SWIGLU_64(NAME, AFTER)                                                                                \
++  extern "C" __global__ void __launch_bounds__(64)                                                                   \
++      NAME(const __nv_bfloat16* gu, __nv_bfloat16* out, float* xs, float limit, int64_t w) {                         \
++    __shared__ float smem[2];                                                                                        \
++    const int64_t r = blockIdx.x, d = blockIdx.y * 64 + threadIdx.x;                                                 \
++    const float a = glm_moe::swiglu1<AFTER>(bf(gu[r * 2 * w + d]), bf(gu[r * 2 * w + w + d]), limit);                \
++    out[r * w + d] = __float2bfloat16_rn(a);                                                                         \
++    const float g = block_sum<2>(a, smem);                                                                           \
++    if (threadIdx.x == 0) xs[r * (w / 64) + blockIdx.y] = g;                                                         \
++  }
++
++TF_GLM_SWIGLU_512(tf_glm_swiglu_512, false)
++TF_GLM_SWIGLU_64(tf_glm_swiglu_64, false)
++// Ling's order, the limit on silu's output: min(silu(g), L) * clip(u, -L, L).
++TF_GLM_SWIGLU_512(tf_ling_swiglu_512, true)
++TF_GLM_SWIGLU_64(tf_ling_swiglu_64, true)
+ 
+ // qmm._group_sums: row blockIdx.x's 64-input sums, 8 lanes a group of 8 consecutive inputs each, 16 groups a block.
+ extern "C" __global__ void __launch_bounds__(128)
+@@ -67,9 +162,11 @@ extern "C" __global__ void __launch_bounds__(128)
+ }
+ 
+ // glue._topk, a warp a row: top_k by sigmoid + bias (ties to lower id), normed if `norm`, x scale; then shared expert.
+-extern "C" __global__ void __launch_bounds__(32)
+-    tf_glm_topk(const float* logits, const float* bias, int* pick, float* wts, float scale, int ne, int top_k,
+-                int norm) {
++// GROUPS: only experts in the topk_group groups of the best top-2 sums (Ling's n_group 8, keep 4) compete.
++namespace glm_moe {
++template <bool GROUPS>
++__device__ __forceinline__ void topk_rows(const float* logits, const float* bias, int* pick, float* wts, float scale,
++                                          int ne, int top_k, int norm, int n_group, int topk_group) {
+   constexpr int MAXE = 16;  // 512 experts a row
+   const int64_t r = blockIdx.x;
+   const int lane = threadIdx.x;
+@@ -79,6 +176,9 @@ extern "C" __global__ void __launch_bounds__(32)
+     score[i] = e < ne ? div_full(1.0f, exp_approx(0.0f - logits[r * ne + e]) + 1.0f) : 0.0f;
+     choice[i] = e < ne ? score[i] + bias[e] : -INFINITY;
+   }
++  if constexpr (GROUPS) {
++    if (n_group > 1) keep_groups<MAXE>(choice, lane, ne, ne / n_group, n_group, topk_group);
++  }
+   float total = 0.0f, mine = 0.0f;
+   int mine_id = 0;
+   for (int k = 0; k < top_k; ++k) {
+@@ -111,3 +211,17 @@ extern "C" __global__ void __launch_bounds__(32)
+     wts[r * (top_k + 1) + lane] = 1.0f;
+   }
+ }
++}  // namespace glm_moe
++
++extern "C" __global__ void __launch_bounds__(32)
++    tf_glm_topk(const float* logits, const float* bias, int* pick, float* wts, float scale, int ne, int top_k,
++                int norm) {
++  glm_moe::topk_rows<false>(logits, bias, pick, wts, scale, ne, top_k, norm, 1, 1);
++}
++
++// Ling's group-limited glue._topk: n_group groups by their top-2 sums, the best topk_group kept (lower group on ties).
++extern "C" __global__ void __launch_bounds__(32)
++    tf_ling_topk(const float* logits, const float* bias, int* pick, float* wts, float scale, int ne, int top_k,
++                 int norm, int n_group, int topk_group) {
++  glm_moe::topk_rows<true>(logits, bias, pick, wts, scale, ne, top_k, norm, n_group, topk_group);
++}
+diff --git a/zig/src/cuda/experts.zig b/zig/src/cuda/experts.zig
+index 0fe49c1db..d2824a738 100644
+--- a/zig/src/cuda/experts.zig
++++ b/zig/src/cuda/experts.zig
+@@ -30,6 +30,7 @@ pub const Layer = struct {
+     experts: usize,
+     limit: f32 = 0.0, // fp8g, nvfp4: the SwiGLU clamp, 0 for none
+     relu2: bool = false, // nvfp4: up is one projection under relu^2 (Nemotron), not SwiGLU's gate and up; iq2xxs: always
++    after: bool = false, // fp8g: clamp silu's output (Ling: min(silu(g), L)), not its input (silu(min(g, L)))
+     swiglu: bool = false, // affine4: up is gate and up interleaved per group ([E][NI/32][D/64][2][288]) under SwiGLU
+     shared: i32 = -1, // affine3: the expert whose tables are 4-bit (a SwiGLU pair at shared_up, down at shared_down)
+     shared_up: u64 = 0,
+@@ -58,7 +59,7 @@ pub const Grouped = struct {
+             .affine4 => {
+                 const a = g.affine4 orelse return error.FormatNotLoaded;
+                 if (epi == .down_bf16) return error.EpilogueNotBuilt;
+-                if (skip >= 0 or l.limit != 0) return error.OptionNotBuilt;
++                if (skip >= 0 or l.limit != 0 or l.after) return error.OptionNotBuilt;
+                 const up = epi == .up;
+                 const nb = (if (up) l.width else l.dims) / 32;
+                 const w = Affine4Experts.view(l, up);
+@@ -83,7 +84,7 @@ pub const Grouped = struct {
+             .affine4 => {
+                 const a = g.affine4 orelse return error.FormatNotLoaded;
+                 if (epi == .down_f32) return error.EpilogueNotBuilt;
+-                if (skip >= 0 or l.limit != 0) return error.OptionNotBuilt;
++                if (skip >= 0 or l.limit != 0 or l.after) return error.OptionNotBuilt;
+                 const up = epi == .up;
+                 const nb = (if (up) l.width else l.dims) / 32;
+                 const w = Affine4Experts.view(l, up);
+@@ -243,6 +244,8 @@ pub const Fp8Experts = struct {
+     mod: Module,
+     fns: [2][3]Function, // decode, prompt; by Epi
+     resident: [2][3]usize, // blocks the grid may hold: per SM times SMs
++    after: [2]Function, // decode, prompt: gate-up in Ling's clamp order (Layer.after)
++    after_resident: [2]usize,
+ 
+     pub const cols = 32; // output columns a warp
+     pub const block = 128; // the checkpoint's scale block, both ways
+@@ -254,18 +257,24 @@ pub const Fp8Experts = struct {
+         pub const p_gate_up = "_ZN14tf_fp8_experts24fp8_expert_prompt_kernelILi2ELi2ELi2ELi2EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
+         pub const p_down_f32 = "_ZN14tf_fp8_experts24fp8_expert_prompt_kernelILi1ELi0ELi4ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
+         pub const p_down_bf16 = "_ZN14tf_fp8_experts24fp8_expert_prompt_kernelILi1ELi3ELi4ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
++        pub const gate_up_after = "_ZN14tf_fp8_experts17fp8_expert_kernelILi2ELi4ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
++        pub const p_gate_up_after = "_ZN14tf_fp8_experts24fp8_expert_prompt_kernelILi2ELi4ELi2ELi2EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
+     };
+ 
+     pub fn load(d: *const Driver, sms: usize) !Fp8Experts {
+         if (!kernels.available) return error.BuiltWithoutKernels;
+         var mod = try Module.load(d, kernels.fp8_experts);
+         errdefer mod.unload();
+-        var e: Fp8Experts = .{ .mod = mod, .fns = undefined, .resident = undefined };
++        var e: Fp8Experts = .{ .mod = mod, .fns = undefined, .resident = undefined, .after = undefined, .after_resident = undefined };
+         const names = [2][3][:0]const u8{ .{ symbols.gate_up, symbols.down_f32, symbols.down_bf16 }, .{ symbols.p_gate_up, symbols.p_down_f32, symbols.p_down_bf16 } };
+         for (names, 0..) |set, i| for (set, 0..) |name, j| {
+             e.fns[i][j] = try mod.function(name);
+             e.resident[i][j] = @max(1, try e.fns[i][j].occupancy(128, 0)) * sms;
+         };
++        for ([2][:0]const u8{ symbols.gate_up_after, symbols.p_gate_up_after }, 0..) |name, i| {
++            e.after[i] = try mod.function(name);
++            e.after_resident[i] = @max(1, try e.after[i].occupancy(128, 0)) * sms;
++        }
+         return e;
+     }
+ 
+@@ -281,10 +290,12 @@ pub const Fp8Experts = struct {
+         const n = if (gate) l.width else l.dims;
+         const pi: usize = @intFromBool(prompt);
+         const ei: usize = @backingInt(epi);
++        const after = gate and l.after;
++        const resident = if (after) e.after_resident[pi] else e.resident[pi][ei];
+         const grid: usize = if (prompt) blk: {
+             const cw: usize = if (gate) 2 else 4;
+-            break :blk @min(items * (nb / cw), e.resident[pi][ei]);
+-        } else @min((items * nb + 3) / 4, e.resident[pi][ei]);
++            break :blk @min(items * (nb / cw), resident);
++        } else @min((items * nb + 3) / 4, resident);
+         if (grid < 1) return;
+         var a: launch_.Args = .{};
+         a.add(in.x);
+@@ -298,7 +309,7 @@ pub const Fp8Experts = struct {
+         a.add(@as(i32, @intCast(n)));
+         a.add(if (gate) l.limit else @as(f32, 0.0));
+         a.add(skip);
+-        try launch_.launch(e.fns[pi][ei], .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &a);
++        try launch_.launch(if (after) e.after[pi] else e.fns[pi][ei], .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &a);
+     }
+ 
+     /// e4m3 [n, k] of one expert as int32 [n/32][k/32][32][2][4]: lane (gq, t)'s half h, tile j (fp8/experts.py pack).
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index ea33d031a..af5118cc0 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -71,6 +71,7 @@ pub const dense_rows: []const u8 = if (available) &Blob("fatbin_dense_rows").byt
+ pub const modelopt_pack: []const u8 = if (available) &Blob("fatbin_modelopt_pack").bytes else &.{};
+ pub const glm_glue: []const u8 = if (available) &Blob("fatbin_glm_glue").bytes else &.{};
+ pub const glm_ops: []const u8 = if (available) &Blob("fatbin_glm_ops").bytes else &.{};
++pub const ling_glue: []const u8 = if (available) &Blob("fatbin_ling_glue").bytes else &.{};
+ pub const glm_index: []const u8 = if (available) &Blob("fatbin_glm_index").bytes else &.{};
+ pub const minimax_m3: []const u8 = if (available) &Blob("fatbin_minimax_m3").bytes else &.{};
+ pub const minimax_m3_attn: []const u8 = if (available) &Blob("fatbin_minimax_m3_attn").bytes else &.{};
+diff --git a/zig/src/families/glm/cuda_latent.zig b/zig/src/families/glm/cuda_latent.zig
+index 8cc7b2eeb..8bb18ed9a 100644
+--- a/zig/src/families/glm/cuda_latent.zig
++++ b/zig/src/families/glm/cuda_latent.zig
+@@ -119,7 +119,8 @@ pub fn sparseAttentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache:
+     try merge(set, stream, p, out, counts, rows, heads, lw, nch, true);
+ }
+ 
+-fn merge(set: glue.Set, stream: cuda.Stream, p: Partials, out: u64, counts: u64, rows: usize, heads: usize, lw: usize, nch: usize, sparse: bool) !void {
++/// latent._merge: the chunks' partials merged in order (also after Ling's roped chunk kernel).
++pub fn merge(set: glue.Set, stream: cuda.Stream, p: Partials, out: u64, counts: u64, rows: usize, heads: usize, lw: usize, nch: usize, sparse: bool) !void {
+     if (lw != 512) return error.LatentShape;
+     var a: cuda.Args = .{};
+     inline for (.{ p.po, p.pm, p.pl, out, counts, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(c_int, @intCast(nch)), @as(c_int, @intFromBool(sparse)) }) |v| a.add(v);
+diff --git a/zig/src/families/ling/block_ffn.zig b/zig/src/families/ling/block_ffn.zig
+index d20010e7e..bb5388a6c 100644
+--- a/zig/src/families/ling/block_ffn.zig
++++ b/zig/src/families/ling/block_ffn.zig
+@@ -20,7 +20,7 @@ pub fn mlp(o: Ops, b: *const state.Buffers, m: weights.Mlp, x: u64, ldx: usize,
+         try o.mmCols(m.gate, x, ldx, rows, b.tmp, b.gu, 2 * w, 0);
+         try o.mmCols(m.up, x, ldx, rows, b.tmp, b.gu, 2 * w, w);
+     }
+-    try glue.swigluWith(o.m.swiglu, o.s, b.gu, b.act, b.xs, limit, rows, w);
++    try graph.ops.swiglu(&o.m.ling, o.s, b.gu, b.act, b.xs, limit, rows, w);
+     try o.mm(m.down, b.act, w, rows, out);
+ }
+ 
+@@ -34,7 +34,7 @@ pub fn moe(o: Ops, b: *const state.Buffers, e: weights.Moe, g: *const graph.Grap
+     const slots = top + 1;
+     const lim = ling.limits(c, layer);
+     try glue.router(o.set(), o.s, b.normed, D, e.router, b.mlog, b.rpart, rows, D, E);
+-    try glue.select(o.set(), o.s, b.mlog, if (e.bias != 0) e.bias else g.zero_bias, b.pick, b.wts, rows, top, E, c.routed_scale, c.norm_topk, ling.groups(c));
++    try graph.ops.select(&o.m.ling, o.s, b.mlog, if (e.bias != 0) e.bias else g.zero_bias, b.pick, b.wts, rows, top, E, c.routed_scale, c.norm_topk, c.groups());
+     if (picks) |p| try o.copy(b.pick, slots * 4, p, slots * 4, rows, slots * 4);
+     switch (e.routed) {
+         .grouped => |l| try grouped(o, b, l, rows, slots, E),
+diff --git a/zig/src/families/ling/block_mla.zig b/zig/src/families/ling/block_mla.zig
+index 02a5e5beb..dc5fd1f21 100644
+--- a/zig/src/families/ling/block_mla.zig
++++ b/zig/src/families/ling/block_mla.zig
+@@ -7,6 +7,7 @@ const block_kda = @import("block_kda.zig");
+ 
+ const glue = graph.glue;
+ const latent = graph.latent;
++const ops = graph.ops;
+ const Ops = graph.Ops;
+ const Config = @import("config.zig").Config;
+ const kw = state.cache_width;
+@@ -25,25 +26,26 @@ pub fn block(o: Ops, b: *const state.Buffers, a: weights.Mla, ab: graph.Absorb,
+     const qk: usize = c.qkDim();
+     const nope: usize = c.nope;
+     const dv: usize = c.v_dim;
+-    if (c.kv_lora != lw or nope != 128 or dv != 128 or c.rope_dim != latent.rope_width) return error.LatentShape;
++    if (c.kv_lora != lw or nope != 128 or dv != 128 or c.rope_dim != ops.rope_width) return error.LatentShape;
+     if (a.q_a) |qa| {
+         const ql: usize = c.q_lora;
+         try o.mm(qa, b.normed, D, rows, b.qa_in);
+         try glue.rmsnorm(o.set(), o.s, b.qa_in, ql, a.q_a_norm, b.qr, ql, null, c.eps, rows, ql);
+         try o.mm(a.q_b.?, b.qr, ql, rows, b.q);
+     } else try o.mm(a.q.?, b.normed, D, rows, b.q);
++    const kvs = a.kv_a.outputs(); // kv_a's rows: 576, or an EXL3 pack's 640 (its padding read past)
+     try o.mm(a.kv_a, b.normed, D, rows, b.kv);
+-    try glue.rmsnorm(o.set(), o.s, b.kv, kw, a.kv_a_norm, b.lat, kw, null, c.eps, rows, lw);
++    try glue.rmsnorm(o.set(), o.s, b.kv, kvs, a.kv_a_norm, b.lat, kw, null, c.eps, rows, lw);
+     if (a.gate) |gp| try o.mm(gp, b.normed, D, rows, b.g);
+-    try latent.absorbQStrided(o.set(), o.s, b.q, qk, ab.wk, b.qa, kw, rows, H, nope, lw);
++    try ops.absorbQ(&o.m.ling, o.s, b.q, qk, ab.wk, b.qa, kw, rows, H, nope, lw);
+     const scale = c.smScale();
+     for (segs) |sg| try room(b, sg.st, sg.rows); // every segment before the first cache write
+     for (segs) |sg| {
+         const st = sg.st;
+         const r = sg.row0;
+-        try latent.rope(o.set(), o.s, .{ .x = b.q + (r * H * qk + nope) * 2, .x_row = H * qk, .x_head = qk, .out = b.qa + (r * H * kw + lw) * 2, .o_row = H * kw, .o_head = kw }, sg.rows, H, st.pos_dev, g.freq);
+-        try latent.rope(o.set(), o.s, .{ .x = b.kv + (r * kw + lw) * 2, .x_row = kw, .x_head = 0, .out = b.lat + (r * kw + lw) * 2, .o_row = kw, .o_head = 0 }, sg.rows, 1, st.pos_dev, g.freq);
+-        try latent.latentWrite(o.set(), o.s, b.lat + r * kw * 2, kw, st.cacheAt(mi), st.pos_dev, sg.rows, kw);
++        try ops.rope(&o.m.ling, o.s, .{ .x = b.q + (r * H * qk + nope) * 2, .x_row = H * qk, .x_head = qk, .out = b.qa + (r * H * kw + lw) * 2, .o_row = H * kw, .o_head = kw }, sg.rows, H, st.pos_dev, g.freq);
++        try ops.rope(&o.m.ling, o.s, .{ .x = b.kv + (r * kvs + lw) * 2, .x_row = kvs, .x_head = 0, .out = b.lat + (r * kw + lw) * 2, .o_row = kw, .o_head = 0 }, sg.rows, 1, st.pos_dev, g.freq);
++        try latent.latentWrite(o.set(), o.s, b.lat + r * kw * 2, kw, st.cacheAt(mi), .{}, st.pos_dev, sg.rows, kw);
+         var r0: usize = 0;
+         while (r0 < sg.rows) : (r0 += state.att_rows) {
+             const m = @min(state.att_rows, sg.rows - r0);
+@@ -54,10 +56,10 @@ pub fn block(o: Ops, b: *const state.Buffers, a: weights.Mla, ab: graph.Absorb,
+             }
+             const nch = latent.chunksFor(st.pos + r0 + m);
+             const row = r + r0;
+-            try latent.attentionRoped(o.set(), o.s, b.qa + row * H * kw * 2, st.cacheAt(mi), at, b.partials, b.ol + row * H * lw * 2, b.dummy, m, H, lw, nch, scale);
++            try ops.attention(&o.m.ling, o.set(), o.s, b.qa + row * H * kw * 2, st.cacheAt(mi), at, b.partials, b.ol + row * H * lw * 2, b.dummy, m, H, lw, nch, scale);
+         }
+     }
+-    try latent.expandV(o.set(), o.s, b.ol, ab.wv, b.vn, rows, H, dv, lw);
++    try ops.expandV(&o.m.ling, o.s, b.ol, ab.wv, b.vn, rows, H, dv, lw);
+     if (a.gate != null) try o.gate(b.vn, b.g, H, rows, H, dv);
+     try o.mm(a.o, b.vn, H * dv, rows, b.y);
+ }
+diff --git a/zig/src/families/ling/config.zig b/zig/src/families/ling/config.zig
+index a5d550262..365adb664 100644
+--- a/zig/src/families/ling/config.zig
++++ b/zig/src/families/ling/config.zig
+@@ -16,8 +16,8 @@ pub const Limits = struct { routed: f32, shared: f32, dense: f32 };
+ /// MLA's rope pairs: rope_interleave true is exllamav3's RopeStyle.GPTJ (adjacent pairs), false NeoX (halves).
+ pub const RopeStyle = enum { gptj, neox };
+ 
+-/// A linear's format: bf16, FP8 128x128 blocks, ModelOpt NVFP4; EXL3 (#832) adds a variant and a weights_proj reader.
+-pub const Quant = enum { bf16, fp8_block128, nvfp4 };
++/// A linear's format: bf16, FP8 128x128 blocks, ModelOpt NVFP4, or EXL3 (exllamav3's trellis, on main's shared kernels).
++pub const Quant = enum { bf16, fp8_block128, nvfp4, exl3 };
+ 
+ /// Why parse refused the config, one sentence for the caller's log line (tests read it too).
+ pub const Why = struct {
+@@ -304,12 +304,19 @@ fn quantization(o: std.json.ObjectMap, c: *Config, why: *Why) !void {
+     const method = text(q, "quant_method") orelse "";
+     if (std.mem.eql(u8, method, "fp8")) return fp8Block(q, c, why);
+     if (std.ascii.eqlIgnoreCase(method, "modelopt")) return modelopt(q, c, why);
+-    if (std.ascii.eqlIgnoreCase(method, "exl3")) {
+-        why.set("EXL3: Ling's EXL3 weights need the shared EXL3 module (tracker #832), not this loader yet", .{});
++    if (std.ascii.eqlIgnoreCase(method, "exl3")) return exl3(q, c, why);
++    why.set("quantization {s}: the loader reads bf16, FP8 128x128 blocks, ModelOpt NVFP4 or EXL3", .{if (method.len > 0) method else "without quant_method"});
++    return error.Quant;
++}
++
++/// exllamav3's packs: a quantized linear holds `.trellis` (bits in its shape); the loader tells which by the tensors.
++fn exl3(q: std.json.ObjectMap, c: *Config, why: *Why) !void {
++    const book = text(q, "codebook") orelse "mcg";
++    if (!std.mem.eql(u8, book, "mul1") and !std.mem.eql(u8, book, "mcg") and !std.mem.eql(u8, book, "3inst")) {
++        why.set("EXL3 codebook {s}: the shared EXL3 kernels take mul1, mcg or 3inst", .{book});
+         return error.Exl3;
+     }
+-    why.set("quantization {s}: the loader reads bf16, FP8 128x128 blocks or ModelOpt NVFP4", .{if (method.len > 0) method else "without quant_method"});
+-    return error.Quant;
++    c.quant = .exl3;
+ }
+ 
+ fn tokens(o: std.json.ObjectMap, c: *Config, why: *Why) !void {
+diff --git a/zig/src/families/ling/config_test.zig b/zig/src/families/ling/config_test.zig
+index 880d8ddd0..3047cad08 100644
+--- a/zig/src/families/ling/config_test.zig
++++ b/zig/src/families/ling/config_test.zig
+@@ -191,8 +191,16 @@ test "hf_quant_config.json's NVFP4 block when config.json has none; groups other
+     try t.expectEqual(config.Quant.bf16, (try config.parseWith(t.allocator, json, null, &why)).quant);
+ }
+ 
+-test "EXL3 is refused naming #832; a glob matches whole names only" {
+-    try refused("\"quant_method\": \"fp8\"", "\"quant_method\": \"exl3\"", error.Exl3, "#832");
++test "an EXL3 pack parses to quant exl3, an unknown codebook is refused; a glob matches whole names only" {
++    {
++        const json = try edit("\"quant_method\": \"fp8\"", "\"quant_method\": \"exl3\"");
++        defer t.allocator.free(json);
++        var why: config.Why = .{};
++        const c = try config.parse(t.allocator, json, &why);
++        try t.expectEqual(config.Quant.exl3, c.quant);
++        try t.expectEqual(@as(u32, 0), c.plain_n);
++    }
++    try refused("\"quant_method\": \"fp8\"", "\"quant_method\": \"exl3\", \"codebook\": \"e8p\"", error.Exl3, "codebook e8p");
+     try t.expect(config.glob("*.mlp.gate", "model.layers.4.mlp.gate"));
+     try t.expect(!config.glob("*.mlp.gate", "model.layers.4.mlp.gate_proj"));
+     try t.expect(config.glob("model.layers.*.attention*", "model.layers.12.attention.q_proj"));
+diff --git a/zig/src/families/ling/cuda.zig b/zig/src/families/ling/cuda.zig
+index 0743957aa..c3cf69f49 100644
+--- a/zig/src/families/ling/cuda.zig
++++ b/zig/src/families/ling/cuda.zig
+@@ -6,6 +6,7 @@ pub const names = @import("names.zig");
+ pub const weights = @import("weights.zig");
+ pub const synth = @import("synth.zig");
+ pub const graph = @import("graph.zig");
++pub const ops = @import("ops.zig");
+ pub const state = @import("state.zig");
+ pub const forward = @import("forward.zig");
+ pub const mtp = @import("mtp.zig");
+@@ -16,35 +17,19 @@ pub const fake_driver = @import("fake_driver.zig");
+ 
+ const Config = config.Config;
+ 
+-/// glue.select's group-limited routing: n_group groups, the best topk_group kept (parse holds select's bounds).
+-pub fn groups(c: *const Config) glm.glue.Groups {
+-    return .{ .n = c.n_group, .keep = c.topk_group };
+-}
+-
+-/// Layer i's SwiGLU clamps, 0 for none: experts.Layer.limit, moe.Layer.shared_limit, mlp.Layer.limit.
+-pub const Limits = struct { routed: f32, shared: f32, dense: f32 };
++/// Layer i's SwiGLU clamps, 0 for none: experts.Layer.limit, the shared expert's, mlp's.
++pub const Limits = config.Limits;
+ 
+ /// The lists cover the backbone; the MTP layer and the dense layers run unclamped (parse refuses a dense limit).
+ pub fn limits(c: *const Config, i: u32) Limits {
+-    if (i >= c.layers or !c.isMoe(i)) return .{ .routed = 0, .shared = 0, .dense = 0 };
+-    return .{ .routed = c.expert_limit[i], .shared = c.shared_limit[i], .dense = 0 };
+-}
+-
+-/// The MoE layer's routing fields as moe.Layer holds them (pointers and widths come from the weight loader).
+-pub fn route(c: *const Config, i: u32, l: *glm.moe.Layer) void {
+-    const lim = limits(c, i);
+-    l.top_k = c.topk;
+-    l.scale = c.routed_scale;
+-    l.norm = c.norm_topk;
+-    l.groups = groups(c);
+-    l.shared_limit = lim.shared;
+-    l.routed.limit = lim.routed;
++    return c.layerLimits(i);
+ }
+ 
+ test {
+     _ = @import("config_test.zig");
+     _ = @import("names_test.zig");
+     _ = @import("synth.zig");
++    _ = ops;
+     std.testing.refAllDecls(weights); // the loader compiles on hosts without a GPU
+     std.testing.refAllDecls(@import("weights_proj.zig"));
+     std.testing.refAllDecls(forward); // the layer graph compiles on hosts without a GPU
+@@ -61,17 +46,16 @@ test {
+ test "config's fixed widths are the kernels' own: KDA heads, the latent cache, the rope" {
+     const f = config.fixed;
+     try std.testing.expect(f.kda_dim == glm.kda.dk and f.kda_dim == glm.kda.dv);
+-    try std.testing.expect(f.rope == glm.latent.rope_width and f.kv_lora + f.rope == state.cache_width);
++    try std.testing.expect(f.rope == ops.rope_width and f.kv_lora + f.rope == state.cache_width);
+     try std.testing.expect(f.block == @import("cuda").fp8.block);
+ }
+ 
+-test "Ling's routing as glue.select takes it: 8 groups keeping 4, and select's own bounds hold" {
++test "Ling's routing as ops.select takes it: 8 groups keeping 4, and select's own bounds hold" {
+     var why: config.Why = .{};
+     const c = try config.parse(std.testing.allocator, @embedFile("fixtures/config.json"), &why);
+-    const g = groups(&c);
+-    try std.testing.expectEqual(glm.glue.Groups{ .n = 8, .keep = 4 }, g);
++    const g = c.groups();
++    try std.testing.expectEqual(config.Groups{ .n = 8, .keep = 4 }, g);
+     try std.testing.expect(c.experts % g.n == 0 and g.keep <= g.n and c.topk <= g.keep * (c.experts / g.n) and g.n <= 32);
+-    try std.testing.expect(!std.meta.eql(g, glm.glue.Groups{})); // GLM's one group would skip Ling's group pass
+ }
+ 
+ test "per-layer limits on the MoE layers: routed 10 from 65, shared 10 from 64, none on dense or MTP layers" {
+@@ -84,14 +68,4 @@ test "per-layer limits on the MoE layers: routed 10 from 65, shared 10 from 64,
+         try std.testing.expectEqual(@as(f32, if (moe and i >= 64) 10 else 0), l.shared);
+         try std.testing.expectEqual(@as(f32, 0), l.dense);
+     }
+-    var l: glm.moe.Layer = undefined;
+-    route(&c, 64, &l);
+-    try std.testing.expectEqual(@as(f32, 0), l.routed.limit);
+-    try std.testing.expectEqual(@as(f32, 10), l.shared_limit);
+-    route(&c, 65, &l);
+-    try std.testing.expectEqual(@as(f32, 10), l.routed.limit);
+-    try std.testing.expectEqual(glm.glue.Groups{ .n = 8, .keep = 4 }, l.groups);
+-    try std.testing.expectEqual(@as(usize, 8), l.top_k);
+-    try std.testing.expectEqual(@as(f32, 2.5), l.scale);
+-    try std.testing.expect(l.norm);
+ }
+diff --git a/zig/src/families/ling/fake_driver.zig b/zig/src/families/ling/fake_driver.zig
+index 7a8efc8ad..b40ac30a8 100644
+--- a/zig/src/families/ling/fake_driver.zig
++++ b/zig/src/families/ling/fake_driver.zig
+@@ -191,6 +191,7 @@ const table = struct {
+             .compute_capability_major => 12,
+             .compute_capability_minor => 1,
+             .max_shared_memory_per_multiprocessor, .max_shared_memory_per_block_optin => 101376,
++            .virtual_memory_management_supported, .gpu_direct_rdma_with_cuda_vmm_supported => 0,
+         };
+         return step();
+     }
+diff --git a/zig/src/families/ling/forward.zig b/zig/src/families/ling/forward.zig
+index 61bc7befc..3019723fa 100644
+--- a/zig/src/families/ling/forward.zig
++++ b/zig/src/families/ling/forward.zig
+@@ -79,6 +79,16 @@ pub const Forward = struct {
+         }
+     }
+ 
++    /// Loaded layer j alone on b.x's rows (a layer check's teacher-forced input); pending as stack() leaves it.
++    pub fn one(f: *const Forward, segs: []const Seg, j: usize, picks: ?u64) !void {
++        const rows = try f.rowsOf(segs);
++        try f.layer(segs, j, rows, picks);
++        for (segs) |sg| {
++            sg.st.pending = sg.rows;
++            sg.st.prompt = f.b.prompt;
++        }
++    }
++
+     /// Loaded layer j: input norm, mixer, residual; post-attention norm, MLP or MoE, residual.
+     pub fn layer(f: *const Forward, segs: []const Seg, j: usize, rows: usize, picks: ?u64) !void {
+         const o = f.ops();
+diff --git a/zig/src/families/ling/graph.zig b/zig/src/families/ling/graph.zig
+index e0f055b80..30b36c732 100644
+--- a/zig/src/families/ling/graph.zig
++++ b/zig/src/families/ling/graph.zig
+@@ -7,6 +7,7 @@ const weights = @import("weights.zig");
+ pub const glue = glm.glue;
+ pub const kda = glm.kda;
+ pub const latent = glm.latent;
++pub const ops = @import("ops.zig");
+ const Proj = weights.Proj;
+ const Config = @import("config.zig").Config;
+ 
+@@ -14,6 +15,7 @@ const Config = @import("config.zig").Config;
+ pub const Modules = struct {
+     mods: [5]cuda.Module, // glm_glue, glm_kda, glm_ops, experts (the plan kernels), ling_glue
+     glue: glue.Kernels,
++    ling: ops.Kernels, // the tf_ling_* entries of the glm_glue image
+     kda: kda.Kernels,
+     lane: cuda.qmmf.Lane,
+     prompt: cuda.nvfp4.Prompt,
+@@ -25,7 +27,14 @@ pub const Modules = struct {
+     add: cuda.Function,
+     gate: cuda.Function,
+     combine: cuda.Function,
+-    swiglu: [2]cuda.Function, // glm_glue's 512 and 64 SwiGLU in Ling's order, min(silu(g), L) * clip(u, -L, L)
++    x3: *Exl3,
++
++    /// main's shared EXL3 kernels, heap-held (the grouped view points at its kernels): dense rows, grouped experts.
++    pub const Exl3 = struct {
++        dense: cuda.exl3.Dense,
++        experts: cuda.exl3_experts.Experts,
++        grouped: cuda.exl3_grouped.Grouped,
++    };
+ 
+     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
+         const k = cuda.kernels;
+@@ -45,7 +54,7 @@ pub const Modules = struct {
+         m.add = try m.mods[4].function("tf_ling_add");
+         m.gate = try m.mods[4].function("tf_ling_gate");
+         m.combine = try m.mods[4].function("tf_ling_combine");
+-        m.swiglu = .{ try m.mods[0].function("tf_ling_swiglu_512"), try m.mods[0].function("tf_ling_swiglu_64") };
++        m.ling = try ops.Kernels.load(m.mods[0]);
+         m.lane = try cuda.qmmf.Lane.load(d, @intCast(try ctx.attribute(.compute_capability_major)));
+         errdefer m.lane.unload();
+         m.prompt = try cuda.nvfp4.Prompt.load(d);
+@@ -53,6 +62,14 @@ pub const Modules = struct {
+         m.x8 = try cuda.experts.Fp8Experts.load(d, sms);
+         errdefer m.x8.unload();
+         m.x4 = try cuda.experts.Nvfp4Experts.load(d, sms);
++        errdefer m.x4.unload();
++        const x3 = try std.heap.page_allocator.create(Exl3);
++        errdefer std.heap.page_allocator.destroy(x3);
++        x3.dense = try cuda.exl3.Dense.load(d);
++        errdefer x3.dense.unload();
++        x3.experts = try cuda.exl3_experts.Experts.load(d);
++        x3.grouped = .{ .d = d, .kernels = &x3.experts };
++        m.x3 = x3;
+         return m;
+     }
+ 
+@@ -62,6 +79,10 @@ pub const Modules = struct {
+         m.prompt.unload();
+         m.x8.unload();
+         m.x4.unload();
++        m.x3.grouped.deinit();
++        m.x3.experts.unload();
++        m.x3.dense.unload();
++        std.heap.page_allocator.destroy(m.x3);
+         m.* = undefined;
+     }
+ 
+@@ -69,13 +90,13 @@ pub const Modules = struct {
+         return .{ .glue = &m.glue };
+     }
+ 
+-    /// Every lane format's decode rows; nvfp4 prompt rows on the prompt GEMM.
++    /// Every lane format's decode rows; nvfp4 prompt rows on the prompt GEMM; EXL3 on main's shared Dense.
+     pub fn linear(m: *const Modules) cuda.qlinear.Linear {
+-        return .{ .lane = &m.lane, .nvfp4_prompt = &m.prompt };
++        return .{ .lane = &m.lane, .nvfp4_prompt = &m.prompt, .exl3 = &m.x3.dense };
+     }
+ 
+     pub fn grouped(m: *const Modules) cuda.experts.Grouped {
+-        return .{ .fp8g = &m.x8, .nvfp4 = &m.x4 };
++        return .{ .fp8g = &m.x8, .nvfp4 = &m.x4, .exl3 = &m.x3.grouped };
+     }
+ };
+ 
+@@ -166,8 +187,8 @@ pub const Graph = struct {
+                 g.mla_layers += 1;
+             },
+         };
+-        if (c.rope_dim != latent.rope_width or c.rope_style != .gptj) return error.RopeNotBuilt;
+-        const f = latent.ropeFreqs(c.rope_theta);
++        if (c.rope_dim != ops.rope_width or c.rope_style != .gptj) return error.RopeNotBuilt;
++        const f = ops.ropeFreqs(c.rope_theta);
+         g.freq = try g.store.keep(std.mem.sliceAsBytes(&f), "ling.rope.inv_freq");
+         const zero = try gpa.alloc(u8, @as(usize, c.experts) * 4);
+         defer gpa.free(zero);
+diff --git a/zig/src/families/ling/lanes.zig b/zig/src/families/ling/lanes.zig
+index bbcbc51c1..f8b9c54c6 100644
+--- a/zig/src/families/ling/lanes.zig
++++ b/zig/src/families/ling/lanes.zig
+@@ -126,7 +126,8 @@ pub const Lanes = struct {
+     }
+ 
+     /// One chunk of the stream's prompt pass (fillOne runs other rounds between); true once the first token is drawn.
+-    fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
++    fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream, cap: u32) anyerror!bool {
++        _ = cap; // chunks follow the engine's own prompt plan (chunk_invariant stays false)
+         const self = of(ptr);
+         const going: ?usize = if (self.lanes.getPtr(s)) |l| l.fill else null;
+         const at = going orelse try self.e.prefillStart(s.prompt().len, try self.opening(s));
+diff --git a/zig/src/families/ling/names.zig b/zig/src/families/ling/names.zig
+index f59d867ba..f4365cb3c 100644
+--- a/zig/src/families/ling/names.zig
++++ b/zig/src/families/ling/names.zig
+@@ -145,6 +145,7 @@ pub fn side(f: config.Quant) []const []const u8 {
+         .bf16 => &.{},
+         .fp8_block128 => &.{"weight_scale_inv"},
+         .nvfp4 => &.{ "weight_scale", "weight_scale_2", "input_scale" },
++        .exl3 => &.{}, // a quantized linear is .trellis, .suh, .svh and its marker, read by the trellis (weights_proj)
+     };
+ }
+ 
+diff --git a/zig/src/families/ling/ops.zig b/zig/src/families/ling/ops.zig
+new file mode 100644
+index 000000000..9ee528d0b
+--- /dev/null
++++ b/zig/src/families/ling/ops.zig
+@@ -0,0 +1,128 @@
++//! Ling-3.1's launches on GLM's glue image: group-limited select, SwiGLU in Ling's order, the 128-wide absorbed MLA
++//! with 64 roped columns. The kernels are GLM's device code at Ling's shapes (glm_glue_moe/latent/attn.cuh).
++const std = @import("std");
++const cuda = @import("cuda");
++const glm = @import("glm_cuda");
++
++const glue = glm.glue;
++const latent = glm.latent;
++const Groups = @import("config.zig").Groups;
++
++/// Ling's qk_rope_head_dim: the roped columns after the latent in q and in the cache.
++pub const rope_width = 64;
++
++/// The tf_ling_* entries of the glm_glue image.
++pub const Kernels = struct {
++    topk: cuda.Function,
++    swiglu: [2]cuda.Function, // 512 and 64 blocks, min(silu(g), L) * clip(u, -L, L)
++    absorb_q: cuda.Function,
++    expand_v: cuda.Function,
++    rope: cuda.Function,
++    chunks: cuda.Function,
++
++    pub fn load(m: cuda.Module) !Kernels {
++        var k: Kernels = undefined;
++        k.topk = try m.function("tf_ling_topk");
++        k.swiglu = .{ try m.function("tf_ling_swiglu_512"), try m.function("tf_ling_swiglu_64") };
++        k.absorb_q = try m.function("tf_ling_absorb_q_128");
++        k.expand_v = try m.function("tf_ling_expand_v_128");
++        k.rope = try m.function("tf_ling_rope");
++        k.chunks = try m.function("tf_ling_chunks_r16");
++        try k.chunks.allowDynamicShared(chunksSmem(latent.heads_tile));
++        return k;
++    }
++};
++
++fn cdiv(a: usize, b: usize) u32 {
++    return @intCast((a + b - 1) / b);
++}
++
++fn i64of(v: usize) i64 {
++    return @intCast(v);
++}
++
++fn cint(v: usize) c_int {
++    return @intCast(v);
++}
++
++/// The kernel's clamp for a limit: 0 (unclamped, as the experts' 0) as +inf, whose min and clip are exact.
++pub fn clampOf(limit: f32) f32 {
++    return if (limit == 0) std.math.inf(f32) else limit;
++}
++
++/// glue.swiglu in Ling's order: [gate | up] -> bf16(min(bf16(silu(g)), L) * clip(u, -L, L)), 64-sums in `xs`; 0: none.
++pub fn swiglu(k: *const Kernels, stream: cuda.Stream, gu: u64, out: u64, xs: u64, limit: f32, rows: usize, w: usize) !void {
++    const block: usize = if (w % 512 == 0) 512 else if (w % 64 == 0) 64 else return error.NoSwigluBlock;
++    const f, const threads: u32 = if (block == 512) .{ k.swiglu[0], 128 } else .{ k.swiglu[1], 64 };
++    var a: cuda.Args = .{};
++    inline for (.{ gu, out, xs, clampOf(limit), i64of(w) }) |v| a.add(v);
++    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(w / block) }, .block = .{ .x = threads } }, stream, &a);
++}
++
++/// glue.select with group-limited routing: top_k by sigmoid + bias in the kept groups, normed, x `scale`, + shared.
++pub fn select(k: *const Kernels, stream: cuda.Stream, logits: u64, bias: u64, pick: u64, wts: u64, rows: usize, top_k: usize, experts: usize, scale: f32, norm: bool, groups: Groups) !void {
++    if (experts > 512 or top_k >= 32) return error.TopkTooWide;
++    const n: usize = groups.n;
++    const keep: usize = groups.keep;
++    if (n == 0 or n > 32 or experts % n != 0 or keep == 0 or keep > n or top_k > keep * (experts / n)) return error.TopkGroups;
++    var a: cuda.Args = .{};
++    inline for (.{ logits, bias, pick, wts, scale, cint(experts), cint(top_k), @as(c_int, @intFromBool(norm)), cint(n), cint(keep) }) |v| a.add(v);
++    try cuda.launch.launch(k.topk, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 } }, stream, &a);
++}
++
++/// The absorb and expand launches: rows in one block in decode windows, prompt_rb a block in prompt chunks.
++fn rowBlocks(f: cuda.Function, stream: cuda.Stream, in: u64, w: u64, out: u64, rows: usize, heads: usize, cols: usize, extra: anytype) !void {
++    const rb = if (rows >= latent.prompt_rows) latent.prompt_rb else rows;
++    var a: cuda.Args = .{};
++    inline for (.{ in, w, out, i64of(rows), i64of(heads), i64of(rb) } ++ extra) |v| a.add(v);
++    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(heads), .y = @intCast(cols), .z = cdiv(rows, rb) }, .block = .{ .x = 128 } }, stream, &a);
++}
++
++/// The absorb: q_nope the first d = 128 of each head's `q_stride` columns, out rows `out_stride` apart per head.
++pub fn absorbQ(k: *const Kernels, stream: cuda.Stream, q: u64, q_stride: usize, wk: u64, out: u64, out_stride: usize, rows: usize, heads: usize, d: usize, lw: usize) !void {
++    if (d != 128 or lw != 512 or q_stride < d or out_stride < lw) return error.LatentShape;
++    try rowBlocks(k.absorb_q, stream, q, wk, out, rows, heads, lw / 32, .{ i64of(q_stride), i64of(out_stride) });
++}
++
++/// latent.expand_v at 128-wide v heads: out [rows][heads][dv] bf16 = o_lat [rows][heads][lw] . wv [heads][dv][lw].
++pub fn expandV(k: *const Kernels, stream: cuda.Stream, ol: u64, wv: u64, out: u64, rows: usize, heads: usize, dv: usize, lw: usize) !void {
++    if (lw != 512 or dv != 128) return error.LatentShape;
++    try rowBlocks(k.expand_v, stream, ol, wv, out, rows, heads, dv / 16, .{});
++}
++
++/// The 64 rope columns of `heads` heads a row: in at x + r x_row + h x_head, out likewise (bf16 elements).
++pub const RopeRows = struct { x: u64, x_row: usize, x_head: usize, out: u64, o_row: usize, o_head: usize };
++
++/// The rope (GPT-J pairs) at positions pos .. pos + rows - 1 (pos an i32 on device), inv_freq 32 fp32 on device.
++pub fn rope(k: *const Kernels, stream: cuda.Stream, v: RopeRows, rows: usize, heads: usize, pos: u64, inv_freq: u64) !void {
++    var a: cuda.Args = .{};
++    inline for (.{ v.x, i64of(v.x_row), i64of(v.x_head), v.out, i64of(v.o_row), i64of(v.o_head), pos, inv_freq }) |x| a.add(x);
++    try cuda.launch.launch(k.rope, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(heads) }, .block = .{ .x = rope_width / 2 } }, stream, &a);
++}
++
++/// The rope's inv_freq: theta^(-2i / 64) for i < 32, from float64 rounded to fp32.
++pub fn ropeFreqs(theta: f64) [rope_width / 2]f32 {
++    var f: [rope_width / 2]f32 = undefined;
++    for (&f, 0..) |*x, i| x.* = @floatCast(1.0 / std.math.pow(f64, theta, @as(f64, @floatFromInt(2 * i)) / rope_width));
++    return f;
++}
++
++/// wide_smem<hb, 64>(): GLM's chunk tiles with q and key rows 576 wide (the roped columns after the latent).
++pub fn chunksSmem(comptime hb: u32) u32 {
++    return (hb * 576 + 2 * 32 * 576 + hb * 32) * 2 + (hb * 4 + 2 * hb) * 4;
++}
++
++/// latent.attention with roped keys: qa and cache rows lw + 64 wide, 16-head blocks, then GLM's merge; out lw wide.
++pub fn attention(k: *const Kernels, set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, pos: u64, p: latent.Partials, out: u64, dummy: u64, rows: usize, heads: usize, lw: usize, nch: usize, scale: f32) !void {
++    if (lw != 512) return error.LatentShape;
++    const hb = latent.heads_tile;
++    var a: cuda.Args = .{};
++    inline for (.{ qa, cache, pos, @as(u64, 0), @as(u64, 0), p.po, p.pm, p.pl, i64of(rows), i64of(heads), @as(i64, 0), scale, @as(c_int, 0), @as(u64, 0), @as(i64, 0) }) |v| a.add(v);
++    try cuda.launch.launch(k.chunks, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb), .z = @intCast(nch) }, .block = .{ .x = 256 }, .shared = chunksSmem(hb) }, stream, &a);
++    try latent.merge(set, stream, p, out, dummy, rows, heads, lw, nch, false);
++}
++
++test "the roped chunk tiles fit the 99 KiB a GB10 block may take" {
++    try std.testing.expect(chunksSmem(16) <= 99 * 1024);
++    try std.testing.expectEqual(@as(f32, 1.0), ropeFreqs(6e6)[0]);
++}
+diff --git a/zig/src/families/ling/state.zig b/zig/src/families/ling/state.zig
+index 50505e696..31511c305 100644
+--- a/zig/src/families/ling/state.zig
++++ b/zig/src/families/ling/state.zig
+@@ -12,7 +12,9 @@ pub const window_rows = 16;
+ /// The most rows of one roped attention call (a prompt chunk's rows go in blocks of these).
+ pub const att_rows = 128;
+ /// MLA's cache row: the 512-wide latent, then the 64 roped key columns.
+-pub const cache_width = 512 + latent.rope_width;
++pub const cache_width = 512 + graph.ops.rope_width;
++/// kv_a's output row: the cache width, or the 640 an EXL3 pack pads it to.
++pub const kv_rows = 640;
+ 
+ /// Sub-allocations of one zeroed device allocation, 256-byte aligned.
+ const Arena = struct {
+@@ -135,7 +137,7 @@ pub const Buffers = struct {
+             rows * n * 2,                                    rows * n * 2,                   rows * n * 2,                rows * n * 4,
+             rows * n * 2,                                    rows * n * 4,                   rows * H * 4,                rows * n * 4,
+             rows * n * 2,                                    rows * ql * 2,                  rows * ql * 2,               rows * HM * c.qkDim() * 2,
+-            rows * cache_width * 2,                          rows * cache_width * 2,         rows * HM * cache_width * 2, rows * HM * 512 * 2,
++            rows * kv_rows * 2,                              rows * cache_width * 2,         rows * HM * cache_width * 2, rows * HM * 512 * 2,
+             rows * HM * c.v_dim * 2,                         rows * HM * 2,                  nch * ar * HM * 512 * 4,     nch * ar * HM * 4,
+             nch * ar * HM * 4,                               4,                              4,                           rows * 2 * width * 2,
+             rows * width * 2,                                rows * (width / 64 + 1) * 4,    rows * E * 4,                glue_router_ks * rows * E * 4,
+diff --git a/zig/src/families/ling/synth.zig b/zig/src/families/ling/synth.zig
+index aa9b707d2..d69e95bc7 100644
+--- a/zig/src/families/ling/synth.zig
++++ b/zig/src/families/ling/synth.zig
+@@ -45,6 +45,7 @@ pub fn configJsonOf(gpa: std.mem.Allocator, base: Base, format: config.Quant, la
+             .bf16 => {},
+             .fp8_block128 => try o.put(a, "quantization_config", try quant(a, fp8_block, layers, group, false)),
+             .nvfp4 => try o.put(a, "quantization_config", try quant(a, modelopt_block, layers, group, false)),
++            .exl3 => return error.Exl3Synth, // exllamav3 writes EXL3 packs; synth writes the formats it quantizes
+         }
+         return std.json.Stringify.valueAlloc(gpa, root, .{ .whitespace = .indent_2 });
+     }
+@@ -67,6 +68,7 @@ pub fn configJsonOf(gpa: std.mem.Allocator, base: Base, format: config.Quant, la
+         .bf16 => _ = o.orderedRemove("quantization_config"),
+         .fp8_block128 => try o.put(a, "quantization_config", try quant(a, fp8_block, layers, shape.group, true)),
+         .nvfp4 => try o.put(a, "quantization_config", try quant(a, modelopt_block, layers, shape.group, true)),
++        .exl3 => return error.Exl3Synth,
+     }
+     return std.json.Stringify.valueAlloc(gpa, root, .{ .whitespace = .indent_2 });
+ }
+diff --git a/zig/src/families/ling/weights.zig b/zig/src/families/ling/weights.zig
+index 1ccecba65..3d411d88a 100644
+--- a/zig/src/families/ling/weights.zig
++++ b/zig/src/families/ling/weights.zig
+@@ -128,6 +128,7 @@ const Loader = struct {
+         const n = names.dims(L.c, .kda_q_conv).conv[0];
+         var b: [64]u8 = undefined;
+         var cb: [96]u8 = undefined;
++        if (L.c.quant == .exl3) return L.kdaFused(i, n);
+         return .{
+             .q = try L.lin(i, .kda_q),
+             .k = try L.lin(i, .kda_k),
+@@ -143,6 +144,39 @@ const Loader = struct {
+         };
+     }
+ 
++    /// exllamav3's KDA as it converts it: q|k|v fused (qkv_proj, viewed per head block by columns), conv1d fused q|k|v.
++    fn kdaFused(L: *Loader, i: u32, n: usize) !Kda {
++        const d: usize = L.c.hidden;
++        var b: [96]u8 = undefined;
++        const qkv = try L.r.linear(try std.fmt.bufPrint(&b, "model.layers.{d}.attention.qkv_proj", .{i}), 3 * n, d);
++        const w = switch (qkv) {
++            .exl3 => |x| x,
++            else => return error.UnexpectedTensor, // a bf16 pack keeps q, k and v apart (the other path)
++        };
++        const conv = try std.fmt.bufPrint(&b, "model.layers.{d}.attention.conv1d.weight", .{i});
++        const t = try L.r.ck.get(conv);
++        if (t.numel() != 3 * n * L.c.conv or (t.dtype != .bf16 and t.dtype != .f32 and t.dtype != .f16)) {
++            std.log.err("{s}: {t} {any}, expected {d} x {d} values", .{ conv, t.dtype, t.shape[0..t.rank], 3 * n, L.c.conv });
++            return error.UnexpectedTensor;
++        }
++        var host: std.ArrayList(u8) = .empty;
++        defer host.deinit(L.r.gpa);
++        try proj.append(L.r.gpa, &host, t, .f32);
++        return .{
++            .q = .{ .exl3 = try w.columns(0, @intCast(n)) },
++            .k = .{ .exl3 = try w.columns(@intCast(n), @intCast(n)) },
++            .v = .{ .exl3 = try w.columns(@intCast(2 * n), @intCast(n)) },
++            .b = try L.lin(i, .kda_b),
++            .f = try L.lin(i, .kda_f),
++            .g = try L.lin(i, .kda_g),
++            .o = try L.lin(i, .kda_o),
++            .conv = try L.r.store.keep(host.items, conv),
++            .a_log = try L.small(i, .kda_a_log, .f32),
++            .dt_bias = try L.small(i, .kda_dt_bias, .f32),
++            .o_norm = try L.small(i, .kda_o_norm, .bf16),
++        };
++    }
++
+     fn mla(L: *Loader, i: u32) !Mla {
+         const c = L.c;
+         var m: Mla = .{
+@@ -163,7 +197,9 @@ const Loader = struct {
+     fn moe(L: *Loader, i: u32) !Moe {
+         const c = L.c;
+         const route = try L.module(i, .router);
+-        if (c.format(route) != .bf16) {
++        var rb: [128]u8 = undefined;
++        const plain_router = if (c.quant == .exl3) !L.r.ck.has(try std.fmt.bufPrint(&rb, "{s}.trellis", .{route})) else c.format(route) == .bf16;
++        if (!plain_router) {
+             std.log.err("{s} is {t}: the routing kernels read a bf16 router", .{ route, c.format(route) });
+             return error.QuantizedRouter;
+         }
+diff --git a/zig/src/families/ling/weights_proj.zig b/zig/src/families/ling/weights_proj.zig
+index 0c7123e95..f842c69ed 100644
+--- a/zig/src/families/ling/weights_proj.zig
++++ b/zig/src/families/ling/weights_proj.zig
+@@ -57,6 +57,20 @@ pub const Store = struct {
+         return p;
+     }
+ 
++    /// `parts` back to back in one buffer the store owns (an EXL3 layer's expert trellises: one allocation, not 512).
++    pub fn keepAll(s: *Store, parts: []const []const u8, name: []const u8) !u64 {
++        var total: usize = 0;
++        for (parts) |p| total += p.len;
++        const base = try s.alloc(total, name);
++        const buf = &s.buffers.items[s.buffers.items.len - 1];
++        var at: usize = 0;
++        for (parts) |p| {
++            try buf.upload(at, p);
++            at += p.len;
++        }
++        return base;
++    }
++
+     /// deinit, or when the device may still write them (a failed drain) the host lists alone: buffers leaked.
+     pub fn drop(s: *Store, settled: bool) void {
+         if (!settled) s.buffers.clearRetainingCapacity();
+@@ -86,6 +100,7 @@ pub fn toBf16(v: f32) u16 {
+ pub fn value(t: Tensor, i: usize) !f32 {
+     return switch (t.dtype) {
+         .bf16 => @bitCast(@as(u32, std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)) << 16),
++        .f16 => @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)))), // EXL3 packs' plain tensors
+         .f32 => @bitCast(std.mem.readInt(u32, t.bytes[4 * i ..][0..4], .little)),
+         else => error.UnexpectedTensor,
+     };
+@@ -120,6 +135,51 @@ pub const Reader = struct {
+             .bf16 => r.bf16(module, n, k),
+             .fp8_block128 => r.fp8(module, n, k),
+             .nvfp4 => r.fp4(module, n, k),
++            // an EXL3 pack keeps what exllamav3 left unquantized (b_proj, kv_b_proj, the head gate) as bf16 weights
++            .exl3 => if (r.ck.has(try r.name(module, "trellis"))) .{ .exl3 = try r.exl3Linear(module, n, k) } else r.bf16(module, n, k),
++        };
++    }
++
++    /// One EXL3 group as main's exl3_load admits it: trellis int16 [k/16][n/16][16 bits], fp16 suh [k] and svh [n].
++    pub const Group = struct { trellis: Tensor, suh: Tensor, svh: Tensor, halves: u32, codebook: cuda.exl3.Codebook, n: usize };
++
++    pub fn exl3Group(r: *Reader, module: []const u8, n: usize, k: usize) !Group {
++        const t = try r.ck.get(try r.name(module, "trellis"));
++        const halves = if (t.rank == 3) t.shape[2] / 8 else 0;
++        // exllamav3 pads a width off the 128 grid up to it (kv_a_proj_with_mqa's 576 is stored as 640)
++        const np = if (n % 128 == 0) n else std.mem.alignForward(usize, n, 128);
++        if (t.dtype != .i16 or t.rank != 3 or t.shape[0] != k / 16 or t.shape[1] != np / 16 or t.shape[2] % 8 != 0 or halves < 2 or halves > 16 or k % 128 != 0) return wrong(module, .exl3, t, n, k);
++        var codebook: cuda.exl3.Codebook = .inst3;
++        for (core.exl3_load.markers) |m| if (r.ck.has(try r.name(module, m.name))) {
++            const v = try r.ck.get(try r.name(module, m.name));
++            if (v.bytes.len != 4 or std.mem.readInt(u32, v.bytes[0..4], .little) != m.value) return wrong(module, .exl3, v, n, k);
++            codebook = switch (m.codebook) {
++                .inst3 => .inst3,
++                .mcg => .mcg,
++                .mul1 => .mul1,
++            };
++        };
++        if (halves % 2 == 1 and codebook != .mul1) return wrong(module, .exl3, t, n, k); // half steps are mul1's alone
++        const suh = try r.ck.get(try r.name(module, "suh"));
++        const svh = try r.ck.get(try r.name(module, "svh"));
++        if (!suh.is(.f16, &.{k}) or !svh.is(.f16, &.{np})) return wrong(module, .exl3, suh, n, k);
++        return .{ .trellis = t, .suh = suh, .svh = svh, .halves = @intCast(halves), .codebook = codebook, .n = np };
++    }
++
++    /// An n-by-k EXL3 projection with its trellis as stored (exl3.Dense reads the stored layout), on qlinear's exl3 arm.
++    fn exl3Linear(r: *Reader, module: []const u8, n: usize, k: usize) !cuda.exl3.Weight {
++        const g = try r.exl3Group(module, n, k);
++        const st = cuda.exl3.strides(k, g.n, g.halves, false);
++        return .{
++            .trellis = try r.store.keep(g.trellis.bytes, module),
++            .suh = try r.store.keep(g.suh.bytes, try r.name(module, "suh")),
++            .svh = try r.store.keep(g.svh.bytes, try r.name(module, "svh")),
++            .k = @intCast(k),
++            .n = @intCast(g.n), // the stored width: a padded one's extra columns are read past
++            .halves = g.halves,
++            .codebook = g.codebook,
++            .stride_k = st.k,
++            .stride_nb = st.nb,
+         };
+     }
+ 
+@@ -142,7 +202,21 @@ pub const Reader = struct {
+ 
+     fn bf16(r: *Reader, module: []const u8, n: usize, k: usize) !Proj {
+         const t = try r.ck.get(try r.name(module, "weight"));
++        // an EXL3 pack stores what it left unquantized as fp16: rounded to bf16 here, the lanes' plain format
++        if (r.c.quant == .exl3 and t.is(.f16, &.{ n, k })) {
++            var host: std.ArrayList(u8) = .empty;
++            defer host.deinit(r.gpa);
++            try append(r.gpa, &host, t, .bf16);
++            var u = t;
++            u.dtype = .bf16;
++            u.bytes = host.items;
++            return r.bf16Of(module, u, n, k);
++        }
+         if (!t.is(.bf16, &.{ n, k })) return wrong(module, .bf16, t, n, k);
++        return r.bf16Of(module, t, n, k);
++    }
++
++    fn bf16Of(r: *Reader, module: []const u8, t: Tensor, n: usize, k: usize) !Proj {
+         var src = try r.staged(t.bytes);
+         defer if (r.settled()) src.free(); // else leaked: a packer may still read it
+         const out = try r.store.alloc(cuda.modelopt.padded(n) * k * 2, module);
+@@ -216,8 +290,8 @@ pub const Reader = struct {
+     /// Small tensor `tensor` (bf16 or fp32, `numel` long) as `to`, uploaded under its own name.
+     pub fn small(r: *Reader, tensor: []const u8, numel: usize, to: core.checkpoint.DType) !u64 {
+         const t = try r.ck.get(tensor);
+-        if (t.numel() != numel or (t.dtype != .bf16 and t.dtype != .f32)) {
+-            std.log.err("{s}: {t} {any}, expected {d} bf16 or fp32 values", .{ tensor, t.dtype, t.shape[0..t.rank], numel });
++        if (t.numel() != numel or (t.dtype != .bf16 and t.dtype != .f32 and !(t.dtype == .f16 and r.c.quant == .exl3))) {
++            std.log.err("{s}: {t} {any}, expected {d} bf16 or fp32 values (fp16 in an EXL3 pack)", .{ tensor, t.dtype, t.shape[0..t.rank], numel });
+             return error.UnexpectedTensor;
+         }
+         var host: std.ArrayList(u8) = .empty;
+@@ -265,7 +339,73 @@ pub const Reader = struct {
+             },
+             .fp8_block128 => return .{ .grouped = try r.fp8Experts(i, count, width, dims, limit) },
+             .nvfp4 => return .{ .grouped = try r.fp4Experts(i, count, width, dims, limit) },
++            .exl3 => return .{ .grouped = try r.exl3Experts(i, count, width, dims, limit) },
++        }
++    }
++
++    /// experts.Layer's exl3 form (main's exl3_grouped): trellises as stored, pointers and half-bit widths per expert.
++    fn exl3Experts(r: *Reader, i: u32, count: usize, ni: usize, d: usize, limit: f32) !cuda.experts.Layer {
++        // Ling's clamp is min(silu(g), L); the shared EXL3 epilogue clamps g before silu, so clamped layers wait for it
++        if (limit != 0) return error.Exl3ClampOrder;
++        var tables: [3]struct { ptrs: u64, k2: u64, suh: u64, svh: u64 } = undefined;
++        var codebook: ?cuda.exl3.Codebook = null;
++        var b: [192]u8 = undefined;
++        var lb: [96]u8 = undefined;
++        inline for (.{ "gate_proj", "up_proj", "down_proj" }, 0..) |proj, m| {
++            const n = if (m < 2) ni else d;
++            const k = if (m < 2) d else ni;
++            const ptrs = try r.gpa.alloc(u64, count);
++            defer r.gpa.free(ptrs);
++            const k2 = try r.gpa.alloc(i32, count);
++            defer r.gpa.free(k2);
++            var su: std.ArrayList(u8) = .empty;
++            defer su.deinit(r.gpa);
++            var sv: std.ArrayList(u8) = .empty;
++            defer sv.deinit(r.gpa);
++            const parts = try r.gpa.alloc([]const u8, count);
++            defer r.gpa.free(parts);
++            var at: usize = 0;
++            for (0..count) |e| {
++                const g = try r.exl3Group(try expertModule(&b, i, e, proj), n, k);
++                if (codebook) |c| (if (c != g.codebook) return error.MixedExperts) else codebook = g.codebook;
++                parts[e] = g.trellis.bytes;
++                ptrs[e] = at; // offsets until the one upload below
++                at += g.trellis.bytes.len;
++                k2[e] = @intCast(g.halves);
++                try su.appendSlice(r.gpa, g.suh.bytes);
++                try sv.appendSlice(r.gpa, g.svh.bytes);
++            }
++            const base = try r.store.keepAll(parts, try label(&lb, i, proj ++ ".trellis"));
++            for (ptrs) |*p| p.* += base;
++            tables[m] = .{
++                .ptrs = try r.store.keep(std.mem.sliceAsBytes(ptrs), try label(&lb, i, proj ++ ".trellis_ptrs")),
++                .k2 = try r.store.keep(std.mem.sliceAsBytes(k2), try label(&lb, i, proj ++ ".k2")),
++                .suh = try r.store.keep(su.items, try label(&lb, i, proj ++ ".suh")),
++                .svh = try r.store.keep(sv.items, try label(&lb, i, proj ++ ".svh")),
++            };
++            r.ck.release(); // each projection's pages dropped: the GPU shares this memory
+         }
++        const lay: cuda.exl3_experts.Layer = .{
++            .gate = tables[0].ptrs,
++            .up = tables[1].ptrs,
++            .down = tables[2].ptrs,
++            .gate_k2 = tables[0].k2,
++            .up_k2 = tables[1].k2,
++            .down_k2 = tables[2].k2,
++            .suh_g = tables[0].suh,
++            .suh_u = tables[1].suh,
++            .svh_g = tables[0].svh,
++            .svh_u = tables[1].svh,
++            .suh_d = tables[2].suh,
++            .svh_d = tables[2].svh,
++            .experts = count,
++            .dims = d,
++            .width = ni,
++            .codebook = codebook orelse return error.UnexpectedTensor,
++            .limit = 0,
++            .act_mode = 1, // fp32 silu(g) * u, nearest exllamav3's fp16 intermediate
++        };
++        return .{ .format = .exl3, .exl3 = lay, .up = 0, .down = 0, .width = ni, .dims = d, .experts = count };
+     }
+ 
+     fn expertModule(b: []u8, i: u32, e: usize, comptime proj: []const u8) ![]const u8 {
+@@ -370,6 +510,8 @@ pub const Reader = struct {
+     /// experts.Layer's nvfp4 form: batches of codes and scales staged on the device, packed there (Packer.fp4Experts).
+     fn fp4Experts(r: *Reader, i: u32, count: usize, ni: usize, d: usize, limit: f32) !cuda.experts.Layer {
+         if (ni % X4.cols != 0 or d % 32 != 0) return error.UnexpectedTensor;
++        // main's NVFP4 epilogue clamps g before silu; Ling's order (min(silu(g), L)) has no NVFP4 instance yet
++        if (limit != 0) return error.Nvfp4ClampOrder;
+         const up_n = X4.bytes(1, ni, d, 2);
+         const down_n = X4.bytes(1, d, ni, 1);
+         const cb = ni * d / 2; // code bytes of one matrix
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index d786be656..8648c92da 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -14,6 +14,7 @@ pub const follow = @import("cuda_follow.zig").follow;
+ const lfm2 = @import("lfm2.zig");
+ const glm = @import("glm_cuda");
+ const minimax = @import("minimax_m3_cuda");
++const ling = @import("ling_cuda");
+ const qwen35 = @import("qwen35");
+ const kolibri1 = @import("kolibri1");
+ const gemma4 = @import("gemma4_cuda");
+@@ -30,7 +31,7 @@ const vision_offer = @import("cuda_vision_offer.zig");
+ const drafted = @import("cuda_drafted.zig");
+ const kv_pages = @import("cuda_kv_pool.zig");
+ /// CUDA families provide metadata, open their lane backend and explain their refusals.
+-const registry = .{ nemotron.native, nemotron.omni, glm.native, minimax.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, gemma4.native, gemma4.native31, spark25.native, dory.native };
++const registry = .{ nemotron.native, nemotron.omni, glm.native, minimax.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, gemma4.native, gemma4.native31, spark25.native, dory.native, ling.native };
+ /// --record opens here (engines.zig refuses it for a backend without this).
+ pub const records = true;
+ pub const backends: []const []const u8 = &.{"cuda"};
+diff --git a/zig/tests/cuda/ling_ckpt.zig b/zig/tests/cuda/ling_ckpt.zig
+index c52b368d8..79b04dcd4 100644
+--- a/zig/tests/cuda/ling_ckpt.zig
++++ b/zig/tests/cuda/ling_ckpt.zig
+@@ -25,11 +25,13 @@ fn fits(c: *const Config, name: []const u8, t: names.Tensor, x: Tensor) bool {
+                 .bf16 => x.is(.bf16, &nk),
+                 .fp8_block128 => x.is(.f8_e4m3, &nk) and k % 128 == 0,
+                 .nvfp4 => x.is(.u8, &.{ n, k / 2 }) and k % 16 == 0,
++                .exl3 => false, // an EXL3 linear has no .weight beside its trellis; the loader reads the trellis
+             };
+             return switch (f) {
+                 .bf16 => false,
+                 .fp8_block128 => x.is(.f32, &.{ (n + 127) / 128, k / 128 }),
+                 .nvfp4 => if (std.mem.eql(u8, tail, "weight_scale")) x.is(.f8_e4m3, &.{ n, k / 16 }) else x.dtype == .f32 and x.numel() == 1,
++                .exl3 => false,
+             };
+         },
+     }
+diff --git a/zig/tests/cuda/ling_clamp.zig b/zig/tests/cuda/ling_clamp.zig
+index e2b3b24ee..30a380654 100644
+--- a/zig/tests/cuda/ling_clamp.zig
++++ b/zig/tests/cuda/ling_clamp.zig
+@@ -27,14 +27,14 @@ fn silu(g: f64) f64 {
+ }
+ 
+ /// The glue's tf_ling_swiglu at L 10 and 2 on gates and ups straddling L vs float64; GLM's order beside it.
+-fn glueOrder(r: *Rig, fs: [2]cuda.Function, set: glue.Set) !void {
++fn glueOrder(r: *Rig, lk: *const ling.ops.Kernels, set: glue.Set) !void {
+     for ([_]f32{ 10, 2 }) |lim| for ([_]usize{ 1024, 704 }) |w| {
+         const rows = 40;
+         const gu = try r.bfs(rows * 2 * w, 1.5 * lim);
+         const dgu = try r.dev(std.mem.sliceAsBytes(gu));
+         const outs = [2]u64{ try r.zeros(rows * w * 2), try r.zeros(rows * w * 2) };
+         const xs = try r.zeros(rows * w / 64 * 4);
+-        try glue.swigluWith(fs, r.s, dgu, outs[0], xs, lim, rows, w);
++        try ling.ops.swiglu(lk, r.s, dgu, outs[0], xs, lim, rows, w);
+         try glue.swiglu(set, r.s, dgu, outs[1], xs, lim, rows, w);
+         const got = try r.back(outs[0], rows * w * 2);
+         const before = try r.back(outs[1], rows * w * 2);
+@@ -135,7 +135,8 @@ pub fn run(gpu: check.Gpu, dir: []const u8) !void {
+     var gm = try cuda.Module.load(gpu.d, cuda.kernels.glm_glue);
+     defer gm.unload();
+     const ks = try glue.Kernels.load(gm);
+-    try glueOrder(&r, .{ try gm.function("tf_ling_swiglu_512"), try gm.function("tf_ling_swiglu_64") }, .{ .glue = &ks });
++    const lk = try ling.ops.Kernels.load(gm);
++    try glueOrder(&r, &lk, .{ .glue = &ks });
+     var kit: lw.Kit = undefined;
+     try kit.init(gpu);
+     defer kit.deinit();
+@@ -159,111 +160,3 @@ pub fn run(gpu: check.Gpu, dir: []const u8) !void {
+     }
+     check.pass("ling-clamp {t}: min(silu(g), L) * clip(u, -L, L) within float64 bounds (worst {d:.3}), GLM's order beside it", .{ o.c.quant, r.worst });
+ }
+-
+-/// An old fatbin's instance, launched with the arguments and grid the host gave it before Layer.after existed.
+-const Old = struct { f: cuda.Function, threads: u32, smem: u32 = 0, per: usize, cap: usize };
+-
+-fn launchOld(r: *Rig, k: Old, in: ex.Rows, l: ex.Layer, gate: bool, p: cuda.grouped.Plan, out: u64, units: usize) !void {
+-    var a: cuda.Args = .{};
+-    a.add(in.x);
+-    a.add(@as(i32, @intCast(in.stride)));
+-    a.add(@as(i32, @intCast(if (gate) in.slots else 0)));
+-    a.add(if (gate) l.up else l.down);
+-    a.add(if (gate) l.up_scale else l.down_scale);
+-    a.add(@as(i32, @intCast((if (gate) l.dims else l.width) / 32)));
+-    a.add(@as(i32, @intCast((if (gate) l.width else l.dims) / 32)));
+-    for ([_]u64{ p.items, p.counts, p.members, out }) |v| a.add(v);
+-    a.add(@as(i32, @intCast(if (gate) l.width else l.dims)));
+-    a.add(if (gate) l.limit else @as(f32, 0.0));
+-    a.add(@as(i32, -1));
+-    const grid = @min((units + k.per - 1) / k.per, k.cap);
+-    try cuda.launch.launch(k.f, .{ .grid = .{ .x = @intCast(grid) }, .block = .{ .x = k.threads }, .shared = k.smem }, r.s, &a);
+-}
+-
+-fn oldFn(m: cuda.Module, name: [:0]const u8, threads: u32, smem: u32, per: usize, sms: usize, resident: bool) !Old {
+-    const f = try m.function(name);
+-    if (smem > 0) try f.allowDynamicShared(smem);
+-    return .{ .f = f, .threads = threads, .smem = smem, .per = per, .cap = if (resident) @max(1, try f.occupancy(128, 0)) * sms else std.math.maxInt(usize) };
+-}
+-
+-/// `ling-clamp-old DIR FATBINS`: each grouped instance this build kept, via experts.Grouped, vs FATBINS' kernel.
+-pub fn old(gpu: check.Gpu, dir: []const u8, fatbins: []const u8) !void {
+-    var arena = std.heap.ArenaAllocator.init(gpu.gpa);
+-    defer arena.deinit();
+-    var s = try cuda.Stream.init(gpu.d, false);
+-    defer s.deinit();
+-    var prng = std.Random.DefaultPrng.init(0x01d);
+-    var r: Rig = .{ .gpu = gpu, .a = arena.allocator(), .s = s, .rng = prng.random() };
+-    defer {
+-        for (r.bufs.items) |*x| x.free();
+-        r.bufs.deinit(gpu.gpa);
+-    }
+-    var kit: lw.Kit = undefined;
+-    try kit.init(gpu);
+-    defer kit.deinit();
+-    var why: ling.config.Why = .{};
+-    var o = try W.open(gpu.gpa, gpu.io, dir, &why);
+-    defer o.ck.close();
+-    const last: u32 = o.c.layers - 1;
+-    var w = try W.load(gpu.gpa, gpu.d, s, &kit.pack, &o.ck, o.c, &.{last}, .{ .globals = false });
+-    defer w.deinit();
+-    const l = w.layers[0].ffn.moe.routed.grouped;
+-    const fp8 = l.format == .fp8g;
+-    const path = try std.fs.path.join(r.a, &.{ fatbins, if (fp8) "fp8_experts.fatbin" else "nvfp4_experts.fatbin" });
+-    const bytes = try std.Io.Dir.cwd().readFileAllocOptions(gpu.io, path, r.a, .limited(1 << 26), .@"64", null);
+-    var m = try cuda.Module.load(gpu.d, bytes);
+-    defer m.unload();
+-    const sms: usize = @intCast(try gpu.ctx.attribute(.multiprocessor_count));
+-    const F8 = ex.Fp8Experts.symbols;
+-    const F4 = ex.Nvfp4Experts.symbols;
+-    const p4 = ex.Nvfp4Experts.promptSmem;
+-    // [decode, prompt] x [gate-up, down_f32, down_bf16, relu^2]; null where the format has no such instance
+-    const ks: [2][4]?Old = if (fp8) .{
+-        .{ try oldFn(m, F8.gate_up, 128, 0, 4, sms, true), try oldFn(m, F8.down_f32, 128, 0, 4, sms, true), try oldFn(m, F8.down_bf16, 128, 0, 4, sms, true), null },
+-        .{ try oldFn(m, F8.p_gate_up, 128, 0, 1, sms, true), try oldFn(m, F8.p_down_f32, 128, 0, 1, sms, true), try oldFn(m, F8.p_down_bf16, 128, 0, 1, sms, true), null },
+-    } else .{
+-        .{ try oldFn(m, F4.gate_up, 128, 0, 4, sms, true), try oldFn(m, F4.down_f32, 128, 0, 4, sms, true), try oldFn(m, F4.down_bf16, 128, 0, 4, sms, true), try oldFn(m, F4.up_relu2, 128, 0, 4, sms, true) },
+-        .{ try oldFn(m, F4.prompt[1], 128, p4(2, 4), 1, sms, false), null, try oldFn(m, F4.prompt[2], 256, p4(1, 8), 1, sms, false), try oldFn(m, F4.prompt[0], 256, p4(1, 8), 1, sms, false) },
+-    };
+-    const slots = @min(4, l.experts);
+-    var n: usize = 0;
+-    var same_at_10: usize = 0;
+-    for ([_]bool{ false, true }, 0..) |prompt, pi| {
+-        const rows: usize = if (prompt) 40 else 3;
+-        const pairs = rows * slots;
+-        const tile: usize = if (prompt) ex.promptTile(l.format) else 16;
+-        const p = try plan(&r, &kit, pairs, slots, l.experts, tile);
+-        const items = cuda.grouped.maxItems(pairs, l.experts, tile);
+-        const up_in: ex.Rows = .{ .x = try r.dev(std.mem.sliceAsBytes(try r.bfs(rows * l.dims, 4))), .stride = l.dims, .slots = slots };
+-        const down_in: ex.Rows = .{ .x = try r.dev(std.mem.sliceAsBytes(try r.bfs(pairs * l.width, 4))), .stride = l.width };
+-        for (ks[pi], 0..) |maybe, ki| if (maybe) |k| for ([_]f32{ 0, 10, 2 }) |lim| for ([_]bool{ false, true }) |after| {
+-            if (ki != 0 and (lim != 0 or after)) continue;
+-            var lc = l;
+-            lc.limit = if (ki == 0) lim else 0;
+-            lc.after = after;
+-            lc.relu2 = ki == 3;
+-            const gate = ki == 0 or ki == 3;
+-            const epi: ex.Epi = if (gate) .up else if (ki == 1) .down_f32 else .down_bf16;
+-            const n_out = if (gate) l.width else l.dims;
+-            const len = pairs * n_out * @as(usize, if (ki == 1) 4 else 2);
+-            const outs = [2]u64{ try r.zeros(len), try r.zeros(len) };
+-            const in = if (gate) up_in else down_in;
+-            if (prompt) try kit.grouped().prompt(r.s, epi, in, lc, p, outs[0], items, -1) else try kit.grouped().decode(r.s, epi, in, lc, p, outs[0], items, -1);
+-            var lo = lc;
+-            lo.after = false;
+-            const nb = n_out / 32;
+-            const units = if (!prompt) items * nb else if (fp8) items * (nb / @as(usize, if (gate) 2 else 4)) else items * ((nb + @as(usize, if (ki == 0) 4 else 8) - 1) / @as(usize, if (ki == 0) 4 else 8));
+-            try launchOld(&r, k, in, lo, gate, p, outs[1], units);
+-            const got = try r.back(outs[0], len);
+-            const want = try r.back(outs[1], len);
+-            if (!after or lim == 0) {
+-                try check.sameBytes("grouped experts vs the old fatbin", got, want);
+-                n += 1;
+-            } else if (lim == 10) {
+-                try check.sameBytes("Ling's order at L 10 vs the old order", got, want);
+-                same_at_10 += 1;
+-            } else try check.expect(!std.mem.eql(u8, got, want), "Ling's order at L 2 differs from the old order", .{});
+-        };
+-    }
+-    check.pass("ling-clamp-old {t}: {d} calls of the kept instances equal {s}'s bytes; Ling's order at L 10 equals them {d} times, at L 2 differs", .{ l.format, n, fatbins, same_at_10 });
+-}
+diff --git a/zig/tests/cuda/ling_cmds.zig b/zig/tests/cuda/ling_cmds.zig
+new file mode 100644
+index 000000000..41938408e
+--- /dev/null
++++ b/zig/tests/cuda/ling_cmds.zig
+@@ -0,0 +1,53 @@
++//! The Ling-3.1-flash commands of `tf-cuda-test` (main.zig hands every `ling-*` command here).
++const std = @import("std");
++const check = @import("check.zig");
++
++pub const usage =
++    \\  ling-route                group-limited select and Ling's SwiGLU limit vs float64 (synthetic)
++    \\  ling-mla                  Ling's MLA (128-wide absorb/expand, rope, 576-wide attention) vs float64 (synthetic)
++    \\  ling-synth <dir> [--format bf16|fp8|nvfp4] [--layers N] [--tiny]   a tiny Ling checkpoint with the real schema
++    \\  ling-weights <dir>        every layer of a Ling checkpoint loaded: projections vs float64, small tensors byte for byte
++    \\  ling-forward-synth <dir> <ref> [picks]   a ling-synth checkpoint's forward vs its float64 oracle; cuts, windows
++    \\  ling-clamp <dir>          Ling's SwiGLU order min(silu(g), L): glue and the dir's grouped experts vs float64
++    \\  ling-lanes <dir> <out> [ref] [--layers a,b] [--mtp]   the lane backend: chunked, drafted, resumed, concurrent
++    \\  ling-slots                the lane backend's slots over reused map buckets (no GPU work)
++    \\  ling-ckpt-check <dir> [index]   every tensor's name, dtype and shape against the loader's (headers alone)
++    \\  ling-exl3-layers <dir> <ref> <out>   real EXL3 layers on exllamav3's inputs (prompt and decode), outputs saved
++    \\  ling-init-faults <dir> [--mtp] [--every N]   the backend opened with each driver call, then each allocation, failing
++    \\
++;
++
++fn arg(rest: []const [:0]const u8, i: usize) ![]const u8 {
++    if (i >= rest.len) return error.MissingArgument;
++    return rest[i];
++}
++
++/// Runs `cmd` when it is one of ours; false otherwise.
++pub fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !bool {
++    const eq = std.mem.eql;
++    if (eq(u8, cmd, "ling-route")) {
++        try @import("ling_route.zig").run(gpu);
++    } else if (eq(u8, cmd, "ling-mla")) {
++        try @import("ling_ref_mla.zig").run(gpu);
++    } else if (eq(u8, cmd, "ling-synth")) {
++        try @import("ling_synth.zig").run(gpu, rest);
++    } else if (eq(u8, cmd, "ling-weights")) {
++        try @import("ling_weights_tests.zig").run(gpu, try arg(rest, 0));
++    } else if (eq(u8, cmd, "ling-forward-synth")) {
++        try @import("ling_forward_synth.zig").run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) rest[2] else null);
++    } else if (eq(u8, cmd, "ling-clamp")) {
++        try @import("ling_clamp.zig").run(gpu, try arg(rest, 0));
++    } else if (eq(u8, cmd, "ling-lanes")) {
++        try @import("ling_lanes.zig").run(gpu, rest);
++    } else if (eq(u8, cmd, "ling-slots")) {
++        try @import("ling_cuda").lanes.slotCheck(gpu.gpa);
++        check.pass("ling-slots: new streams take the lowest free slot over buckets holding stale slots ({t})", .{@import("builtin").mode});
++    } else if (eq(u8, cmd, "ling-ckpt-check")) {
++        try @import("ling_ckpt.zig").run(gpu, rest);
++    } else if (eq(u8, cmd, "ling-exl3-layers")) {
++        try @import("ling_exl3_layers.zig").run(gpu, rest);
++    } else if (eq(u8, cmd, "ling-init-faults")) {
++        try @import("ling_faults.zig").run(gpu, rest);
++    } else return false;
++    return true;
++}
+diff --git a/zig/tests/cuda/ling_exl3_layers.zig b/zig/tests/cuda/ling_exl3_layers.zig
+new file mode 100644
+index 000000000..19235c1f9
+--- /dev/null
++++ b/zig/tests/cuda/ling_exl3_layers.zig
+@@ -0,0 +1,132 @@
++//! `ling-exl3-layers DIR REF OUT`: real EXL3 layers, each on the reference's own input rows (teacher-forced).
++//! REF (tools/g2/ling_layers_ref.py, exllamav3): "TFLX3L01", u32 T, D, n, i32 ids[T], u32 layer[n], then per layer
++//! f32 in[T][D] and out[T][D]. OUT: "TFLX3O01", u32 T, D, n, top, then per layer f32 prompt[T][D], decode[T][D],
++//! i32 prompt picks[T][top + 1], decode picks[T][top + 1] (zeros on a dense layer). The comparison is the script's.
++const std = @import("std");
++const cuda = @import("cuda");
++const check = @import("check.zig");
++const rig = @import("ling_forward_rig.zig");
++
++const F = rig.F;
++const Rig = rig.Rig;
++
++fn toBf16(x: f32) u16 {
++    const u: u32 = @bitCast(x);
++    if (std.math.isNan(x)) return 0x7fc0;
++    return @intCast((u + 0x7fff + ((u >> 16) & 1)) >> 16);
++}
++
++fn upload(r: *Rig, ptr: u64, rows: []const f32) !void {
++    const h = try r.a.alloc(u16, rows.len);
++    for (h, rows) |*o, x| o.* = toBf16(x);
++    try r.s.synchronize();
++    const b: cuda.DeviceBuffer = .{ .d = r.gpu.d, .ptr = ptr, .len = h.len * 2 };
++    try b.upload(0, std.mem.sliceAsBytes(h));
++}
++
++fn rowsBack(r: *Rig, ptr: u64, out: []f32) !void {
++    const raw = std.mem.bytesAsSlice(u16, try r.back(ptr, out.len * 2));
++    for (out, raw) |*o, u| o.* = @floatCast(rig.bfOf(u));
++}
++
++/// rel L2 of a against b, and of a - b against the layer's own change (b - in).
++fn rel(a: []const f32, b: []const f32, in: []const f32) [2]f64 {
++    var e: f64 = 0;
++    var n: f64 = 0;
++    var dd: f64 = 0;
++    for (a, b, in) |x, y, z| {
++        e += (@as(f64, x) - y) * (@as(f64, x) - y);
++        n += @as(f64, y) * y;
++        dd += (@as(f64, y) - z) * (@as(f64, y) - z);
++    }
++    return .{ @sqrt(e / n), @sqrt(e / dd) };
++}
++
++pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
++    if (rest.len < 3) return error.MissingArgument;
++    var arena = std.heap.ArenaAllocator.init(gpu.gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const bytes = try std.Io.Dir.cwd().readFileAlloc(gpu.io, rest[1], a, .limited(8 << 30));
++    if (bytes.len < 20 or !std.mem.eql(u8, bytes[0..8], "TFLX3L01")) return error.BadFixture;
++    const T: usize = std.mem.readInt(u32, bytes[8..12], .little);
++    const D: usize = std.mem.readInt(u32, bytes[12..16], .little);
++    const n: usize = std.mem.readInt(u32, bytes[16..20], .little);
++    var at: usize = 20 + T * 4;
++    const layers = try a.alloc(u32, n);
++    for (layers) |*l| {
++        l.* = std.mem.readInt(u32, bytes[at..][0..4], .little);
++        at += 4;
++    }
++    if (bytes.len != at + n * 2 * T * D * 4) return error.BadFixture;
++    const vals = try a.alloc(f32, n * 2 * T * D); // the file's offsets need not be 4-aligned
++    @memcpy(std.mem.sliceAsBytes(vals), bytes[at..]);
++
++    var s = try cuda.Stream.init(gpu.d, false);
++    defer s.deinit();
++    var why: @import("ling_cuda").config.Why = .{};
++    var o = rig.W.open(gpu.gpa, gpu.io, rest[0], &why) catch |e| {
++        std.debug.print("{s}: {s}\n", .{ rest[0], why.text() });
++        return e;
++    };
++    defer o.ck.close();
++    try check.expect(o.c.hidden == D, "hidden {d}, the reference's {d}", .{ o.c.hidden, D });
++    var m = try F.Modules.load(gpu.d, gpu.ctx);
++    defer m.deinit();
++    var pack = try cuda.modelopt.Packer.load(gpu.d);
++    defer pack.unload();
++    var w = try rig.W.load(gpu.gpa, gpu.d, s, &pack, &o.ck, o.c, layers, .{ .globals = false });
++    defer w.deinit();
++    std.debug.print("RESULT ling-exl3-layers: {t} layers {any} loaded\n", .{ o.c.quant, layers });
++    var g = try F.Graph.init(gpu.gpa, gpu.d, &m, s, &w);
++    defer g.deinit();
++    var r: Rig = .{ .gpu = gpu, .a = a, .s = s, .m = &m, .g = &g };
++    defer r.deinit();
++    var pb = try F.Buffers.init(gpu.d, &m, &w, T, true, T + 8);
++    defer pb.deinit();
++    var db = try F.Buffers.init(gpu.d, &m, &w, F.window_rows, false, T + 8);
++    defer db.deinit();
++    const top: usize = w.config.topk;
++    const slots = top + 1;
++
++    var out: std.ArrayList(u8) = .empty;
++    try out.appendSlice(a, "TFLX3O01");
++    for ([_]usize{ T, D, n, top }) |v| try out.appendSlice(a, std.mem.asBytes(&@as(u32, @intCast(v))));
++    const got = try a.alloc(f32, T * D);
++    const dec = try a.alloc(f32, T * D);
++    const pp = try r.zeros(T * slots * 4);
++    const dp = try r.zeros(slots * 4);
++    for (layers, 0..) |li, j| {
++        const in = vals[j * 2 * T * D ..][0 .. T * D];
++        const want = vals[(j * 2 + 1) * T * D ..][0 .. T * D];
++        const moe = w.layers[j].ffn == .moe;
++        // prompt: all T rows in one forward of a fresh sequence
++        const sp = try r.state(T + 8);
++        try upload(&r, pb.x, in);
++        try r.fwd(&pb, if (moe) pp else null).one(&.{.{ .st = sp, .row0 = 0, .rows = T }}, j, if (moe) pp else null);
++        try rowsBack(&r, pb.x, got);
++        const ppicks = if (moe) try r.back(pp, T * slots * 4) else try a.alloc(u8, T * slots * 4);
++        if (!moe) @memset(ppicks, 0);
++        // decode: one row a forward, each committed, on another fresh sequence
++        const sd = try r.state(T + 8);
++        const dpicks = try a.alloc(u8, T * slots * 4);
++        @memset(dpicks, 0);
++        for (0..T) |t| {
++            try upload(&r, db.x, in[t * D ..][0..D]);
++            try r.fwd(&db, if (moe) dp else null).one(&.{.{ .st = sd, .row0 = 0, .rows = 1 }}, j, if (moe) dp else null);
++            try rowsBack(&r, db.x, dec[t * D ..][0..D]);
++            if (moe) @memcpy(dpicks[t * slots * 4 ..][0 .. slots * 4], try r.back(dp, slots * 4));
++            try r.fwd(&db, null).commit(sd, 1);
++        }
++        const pr = rel(got, want, in);
++        const dr = rel(dec, want, in);
++        const pd = rel(got, dec, in);
++        std.debug.print("RESULT   layer {d} ({t}, {t}): prompt vs ref rel {e:.3} (of the layer's change {e:.3}); decode vs ref {e:.3} ({e:.3}); prompt vs decode {e:.3}\n", .{ li, w.layers[j].mixer, w.layers[j].ffn, pr[0], pr[1], dr[0], dr[1], pd[1] });
++        try out.appendSlice(a, std.mem.sliceAsBytes(got));
++        try out.appendSlice(a, std.mem.sliceAsBytes(dec));
++        try out.appendSlice(a, ppicks);
++        try out.appendSlice(a, dpicks);
++    }
++    try std.Io.Dir.cwd().writeFile(gpu.io, .{ .sub_path = rest[2], .data = out.items });
++    check.pass("ling-exl3-layers: {d} layers ran on {d} rows, outputs in {s} (the parity numbers are the script's)", .{ n, T, rest[2] });
++}
+diff --git a/zig/tests/cuda/ling_ref_mla.zig b/zig/tests/cuda/ling_ref_mla.zig
+index fd855256b..f2cc45807 100644
+--- a/zig/tests/cuda/ling_ref_mla.zig
++++ b/zig/tests/cuda/ling_ref_mla.zig
+@@ -8,10 +8,12 @@ const Gpu = check.Gpu;
+ const Rig = qr.RigT;
+ const bf = qr.helpers.bfOf;
+ const latent = glm.latent;
++const ops = @import("ling_cuda").ops;
++var lk: *const ops.Kernels = undefined; // the tf_ling_* entries, loaded in run
+ 
+ const heads = 64;
+ const lw = 512;
+-const rw = latent.rope_width;
++const rw = ops.rope_width;
+ const kw = lw + rw;
+ const nope = 128;
+ const qk = nope + rw;
+@@ -43,14 +45,14 @@ fn sameSpan(name: []const u8, all: []const u8, got: []const u8, lo: usize, n: us
+ }
+ 
+ /// absorbQStrided (192-wide q heads into 576-wide qa rows) and expandV at dv 128 vs float64; row counts' bits.
+-fn projections(r: *Rig, set: glm.glue.Set) !void {
++fn projections(r: *Rig) !void {
+     const rows = 70;
+     const q = try r.bfs(rows * heads * qk, 1.0);
+     const wk = try r.bfs(heads * nope * lw, 0.05);
+     const dq = try r.dev(std.mem.sliceAsBytes(q));
+     const dwk = try r.dev(std.mem.sliceAsBytes(wk));
+     const qa = try r.zeros(rows * heads * kw * 2);
+-    try latent.absorbQStrided(set, r.s, dq, qk, dwk, qa, kw, rows, heads, nope, lw);
++    try ops.absorbQ(lk, r.s, dq, qk, dwk, qa, kw, rows, heads, nope, lw);
+     var want = try r.a.alloc(f64, rows * heads * lw);
+     var tol = try r.a.alloc(f64, rows * heads * lw);
+     const qd = try f64s(r, q);
+@@ -71,7 +73,7 @@ fn projections(r: *Rig, set: glm.glue.Set) !void {
+     for ([_][2]usize{ .{ 0, 1 }, .{ 37, 42 }, .{ 3, 67 } }) |span| {
+         const n = span[1] - span[0];
+         const o = try r.zeros(n * heads * kw * 2);
+-        try latent.absorbQStrided(set, r.s, dq + span[0] * heads * qk * 2, qk, dwk, o, kw, n, heads, nope, lw);
++        try ops.absorbQ(lk, r.s, dq + span[0] * heads * qk * 2, qk, dwk, o, kw, n, heads, nope, lw);
+         const got = try r.back(o, n * heads * kw * 2);
+         for (0..n * heads) |i| try check.sameBytes("absorb_q 128: rows of a narrower call equal the 70-row call's", got[i * kw * 2 ..][0 .. lw * 2], all[(span[0] * heads + i) * kw * 2 ..][0 .. lw * 2]);
+     }
+@@ -80,7 +82,7 @@ fn projections(r: *Rig, set: glm.glue.Set) !void {
+     const dol = try r.dev(std.mem.sliceAsBytes(ol));
+     const dwv = try r.dev(std.mem.sliceAsBytes(wv));
+     const vn = try r.zeros(rows * heads * dv * 2);
+-    try latent.expandV(set, r.s, dol, dwv, vn, rows, heads, dv, lw);
++    try ops.expandV(lk, r.s, dol, dwv, vn, rows, heads, dv, lw);
+     want = try r.a.alloc(f64, rows * heads * dv);
+     tol = try r.a.alloc(f64, rows * heads * dv);
+     const old = try f64s(r, ol);
+@@ -100,16 +102,16 @@ fn projections(r: *Rig, set: glm.glue.Set) !void {
+     for ([_][2]usize{ .{ 0, 1 }, .{ 37, 42 }, .{ 3, 67 } }) |span| {
+         const n = span[1] - span[0];
+         const o = try r.zeros(n * heads * dv * 2);
+-        try latent.expandV(set, r.s, dol + span[0] * heads * lw * 2, dwv, o, n, heads, dv, lw);
++        try ops.expandV(lk, r.s, dol + span[0] * heads * lw * 2, dwv, o, n, heads, dv, lw);
+         try sameSpan("expand_v 128: rows of a narrower call equal the 70-row call's", vall, try r.back(o, n * heads * dv * 2), span[0], heads * dv);
+     }
+     check.pass("absorb_q / expand_v at 128-wide heads: within float64 tolerance, every row count's bits equal", .{});
+ }
+ 
+ /// rope (q heads into qa, cache rows in place) at two positions vs float64 on fp32 angles; head gate vs float64.
+-fn ropeGate(r: *Rig, set: glm.glue.Set) !void {
++fn ropeGate(r: *Rig) !void {
+     const rows = 40;
+-    const freqs = latent.ropeFreqs(6000000);
++    const freqs = ops.ropeFreqs(6000000);
+     const dfreq = try r.dev(std.mem.asBytes(&freqs));
+     const q = try r.bfs(rows * heads * qk, 1.0);
+     const dq = try r.dev(std.mem.sliceAsBytes(q));
+@@ -118,8 +120,8 @@ fn ropeGate(r: *Rig, set: glm.glue.Set) !void {
+     for ([_]i32{ 1000, 261000 }) |p0| {
+         const at = try r.dev(std.mem.asBytes(&p0));
+         const qa = try r.zeros(rows * heads * kw * 2);
+-        const v: latent.RopeRows = .{ .x = dq + nope * 2, .x_row = heads * qk, .x_head = qk, .out = qa + lw * 2, .o_row = heads * kw, .o_head = kw };
+-        try latent.rope(set, r.s, v, rows, heads, at, dfreq);
++        const v: ops.RopeRows = .{ .x = dq + nope * 2, .x_row = heads * qk, .x_head = qk, .out = qa + lw * 2, .o_row = heads * kw, .o_head = kw };
++        try ops.rope(lk, r.s, v, rows, heads, at, dfreq);
+         const want = try r.a.alloc(f64, rows * heads * rw);
+         const tol = try r.a.alloc(f64, rows * heads * rw);
+         for (0..rows) |row| for (0..heads) |h| for (0..rw / 2) |i| {
+@@ -137,31 +139,18 @@ fn ropeGate(r: *Rig, set: glm.glue.Set) !void {
+         try within(r, try std.fmt.bufPrint(&name, "rope: 40 rows x 64 heads at {d} (GPT-J pairs, fp32 angles)", .{p0}), all, kw, lw, rw, want, tol);
+         const p1: i32 = p0 + 23;
+         const one = try r.zeros(heads * kw * 2);
+-        const v1: latent.RopeRows = .{ .x = dq + (23 * heads * qk + nope) * 2, .x_row = heads * qk, .x_head = qk, .out = one + lw * 2, .o_row = heads * kw, .o_head = kw };
+-        try latent.rope(set, r.s, v1, 1, heads, try r.dev(std.mem.asBytes(&p1)), dfreq);
++        const v1: ops.RopeRows = .{ .x = dq + (23 * heads * qk + nope) * 2, .x_row = heads * qk, .x_head = qk, .out = one + lw * 2, .o_row = heads * kw, .o_head = kw };
++        try ops.rope(lk, r.s, v1, 1, heads, try r.dev(std.mem.asBytes(&p1)), dfreq);
+         const got = try r.back(one, heads * kw * 2);
+         for (0..heads) |h| try check.sameBytes("rope: row 23 alone equals its row", got[(h * kw + lw) * 2 ..][0 .. rw * 2], all[((23 * heads + h) * kw + lw) * 2 ..][0 .. rw * 2]);
+         // a cache row's k_rope in place equals q's rope of the same values at the same position
+         const k = try r.dev(all[(23 * heads * kw) * 2 ..][0 .. kw * 2]);
+         @memcpy(all[(23 * heads * kw + lw) * 2 ..][0 .. rw * 2], std.mem.sliceAsBytes(q[(23 * heads) * qk + nope ..][0..rw]));
+         const kin = try r.dev(all[(23 * heads * kw) * 2 ..][0 .. kw * 2]);
+-        try latent.rope(set, r.s, .{ .x = kin + lw * 2, .x_row = kw, .x_head = 0, .out = kin + lw * 2, .o_row = kw, .o_head = 0 }, 1, 1, try r.dev(std.mem.asBytes(&p1)), dfreq);
++        try ops.rope(lk, r.s, .{ .x = kin + lw * 2, .x_row = kw, .x_head = 0, .out = kin + lw * 2, .o_row = kw, .o_head = 0 }, 1, 1, try r.dev(std.mem.asBytes(&p1)), dfreq);
+         try check.sameBytes("rope: a cache row in place equals the q rope", try r.back(kin, kw * 2), try r.back(k, kw * 2));
+     }
+-    const o = try r.bfs(rows * heads * dv, 1.0);
+-    const g = try r.a.alloc(f32, rows * (heads + 3));
+-    for (g) |*x| x.* = (r.rng.float(f32) * 2 - 1) * 12;
+-    const dov = try r.dev(std.mem.sliceAsBytes(o));
+-    try latent.headGate(set, r.s, dov, try r.dev(std.mem.sliceAsBytes(g)), heads + 3, rows, heads, dv);
+-    const want = try r.a.alloc(f64, rows * heads * dv);
+-    const tol = try r.a.alloc(f64, rows * heads * dv);
+-    for (want, tol, 0..) |*w, *t, i| {
+-        const sg = 1 / (1 + @exp(-@as(f64, g[(i / (heads * dv)) * (heads + 3) + (i / dv) % heads])));
+-        w.* = bf(o[i]) * sg;
+-        t.* = @abs(w.*) * std.math.pow(f64, 2, -8) + @abs(bf(o[i])) * 8 * u + 1e-30;
+-    }
+-    try within(r, "head gate: 40 rows x 64 heads x 128, g stride 67", try r.back(dov, rows * heads * dv * 2), dv, 0, dv, want, tol);
+-    check.pass("rope and head gate: within float64 tolerance, a row alone and a cache row in place equal", .{});
++    check.pass("rope: within float64 tolerance, a row alone and a cache row in place equal", .{});
+ }
+ 
+ /// float64 attention over 576-wide rows (scores) and their first 512 (values); bound as glm_ref_attn's, 576 + 8 terms.
+@@ -213,7 +202,7 @@ fn attend(r: *Rig, set: glm.glue.Set, qa: u64, cache: u64, pos: usize, first: us
+     const out = try r.zeros(rows * heads * lw * 2);
+     const p0: i32 = @intCast(pos);
+     const p: latent.Partials = .{ .po = try r.zeros(nch * rows * heads * lw * 4), .pm = try r.zeros(nch * rows * heads * 4), .pl = try r.zeros(nch * rows * heads * 4) };
+-    try latent.attentionRoped(set, r.s, qa + first * heads * kw * 2, cache, try r.dev(std.mem.asBytes(&p0)), p, out, try r.zeros(4), rows, heads, lw, nch, scale);
++    try ops.attention(lk, set, r.s, qa + first * heads * kw * 2, cache, try r.dev(std.mem.asBytes(&p0)), p, out, try r.zeros(4), rows, heads, lw, nch, scale);
+     return r.back(out, rows * heads * lw * 2);
+ }
+ 
+@@ -260,8 +249,10 @@ pub fn run(gpu: Gpu) !void {
+     defer mod.unload();
+     const ks = try glm.glue.Kernels.load(mod);
+     const set: glm.glue.Set = .{ .glue = &ks };
+-    try projections(&r, set);
+-    try ropeGate(&r, set);
++    const ling_ks = try ops.Kernels.load(mod);
++    lk = &ling_ks;
++    try projections(&r);
++    try ropeGate(&r);
+     try attention(&r, set);
+     check.pass("ling-mla: every check within {e:.3} of its float64 tolerance", .{r.worst});
+ }
+diff --git a/zig/tests/cuda/ling_route.zig b/zig/tests/cuda/ling_route.zig
+new file mode 100644
+index 000000000..21cbe2271
+--- /dev/null
++++ b/zig/tests/cuda/ling_route.zig
+@@ -0,0 +1,241 @@
++//! Ling's group-limited select (512 experts / 8 groups / keep 4 / top 8, and odd shapes) and SwiGLU limit vs float64.
++const std = @import("std");
++const cuda = @import("cuda");
++const check = @import("check.zig");
++const qr = @import("quant_ref_tests.zig");
++const ops = @import("ling_cuda").ops;
++const Gpu = check.Gpu;
++const Rig = qr.RigT;
++const bf = qr.helpers.bfOf;
++
++/// `ling-route`: groups and swigluLimit on the glm_glue image's tf_ling_* entries (seeded synthetic inputs).
++pub fn run(gpu: Gpu) !void {
++    var arena: std.heap.ArenaAllocator = .init(gpu.gpa);
++    defer arena.deinit();
++    var s = try cuda.Stream.init(gpu.d, false);
++    defer s.deinit();
++    var prng = std.Random.DefaultPrng.init(0x1196);
++    var r: Rig = .{ .gpu = gpu, .a = arena.allocator(), .s = s, .rng = prng.random() };
++    defer {
++        for (r.bufs.items) |*b| b.free();
++        r.bufs.deinit(gpu.gpa);
++    }
++    var mod = try cuda.Module.load(gpu.d, cuda.kernels.glm_glue);
++    defer mod.unload();
++    const lk = try ops.Kernels.load(mod);
++    try groups(&r, &lk);
++    try swigluLimit(&r, &lk);
++    check.pass("ling-route: every check within {e:.3} of its float64 tolerance", .{r.worst});
++}
++
++/// One routing problem: fp32 logits [rows][ne], fp32 bias, top_k of the `keep` best of `ng` groups, times `scale`.
++const Route = struct { rows: usize, ne: usize, top_k: usize, ng: usize, keep: usize, scale: f32 };
++
++/// The kernels' near ties: two choices (or group sums) this close in float64 may rank either way after fp32 rounding.
++const tie_expert = std.math.pow(f64, 2, -20);
++const tie_group = std.math.pow(f64, 2, -19);
++
++fn sigmoid(x: f32) f64 {
++    return 1 / (1 + @exp(-@as(f64, x)));
++}
++
++/// float64 rule: `keep` best top-2 group sums (or `forced`), then top_k in them, lower ids on ties; returns kept bits.
++fn refPick(choice: []const f64, q: Route, forced: ?u32, order: []usize, gs_out: []f64) u32 {
++    const gs = q.ne / q.ng;
++    var kept: u32 = if (q.ng == 1) 1 else 0;
++    if (q.ng > 1) {
++        for (0..q.ng) |g| {
++            var a: f64 = -std.math.inf(f64);
++            var b: f64 = -std.math.inf(f64);
++            for (choice[g * gs ..][0..gs]) |c| {
++                if (c > a) {
++                    b = a;
++                    a = c;
++                } else if (c > b) b = c;
++            }
++            gs_out[g] = a + b;
++        }
++        if (forced) |f| kept = f else for (0..q.keep) |_| {
++            var best: usize = q.ng;
++            for (0..q.ng) |g| if (kept >> @intCast(g) & 1 == 0 and (best == q.ng or gs_out[g] > gs_out[best])) {
++                best = g;
++            };
++            kept |= @as(u32, 1) << @intCast(best);
++        }
++    }
++    var taken: [512]bool = @splat(false);
++    for (order[0..q.top_k]) |*o| {
++        var best: usize = q.ne;
++        for (0..q.ne) |e| {
++            if (taken[e] or kept >> @intCast(e / gs) & 1 == 0) continue;
++            if (best == q.ne or choice[e] > choice[best]) best = e;
++        }
++        o.* = best;
++        taken[best] = true;
++    }
++    return kept;
++}
++
++/// The k-th and (k+1)-th best group sums' gap: below tie_group the kernel's kept set may legitimately differ.
++fn boundaryGap(gsc: []const f64, keep: usize) f64 {
++    var s: [32]f64 = undefined;
++    @memcpy(s[0..gsc.len], gsc);
++    std.mem.sort(f64, s[0..gsc.len], {}, std.sort.desc(f64));
++    return s[keep - 1] - s[keep];
++}
++
++const Tally = struct { rows: usize = 0, group_ties: usize = 0, expert_ties: usize = 0, widest: f64 = 0, worst: f64 = 0 };
++
++/// Kernel picks and weights for every row against the float64 rule; near ties counted, anything else fails.
++fn against(r: *Rig, q: Route, logits: []const f32, bias: []const f32, got_pick: []const i32, got_wts: []const f32) !Tally {
++    var t: Tally = .{ .rows = q.rows };
++    const choice = try r.a.alloc(f64, q.ne);
++    const score = try r.a.alloc(f64, q.ne);
++    const order = try r.a.alloc(usize, q.top_k);
++    var gsc: [32]f64 = undefined;
++    const slots = q.top_k + 1;
++    for (0..q.rows) |row| {
++        for (score, choice, logits[row * q.ne ..][0..q.ne], bias) |*s, *c, l, b| {
++            s.* = sigmoid(l);
++            c.* = s.* + b;
++        }
++        const kept = refPick(choice, q, null, order, gsc[0..q.ng]);
++        const gs = q.ne / q.ng;
++        var mine: u32 = 0;
++        for (got_pick[row * slots ..][0..q.top_k]) |id| mine |= @as(u32, 1) << @intCast(@as(usize, @intCast(id)) / gs);
++        if (mine & ~kept != 0) { // a pick outside the float64 groups: only a near tie at the group boundary may do that
++            const gap = boundaryGap(gsc[0..q.ng], q.keep);
++            try check.expect(gap <= tie_group, "row {d}: groups {b} picked where float64 keeps {b} (boundary gap {e})", .{ row, mine, kept, gap });
++            t.group_ties += 1;
++            t.widest = @max(t.widest, gap);
++            var f = mine;
++            var g: usize = 0;
++            while (@popCount(f) < q.keep) : (g += 1) if (kept >> @intCast(g) & 1 != 0) {
++                f |= @as(u32, 1) << @intCast(g);
++            };
++            _ = refPick(choice, q, f, order, gsc[0..q.ng]);
++        }
++        var total: f64 = 0;
++        for (got_pick[row * slots ..][0..q.top_k]) |id| total += score[@intCast(id)];
++        for (0..slots) |i| {
++            const id: usize = @intCast(got_pick[row * slots + i]);
++            const wt: f64 = got_wts[row * slots + i];
++            if (i == q.top_k) {
++                try check.expect(id == q.ne and wt == 1, "row {d}: the shared expert last at weight 1", .{row});
++                continue;
++            }
++            if (id != order[i]) {
++                const gap = @abs(choice[id] - choice[order[i]]);
++                try check.expect(gap <= tie_expert, "row {d} pick {d}: {d} where float64 ranks {d} (gap {e})", .{ row, i, id, order[i], gap });
++                t.expert_ties += 1;
++                t.widest = @max(t.widest, gap);
++            }
++            const want = score[id] / total * q.scale;
++            t.worst = @max(t.worst, @abs(wt - want) / (@abs(want) * std.math.pow(f64, 2, -16)));
++        }
++    }
++    return t;
++}
++
++fn f32s(r: *Rig, n: usize, lo: f32, hi: f32) ![]f32 {
++    const out = try r.a.alloc(f32, n);
++    for (out) |*v| v.* = lo + r.rng.float(f32) * (hi - lo);
++    return out;
++}
++
++const Out = struct { pick: []const i32, wts: []const f32 };
++
++fn runSelect(r: *Rig, lk: *const ops.Kernels, q: Route, logits: []const f32, bias: []const f32, norm: bool) !Out {
++    const n = q.rows * (q.top_k + 1);
++    const pick = try r.zeros(n * 4);
++    const wts = try r.zeros(n * 4);
++    try ops.select(lk, r.s, try r.dev(std.mem.sliceAsBytes(logits)), try r.dev(std.mem.sliceAsBytes(bias)), pick, wts, q.rows, q.top_k, q.ne, q.scale, norm, .{ .n = @intCast(q.ng), .keep = @intCast(q.keep) });
++    return .{ .pick = std.mem.bytesAsSlice(i32, @as([]align(4) u8, @alignCast(try r.back(pick, n * 4)))), .wts = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(try r.back(wts, n * 4)))) };
++}
++
++/// Rows built for exact ties: every group a copy of group 0 (all group sums tie), and a group whose top two are equal.
++fn tieRows(r: *Rig, q: Route, logits: []f32, bias: []f32) void {
++    const gs = q.ne / q.ng;
++    @memset(bias, 0);
++    for (0..q.rows) |row| {
++        const l = logits[row * q.ne ..][0..q.ne];
++        switch (row % 3) {
++            0 => for (0..q.ne) |e| {
++                l[e] = l[e % gs];
++            },
++            1 => { // equal pairs at 2.0 (one lane's in 6, two lanes' in 7) beat 2.2 + 0.0 only if the duplicate counts
++                for (l) |*v| v.* = -6 + r.rng.float(f32);
++                for (0..q.ng) |g| {
++                    l[g * gs + 3] = if (g >= 6) 2.0 else 2.2;
++                    l[g * gs + 35] = if (g == 6) 2.0 else 0.0;
++                    if (g == 7) l[g * gs + 7] = 2.0;
++                }
++            },
++            else => for (0..q.ne) |e| {
++                l[e] = if (e % 7 == 0) 1.0 else l[e];
++            },
++        }
++    }
++}
++
++/// Synthetic Ling-shaped routing (and a few odd shapes) against float64, plus exact-tie rows that must match exactly.
++pub fn groups(r: *Rig, set: *const ops.Kernels) !void {
++    const shapes = [_]Route{
++        .{ .rows = 300, .ne = 512, .top_k = 8, .ng = 8, .keep = 4, .scale = 2.5 },
++        .{ .rows = 300, .ne = 256, .top_k = 8, .ng = 8, .keep = 4, .scale = 2.5 }, // DeepSeek-V3's
++        .{ .rows = 100, .ne = 480, .top_k = 6, .ng = 12, .keep = 3, .scale = 1.0 }, // groups of 40 straddle the lanes
++        .{ .rows = 100, .ne = 512, .top_k = 8, .ng = 32, .keep = 1, .scale = 2.5 },
++        .{ .rows = 100, .ne = 512, .top_k = 8, .ng = 1, .keep = 1, .scale = 2.5 }, // one group: no group pass
++        .{ .rows = 100, .ne = 512, .top_k = 8, .ng = 8, .keep = 8, .scale = 2.5 }, // every group kept
++        .{ .rows = 100, .ne = 64, .top_k = 8, .ng = 32, .keep = 4, .scale = 2.5 }, // groups of two
++        .{ .rows = 100, .ne = 16, .top_k = 4, .ng = 8, .keep = 3, .scale = 1.0 }, // groups of two, the tiny config's experts
++        .{ .rows = 100, .ne = 16, .top_k = 4, .ng = 4, .keep = 2, .scale = 2.5 }, // the tiny config's routing
++    };
++    for (shapes) |q| for ([_]f32{ 0.001, 0.05 }) |bspread| {
++        const logits = try f32s(r, q.rows * q.ne, -6, 6);
++        const bias = try f32s(r, q.ne, -bspread, bspread);
++        const o = try runSelect(r, set, q, logits, bias, true);
++        const t = try against(r, q, logits, bias, o.pick, o.wts);
++        r.worst = @max(r.worst, t.worst);
++        std.debug.print("RESULT group select {d} rows, top {d} of {d} in {d} of {d} groups (bias +-{d}): weights at {e:.3} of 2^-16 relative, {d} group and {d} expert near ties (widest gap {e:.2})\n", .{ q.rows, q.top_k, q.ne, q.keep, q.ng, bspread, t.worst, t.group_ties, t.expert_ties, t.widest });
++        try check.expect(t.worst <= 1, "group select weights within 2^-16 of float64", .{});
++    };
++    const q: Route = .{ .rows = 30, .ne = 512, .top_k = 8, .ng = 8, .keep = 4, .scale = 2.5 };
++    const logits = try f32s(r, q.rows * q.ne, -6, 6);
++    const bias = try r.a.alloc(f32, q.ne);
++    tieRows(r, q, logits, bias);
++    const o = try runSelect(r, set, q, logits, bias, true);
++    const t = try against(r, q, logits, bias, o.pick, o.wts);
++    try check.expect(t.group_ties == 0 and t.expert_ties == 0, "exact-tie rows: {d} group and {d} expert swaps, want none", .{ t.group_ties, t.expert_ties });
++    check.pass("group select: picks follow the float64 rule (exact ties to the lower id, near ties counted), weights within 2^-16", .{});
++}
++
++/// Ling's swiglu at limit 0 (its unclamped layers) against float64 unclamped, and limit 10 differing where it clamps.
++pub fn swigluLimit(r: *Rig, lk: *const ops.Kernels) !void {
++    for ([_]usize{ 1024, 704 }) |w| {
++        const rows = 40;
++        const gu = try r.bfs(rows * 2 * w, 16.0);
++        const dgu = try r.dev(std.mem.sliceAsBytes(gu));
++        const out0 = try r.zeros(rows * w * 2);
++        const out10 = try r.zeros(rows * w * 2);
++        const xs = try r.zeros(rows * w / 64 * 4);
++        try ops.swiglu(lk, r.s, dgu, out0, xs, 0, rows, w);
++        try ops.swiglu(lk, r.s, dgu, out10, xs, 10, rows, w);
++        const raw0 = try r.back(out0, rows * w * 2);
++        const raw10 = try r.back(out10, rows * w * 2);
++        var most: f64 = 0;
++        var clamped: usize = 0;
++        for (0..rows) |m| for (0..w) |d| {
++            const g = bf(gu[m * 2 * w + d]);
++            const u = bf(gu[m * 2 * w + w + d]);
++            const want = g / (1 + @exp(-g)) * u;
++            const got = bf(std.mem.bytesToValue(u16, raw0[2 * (m * w + d) ..][0..2]));
++            most = @max(most, @abs(got - want) / (@abs(want) * std.math.pow(f64, 2, -7) + 1e-30));
++            if (!std.mem.eql(u8, raw0[2 * (m * w + d) ..][0..2], raw10[2 * (m * w + d) ..][0..2])) clamped += 1;
++        };
++        r.worst = @max(r.worst, most);
++        std.debug.print("RESULT swiglu width {d}, limit 0: unclamped float64 at {e:.3} of 2^-7 relative; limit 10 changes {d} of {d}\n", .{ w, most, clamped, rows * w });
++        try check.expect(most <= 1 and clamped > 0, "swiglu limit 0 is unclamped, limit 10 clamps", .{});
++    }
++    check.pass("Ling swiglu: the limit is per call, 0 runs unclamped (as the experts' 0), 10 clamps", .{});
++}
+diff --git a/zig/tests/cuda/ling_synth.zig b/zig/tests/cuda/ling_synth.zig
+index 7dde1b698..82cf683aa 100644
+--- a/zig/tests/cuda/ling_synth.zig
++++ b/zig/tests/cuda/ling_synth.zig
+@@ -75,6 +75,7 @@ const Out = struct {
+                 .bf16 => o.add(name, .bf16, &.{ n, k }, try o.bf16s(n * k, -s, s)),
+                 .fp8_block128 => o.add(name, .f8_e4m3, &.{ n, k }, try o.codes(n * k, .e4m3)),
+                 .nvfp4 => o.add(name, .u8, &.{ n, k / 2 }, try o.codes(n * k / 2, .any)),
++                .exl3 => error.Exl3Synth, // exllamav3 writes EXL3 packs
+             };
+             const tail = name[module.len + 1 ..];
+             if (std.mem.eql(u8, tail, "weight_scale_inv")) return o.add(name, .f32, &.{ (n + 127) / 128, k / 128 }, try o.f32s((n + 127) / 128 * (k / 128), s / 4, s / 2));
+diff --git a/zig/tests/cuda/ling_weights_tests.zig b/zig/tests/cuda/ling_weights_tests.zig
+index 185ecb6ba..94cf3df13 100644
+--- a/zig/tests/cuda/ling_weights_tests.zig
++++ b/zig/tests/cuda/ling_weights_tests.zig
+@@ -72,6 +72,7 @@ pub const Mat = struct {
+                 const l = try core.nvfp4.Linear.read(ck, module);
+                 break :blk .{ .f = f, .n = n, .k = k, .w = l.codes, .s = l.scales, .global = l.global };
+             },
++            .exl3 => error.Exl3Decode, // EXL3 layers are checked against exllamav3 (ling-exl3-layers), not here
+         };
+     }
+ 
+@@ -83,6 +84,7 @@ pub const Mat = struct {
+                 const byte = m.w[row * (m.k / 2) + col / 2];
+                 break :blk h.e2m1Of(if (col & 1 == 0) byte & 0xF else byte >> 4) * h.e4m3Of(m.s[row * (m.k / 16) + col / 16]) * m.global;
+             },
++            .exl3 => unreachable, // read() refuses EXL3
+         };
+     }
+ };
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index 8d6325bcc..cf75cde57 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -285,7 +285,7 @@ const usage =
+     \\  glm-fp8g-shares          block-FP8 TP shares packed as GLM's loader packs them, on the lane, against FP64 of the cut
+     \\  aot-fallback <dir>        a launch's 1 from the runtime-parameter variant: the folded variant's bits (#1003)
+     \\
+-;
++++ @import("ling_cmds.zig").usage;
+ 
+ pub fn main(init: std.process.Init) !u8 {
+     const args = try init.minimal.args.toSlice(init.arena.allocator());
+@@ -331,6 +331,7 @@ fn compileContractGlue() !void {
+ }
+ 
+ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
++    if (try @import("ling_cmds.zig").run(gpu, cmd, rest)) return;
+     if (std.mem.eql(u8, cmd, "qwen4")) {
+         if (rest.len != 0) return error.Qwen4DeviceArguments;
+         return @import("qwen4_tests.zig").run(gpu);
+-- 
+2.53.0
+

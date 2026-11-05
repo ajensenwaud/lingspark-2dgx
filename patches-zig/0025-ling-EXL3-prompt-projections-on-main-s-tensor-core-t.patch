@@ -1,0 +1,50 @@
+From 808b34611af5a445cc846324e36348c2012a8898 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 21:45:53 +1100
+Subject: [PATCH 25/26] ling: EXL3 prompt projections on main's tensor-core
+ tiles by default (TF_LING_PROMPT_TILES=0 turns them off); checked: 16K
+ rel L2 3.4e-2, greedy 9/9, cut == whole, resumed == fresh
+
+---
+ zig/src/families/ling/graph.zig | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/families/ling/graph.zig b/zig/src/families/ling/graph.zig
+index c35d7622f..ef77ce710 100644
+--- a/zig/src/families/ling/graph.zig
++++ b/zig/src/families/ling/graph.zig
+@@ -37,7 +37,7 @@ pub const Modules = struct {
+         dense: cuda.exl3.Dense,
+         experts: cuda.exl3_experts.Experts,
+         grouped: cuda.exl3_grouped.Grouped,
+-        tiles: ?cuda.exl3.Dense, // TF_LING_PROMPT_TILES=1: prompt rows' projections on the tensor-core tiles
++        tiles: ?cuda.exl3.Dense, // prompt rows' projections on the tensor-core tiles (TF_LING_PROMPT_TILES=0: off)
+     };
+ 
+     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
+@@ -77,10 +77,11 @@ pub const Modules = struct {
+         x3.experts = try cuda.exl3_experts.Experts.load(d);
+         x3.grouped = .{ .d = d, .kernels = &x3.experts };
+         x3.tiles = null;
+-        if (std.c.getenv("TF_LING_PROMPT_TILES")) |v| if (std.mem.eql(u8, std.mem.span(v), "1")) {
++        const tiles_off = if (std.c.getenv("TF_LING_PROMPT_TILES")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
++        if (!tiles_off) {
+             x3.tiles = try cuda.exl3.Dense.load(d);
+             x3.tiles.?.implementation = .tiles;
+-        };
++        }
+         m.x3 = x3;
+         return m;
+     }
+@@ -108,7 +109,7 @@ pub const Modules = struct {
+         return .{ .lane = &m.lane, .nvfp4_prompt = &m.prompt, .exl3 = &m.x3.dense };
+     }
+ 
+-    /// linear(), but EXL3 prompt rows on main's tensor-core tiles (exl3.md, Prompts) when TF_LING_PROMPT_TILES=1.
++    /// linear(), but EXL3 prompt rows on main's tensor-core tiles (exl3.md, Prompts), unless TF_LING_PROMPT_TILES=0.
+     pub fn promptLinear(m: *const Modules) cuda.qlinear.Linear {
+         return .{ .lane = &m.lane, .nvfp4_prompt = &m.prompt, .exl3 = if (m.x3.tiles != null) &m.x3.tiles.? else &m.x3.dense };
+     }
+-- 
+2.53.0
+

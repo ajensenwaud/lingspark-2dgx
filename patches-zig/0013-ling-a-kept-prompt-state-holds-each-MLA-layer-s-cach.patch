@@ -1,0 +1,114 @@
+From 9c5ce4a7a0e0eeb98716c5d285934a3c61ea4789 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 02:36:07 +1100
+Subject: [PATCH 13/26] ling: a kept prompt state holds each MLA layer's cache
+ rows below its position, not the whole capacity (the rows past it are never
+ read); snap_bytes sizes a state by its mark. At 1M a 3K-token state goes from
+ 1.2 GiB to 73 MiB on the 8-layer trial pack
+
+---
+ zig/src/families/ling/engine.zig | 38 ++++++++++++++++++++++++--------
+ zig/src/families/ling/native.zig |  5 ++---
+ 2 files changed, 31 insertions(+), 12 deletions(-)
+
+diff --git a/zig/src/families/ling/engine.zig b/zig/src/families/ling/engine.zig
+index 900692cd1..e758e2a2d 100644
+--- a/zig/src/families/ling/engine.zig
++++ b/zig/src/families/ling/engine.zig
+@@ -19,6 +19,8 @@ pub const window_rows = fw.window_rows;
+ /// A shared verify's most rows and streams.
+ pub const shared_rows = 64;
+ pub const max_shared = 8;
++/// One MLA cache row's bytes: a kept state holds each layer's rows below its position.
++const cache_row = @import("state.zig").cache_width * 2;
+ /// The MTP layer's chain at most.
+ pub const max_drafts = head.max_drafts;
+ 
+@@ -464,9 +466,27 @@ pub const Engine = struct {
+         for (out[0..rows], got[0..rows]) |*o, p| o.* = p[1];
+     }
+ 
+-    /// Bytes one kept state takes: the sequence's arenas.
+-    pub fn stateBytes(e: *const Engine) u64 {
+-        return e.seqBytes();
++    /// Bytes one state kept at `at` takes: the KDA part whole, each MLA layer's rows below `at`, the MTP head's alike.
++    pub fn stateBytes(e: *const Engine, at: usize) u64 {
++        const q = e.cur;
++        return keptBytes(&q.st, at) + if (q.hd) |h| keptBytes(&h, at + 1) else 0;
++    }
++
++    /// A State's bytes before its MLA cache, then `at` rows of each layer's cache (later rows are never read).
++    fn keptBytes(st: *const fw.State, at: usize) usize {
++        return (st.cache - st.arena.buf.ptr) + st.mla_layers * at * cache_row;
++    }
++
++    /// The State into `kept` (out) or back from it: the part before the cache, then each MLA layer's first `at` rows.
++    fn keptCopy(e: *const Engine, st: *const fw.State, kept: u64, at: usize, out: bool) !void {
++        const pre = st.cache - st.arena.buf.ptr;
++        try (if (out) e.copy(kept, st.arena.buf.ptr, pre) else e.copy(st.arena.buf.ptr, kept, pre));
++        const rows = at * cache_row;
++        if (rows == 0) return;
++        for (0..st.mla_layers) |mi| {
++            const dst = kept + pre + mi * rows;
++            try (if (out) e.copy(dst, st.cacheAt(mi), rows) else e.copy(st.cacheAt(mi), dst, rows));
++        }
+     }
+ 
+     /// A copy of the bound sequence's state under a new id (the pass standing at a mark).
+@@ -474,15 +494,15 @@ pub const Engine = struct {
+         const q = e.cur;
+         if (q.st.pending != 0 or (q.hd != null and q.in_head != 0)) return error.NotCommitted;
+         try e.send(.keep_state, .{ .kind = 0, .a = e.next_snap }, &.{});
+-        var buf = try cuda.DeviceBuffer.alloc(e.d, q.st.arena.buf.len);
++        var buf = try cuda.DeviceBuffer.alloc(e.d, keptBytes(&q.st, q.st.pos));
+         errdefer if (weights.drains(e.stream)) buf.free(); // else leaked: the copy into it may be queued
+-        try e.copy(buf.ptr, q.st.arena.buf.ptr, buf.len);
++        try e.keptCopy(&q.st, buf.ptr, q.st.pos, true);
+         var hd: ?cuda.DeviceBuffer = null;
+         errdefer if (hd) |*x| if (weights.drains(e.stream)) x.free();
+         if (q.hd) |h| {
+             if (q.in_head != 0) return error.NotCommitted;
+-            hd = try cuda.DeviceBuffer.alloc(e.d, h.arena.buf.len);
+-            try e.copy(hd.?.ptr, h.arena.buf.ptr, h.arena.buf.len);
++            hd = try cuda.DeviceBuffer.alloc(e.d, keptBytes(&h, h.pos));
++            try e.keptCopy(&h, hd.?.ptr, h.pos, true);
+         }
+         try e.stream.synchronize();
+         const cur = try e.gpa.dupe(u1, q.st.cur);
+@@ -497,13 +517,13 @@ pub const Engine = struct {
+     pub fn restoreState(e: *Engine, id: u64) !void {
+         const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
+         const q = e.cur;
+-        try e.copy(q.st.arena.buf.ptr, s.buf.ptr, s.buf.len);
++        try e.keptCopy(&q.st, s.buf.ptr, s.pos, false);
+         @memcpy(q.st.cur, s.cur);
+         q.st.pending = 0;
+         q.st.prompt = false;
+         try q.st.setPos(e.stream, s.pos);
+         if (q.hd) |*h| {
+-            try e.copy(h.arena.buf.ptr, (s.hd orelse return error.NoKeptState).ptr, h.arena.buf.len);
++            try e.keptCopy(h, (s.hd orelse return error.NoKeptState).ptr, s.hd_pos, false);
+             h.pending = 0;
+             try h.setPos(e.stream, s.hd_pos);
+         }
+diff --git a/zig/src/families/ling/native.zig b/zig/src/families/ling/native.zig
+index 0bf9e74e4..0ce9077cf 100644
+--- a/zig/src/families/ling/native.zig
++++ b/zig/src/families/ling/native.zig
+@@ -132,11 +132,10 @@ fn release(own: *Owned) void {
+     own.gpa.destroy(own);
+ }
+ 
+-/// Bytes a state takes at any position: the sequence's arena.
++/// Bytes a state kept at `at` takes: its MLA rows below `at`, the rest of the sequence's arena whole.
+ pub fn snap_bytes(ptr: *anyopaque, at: u32) u64 {
+-    _ = at;
+     const e: *engine.Engine = @ptrCast(@alignCast(ptr));
+-    return e.stateBytes();
++    return e.stateBytes(at);
+ }
+ 
+ /// The prompt pass stands at `at` (a mark): copy the state there under a new id.
+-- 
+2.53.0
+

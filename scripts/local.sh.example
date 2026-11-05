@@ -1,0 +1,9 @@
+# Copy to scripts/local.sh (gitignored) and fill in. Any setting in scripts/config.sh can be overridden here.
+HEAD=spark-a                 # this node (rank 0, serves the API)
+WORKER=user@192.0.2.2        # the other node as ssh reaches it over the CX7 link (key login, no password prompt)
+MASTER=192.0.2.1             # this node's CX7 address
+SRC_NODE=spark-b             # only for making the pack yourself: the node that holds the FP8 source
+# NCCL over the CX7 link (ibdev2netdev lists the RoCE device and its interface)
+NCCL_IFNAME=enp1s0f0np0
+NCCL_HCA=rocep1s0f0
+NCCL_GID=3

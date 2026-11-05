@@ -1,0 +1,268 @@
+From 1a1c49c59dc9f3e86bb16587b00c680170b5165a Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 04:15:58 +1100
+Subject: [PATCH 14/26] ling: one attention-partials area shared by every
+ Buffers (prompt, verify window, shared verify, MTP rows), sized once for the
+ widest; saves 3 x 1.88 GiB a rank at 1M on the full pack at TP=2, results
+ unchanged
+
+Each fw.Buffers held its own MLA attention partials (po/pm/pl, nch x ar x heads x (2048 + 8) B, capped at att_bytes
+2 GiB). The engine had four: bp (prompt chunks), bd (one stream's verify window, also keep's commit), bs (shared
+verify) and the MTP head's bm. They now point at one state.Att, allocated once by Engine.init for the largest rows
+any of them takes at the capacity (att.ar = max attRows; nch is the same for all). Each Buffers keeps its own nch
+and ar, so every attention call is cut into the same row blocks and launched with the same arguments as before;
+only the partials' base address moves (256-byte aligned as before). A standalone Buffers (checks) passes null and
+keeps its own partials.
+
+Why no two of them can hold live partials at once (code reading):
+- The partials carry nothing between calls. ops.attention launches tf_ling_chunks_r16 then tf_glm_merge on the same
+  stream. The chunk kernel writes po/pm/pl for every (chunk c < nch, row r < rows, head h < heads) it is launched
+  over, live chunk or not (no early return: an empty chunk stores m = -inf, l = 0), and the merge reads exactly
+  that set into b.ol. block_mla.zig is the only user of b.partials.
+- Every launch of every Buffers goes on the engine's one in-order stream (Engine.stream): prefill/chunkRun (bp,
+  and the MTP absorb on bp after the main stack), verify and keep (bd), verifyShared (bs: concurrent lanes' windows
+  become ONE forward, segments in row order, attention per segment one after another), draft (bm: absorb and the
+  chained drafts, one after another). The MTP head's Graph is built on the same stream. No other stream or thread
+  launches forwards: the lanes backend calls the Engine serially (it has one bound sequence, e.cur), and TP rank 1
+  replays rank 0's steps through its own Engine on its own single stream. Weight loading uses the stream only
+  before the Buffers exist. So call N's merge completes before call N+1's chunk kernel starts, whichever Buffers
+  either belongs to. Ling has no CUDA graph capture (native.zig: no captured set), so no replay can reorder them.
+- Verify windows: verify then keep on bd, the next verify or draft after; a draft's bm forwards come after the
+  verify that produced its hidden rows (rows_at / hold point into bd/bs/bp's normed rows, not the partials).
+Hence all four can share; none had to stay separate.
+
+Checks (TP=1, against the previous build e69d70d3): the Ling regression chain (16
+commands) plus ling-lanes --mtp (bf16, fp8) and ling-init-faults --mtp --every 3, all EXIT 0 on both builds;
+served ids and routing picks (ling-lanes, plain and --mtp, bf16 and fp8) and ling-exl3-layers' layer outputs
+byte-equal; every RESULT/PASS line identical except the fault harness's call counts (+2 driver calls, +1 failure
+point: the new allocation and its zero fill).
+---
+ zig/src/families/ling/engine.zig      | 14 ++++++----
+ zig/src/families/ling/forward.zig     |  1 +
+ zig/src/families/ling/mtp.zig         |  4 +--
+ zig/src/families/ling/state.zig       | 40 ++++++++++++++++++++++++---
+ zig/tests/cuda/ling_exl3_layers.zig   |  4 +--
+ zig/tests/cuda/ling_forward_synth.zig |  4 +--
+ zig/tests/cuda/ling_lanes_bytes.zig   |  4 +--
+ 7 files changed, 54 insertions(+), 17 deletions(-)
+
+diff --git a/zig/src/families/ling/engine.zig b/zig/src/families/ling/engine.zig
+index e758e2a2d..0eef8a68e 100644
+--- a/zig/src/families/ling/engine.zig
++++ b/zig/src/families/ling/engine.zig
+@@ -70,6 +70,7 @@ pub const Engine = struct {
+     main: weights.Weights, // a view of w: the backbone layers alone
+     g: fw.Graph,
+     mtp: ?head.Head = null,
++    att: fw.Att, // the attention partials bp, bd, bs and the MTP layer's bm share: one forward at a time, one stream
+     bp: fw.Buffers, // prompt chunks
+     bd: fw.Buffers, // one stream's verify window
+     bs: fw.Buffers, // shared verify windows
+@@ -105,7 +106,7 @@ pub const Engine = struct {
+         const mtp = o.mtp and c.mtp > 0;
+         const e = try gpa.create(Engine);
+         errdefer gpa.destroy(e);
+-        e.* = .{ .gpa = gpa, .d = d, .c = c, .m = undefined, .stream = undefined, .w = undefined, .main = undefined, .g = undefined, .bp = undefined, .bd = undefined, .bs = undefined, .smp = undefined, .pairs = undefined, .capacity = o.capacity, .chunk = o.prompt_rows };
++        e.* = .{ .gpa = gpa, .d = d, .c = c, .m = undefined, .stream = undefined, .w = undefined, .main = undefined, .g = undefined, .att = undefined, .bp = undefined, .bd = undefined, .bs = undefined, .smp = undefined, .pairs = undefined, .capacity = o.capacity, .chunk = o.prompt_rows };
+         e.m = try fw.Modules.load(d, ctx);
+         errdefer e.m.deinit();
+         e.stream = try cuda.Stream.init(d, false);
+@@ -126,20 +127,22 @@ pub const Engine = struct {
+         e.g = try fw.Graph.init(gpa, d, &e.m, e.stream, &e.main);
+         errdefer e.g.drop(weights.drains(e.stream)); // as e.w
+         e.g.tp = o.group;
++        e.att = try fw.Att.init(d, &e.w, &.{ o.prompt_rows, window_rows, shared_rows }, o.capacity); // bm: window_rows
++        errdefer e.att.deinit();
+         if (mtp) {
+             e.mtp = @as(head.Head, undefined);
+-            e.mtp.?.init(gpa, d, &e.m, e.stream, &e.w, o.prompt_rows, o.capacity) catch |err| {
++            e.mtp.?.init(gpa, d, &e.m, e.stream, &e.w, o.prompt_rows, o.capacity, &e.att) catch |err| {
+                 e.mtp = null;
+                 return err;
+             };
+         }
+         errdefer if (e.mtp) |*h| h.deinit();
+         if (e.mtp) |*h| h.g.tp = o.group;
+-        e.bp = try fw.Buffers.init(d, &e.m, &e.w, o.prompt_rows, true, o.capacity);
++        e.bp = try fw.Buffers.init(d, &e.m, &e.w, o.prompt_rows, true, o.capacity, &e.att);
+         errdefer e.bp.deinit();
+-        e.bd = try fw.Buffers.init(d, &e.m, &e.w, window_rows, false, o.capacity);
++        e.bd = try fw.Buffers.init(d, &e.m, &e.w, window_rows, false, o.capacity, &e.att);
+         errdefer e.bd.deinit();
+-        e.bs = try fw.Buffers.init(d, &e.m, &e.w, shared_rows, false, o.capacity);
++        e.bs = try fw.Buffers.init(d, &e.m, &e.w, shared_rows, false, o.capacity, &e.att);
+         errdefer e.bs.deinit();
+         e.smp = try sampler.Sampler.init(d, c.vocab, window_rows);
+         errdefer e.smp.deinit();
+@@ -179,6 +182,7 @@ pub const Engine = struct {
+         e.bd.deinit();
+         e.bp.deinit();
+         if (e.mtp) |*h| h.deinit();
++        e.att.deinit();
+         e.g.deinit();
+         e.w.deinit();
+         e.stream.deinit();
+diff --git a/zig/src/families/ling/forward.zig b/zig/src/families/ling/forward.zig
+index 6baa929be..b323ed148 100644
+--- a/zig/src/families/ling/forward.zig
++++ b/zig/src/families/ling/forward.zig
+@@ -13,6 +13,7 @@ pub const Seg = block_kda.Seg;
+ pub const Modules = graph.Modules;
+ pub const Graph = graph.Graph;
+ pub const Buffers = state.Buffers;
++pub const Att = state.Att;
+ pub const State = state.State;
+ pub const window_rows = state.window_rows;
+ pub const cache_width = state.cache_width;
+diff --git a/zig/src/families/ling/mtp.zig b/zig/src/families/ling/mtp.zig
+index a94a4a7d8..413ca2b69 100644
+--- a/zig/src/families/ling/mtp.zig
++++ b/zig/src/families/ling/mtp.zig
+@@ -18,7 +18,7 @@ pub const Head = struct {
+     cat: cuda.DeviceBuffer, // bf16 [rows][2 hidden]: enorm(embed(next)) | hnorm(hidden)
+ 
+     /// In place (the graph points at `view`); `w` holds the MTP layer last; cat rows for `rows` (the prompt chunk).
+-    pub fn init(h: *Head, gpa: std.mem.Allocator, d: *const cuda.Driver, m: *const fw.Modules, s: cuda.Stream, w: *const weights.Weights, rows: usize, capacity: usize) !void {
++    pub fn init(h: *Head, gpa: std.mem.Allocator, d: *const cuda.Driver, m: *const fw.Modules, s: cuda.Stream, w: *const weights.Weights, rows: usize, capacity: usize, att: *const fw.Att) !void {
+         const c = &w.config;
+         const mtp = w.mtp orelse return error.NoMtpLayer;
+         const last = w.layers[w.layers.len - 1];
+@@ -29,7 +29,7 @@ pub const Head = struct {
+         h.view.norm = mtp.norm; // final_layernorm before the shared lm_head
+         h.g = try fw.Graph.init(gpa, d, m, s, &h.view);
+         errdefer h.g.deinit();
+-        h.bm = try fw.Buffers.init(d, m, w, fw.window_rows, false, capacity);
++        h.bm = try fw.Buffers.init(d, m, w, fw.window_rows, false, capacity, att); // the engine's partials area
+         errdefer h.bm.deinit();
+         h.cat = try cuda.DeviceBuffer.alloc(d, @max(rows, fw.window_rows) * 2 * @as(usize, c.hidden) * 2);
+     }
+diff --git a/zig/src/families/ling/state.zig b/zig/src/families/ling/state.zig
+index daa9e5745..8435a1d8b 100644
+--- a/zig/src/families/ling/state.zig
++++ b/zig/src/families/ling/state.zig
+@@ -19,6 +19,35 @@ pub fn attRows(rows: usize, nch: usize, heads: usize) usize {
+     const per = nch * heads * (512 * 4 + 8);
+     return @max(1, @min(@min(rows, att_rows), att_bytes / per));
+ }
++
++/// The attention partials' bytes (po, pm, pl) for `ar` rows a call over `nch` chunks of `heads` heads.
++fn partialBytes(nch: usize, ar: usize, heads: usize) [3]usize {
++    return .{ nch * ar * heads * 512 * 4, nch * ar * heads * 4, nch * ar * heads * 4 };
++}
++
++/// One partials area all an engine's Buffers share: each attention call writes all its merge reads, on one stream.
++pub const Att = struct {
++    arena: Arena,
++    partials: latent.Partials,
++    nch: usize,
++    ar: usize, // the most rows one attention call of any sharing Buffers takes
++
++    /// Sized once for the widest of `rows` (each sharing Buffers' rows) at `capacity`.
++    pub fn init(d: *const cuda.Driver, w: *const weights.Weights, rows: []const usize, capacity: usize) !Att {
++        const heads: usize = w.config.mla_heads;
++        const nch = latent.chunksFor(capacity);
++        var ar: usize = 1;
++        for (rows) |r| ar = @max(ar, attRows(r, nch, heads));
++        var p: [3]u64 = undefined;
++        const a = try Arena.init(d, &partialBytes(nch, ar, heads), &p);
++        return .{ .arena = a, .partials = .{ .po = p[0], .pm = p[1], .pl = p[2] }, .nch = nch, .ar = ar };
++    }
++
++    pub fn deinit(a: *Att) void {
++        a.arena.buf.free();
++        a.* = undefined;
++    }
++};
+ /// MLA's cache row: the 512-wide latent, then the 64 roped key columns.
+ pub const cache_width = 512 + graph.ops.rope_width;
+ /// kv_a's output row: the cache width, or the 640 an EXL3 pack pads it to.
+@@ -123,7 +152,8 @@ pub const Buffers = struct {
+     logits: u64, // bf16 [rows][vocab]
+     xg: u64, // TP: bf16 [world][rows][hidden] gathered partials, or the head's [rows][vocab / world] then [world][..]
+ 
+-    pub fn init(d: *const cuda.Driver, m: *const graph.Modules, w: *const weights.Weights, rows: usize, prompt: bool, capacity: usize) !Buffers {
++    /// `att`: the engine's shared partials area (null: the scratch's own, as a check's standalone Buffers).
++    pub fn init(d: *const cuda.Driver, m: *const graph.Modules, w: *const weights.Weights, rows: usize, prompt: bool, capacity: usize, att: ?*const Att) !Buffers {
+         const c = &w.config;
+         const D: usize = c.hidden;
+         const H: usize = c.kda_heads;
+@@ -140,6 +170,8 @@ pub const Buffers = struct {
+         };
+         const nch = latent.chunksFor(capacity);
+         const ar = attRows(rows, nch, HM);
++        if (att) |x| if (x.nch != nch or x.ar < ar) return error.AttScratch;
++        const pb: [3]usize = if (att != null) .{ 0, 0, 0 } else partialBytes(nch, ar, HM); // shared: none of its own
+         const hist = if (pairs > cuda.grouped.small) (pairs + cuda.grouped.small - 1) / cuda.grouped.small * (E + 1) else 1;
+         const sizes = [_]usize{
+             rows * 4,                                        rows * D * 2,                   rows * D * 2,                                                                                             rows * D * 2,
+@@ -148,8 +180,8 @@ pub const Buffers = struct {
+             rows * n * 2,                                    rows * n * 4,                   rows * H * 4,                                                                                             rows * n * 4,
+             rows * n * 2,                                    rows * ql * 2,                  rows * ql * 2,                                                                                            rows * HM * c.qkDim() * 2,
+             rows * kv_rows * 2,                              rows * cache_width * 2,         rows * HM * cache_width * 2,                                                                              rows * HM * 512 * 2,
+-            rows * HM * c.v_dim * 2,                         rows * HM * 2,                  nch * ar * HM * 512 * 4,                                                                                  nch * ar * HM * 4,
+-            nch * ar * HM * 4,                               4,                              8,                                                                                                        rows * 2 * width * 2,
++            rows * HM * c.v_dim * 2,                         rows * HM * 2,                  pb[0],                                                                                                    pb[1],
++            pb[2],                                           4,                              8,                                                                                                        rows * 2 * width * 2,
+             rows * width * 2,                                rows * (width / 64 + 1) * 4,    rows * E * 4,                                                                                             glue_router_ks * rows * E * 4,
+             pairs * 4,                                       pairs * 4,                      pairs * 4,                                                                                                cuda.grouped.maxItems(pairs, E + 1, 16) * 12,
+             8,                                               pairs * 4,                      hist * 4,                                                                                                 pairs * c.moe_inter * 2,
+@@ -184,7 +216,7 @@ pub const Buffers = struct {
+             .ol = p[23],
+             .vn = p[24],
+             .g = p[25],
+-            .partials = .{ .po = p[26], .pm = p[27], .pl = p[28] },
++            .partials = if (att) |x| x.partials else .{ .po = p[26], .pm = p[27], .pl = p[28] },
+             .dummy = p[29],
+             .at = p[30],
+             .gu = p[31],
+diff --git a/zig/tests/cuda/ling_exl3_layers.zig b/zig/tests/cuda/ling_exl3_layers.zig
+index c541538c2..db8161684 100644
+--- a/zig/tests/cuda/ling_exl3_layers.zig
++++ b/zig/tests/cuda/ling_exl3_layers.zig
+@@ -109,9 +109,9 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+     }
+     var r: Rig = .{ .gpu = gpu, .a = a, .s = s, .m = &m, .g = &g };
+     defer r.deinit();
+-    var pb = try F.Buffers.init(gpu.d, &m, &w, T, true, T + 8);
++    var pb = try F.Buffers.init(gpu.d, &m, &w, T, true, T + 8, null);
+     defer pb.deinit();
+-    var db = try F.Buffers.init(gpu.d, &m, &w, F.window_rows, false, T + 8);
++    var db = try F.Buffers.init(gpu.d, &m, &w, F.window_rows, false, T + 8, null);
+     defer db.deinit();
+     const top: usize = w.config.topk;
+     const slots = top + 1;
+diff --git a/zig/tests/cuda/ling_forward_synth.zig b/zig/tests/cuda/ling_forward_synth.zig
+index 73a927ad0..81bdcd800 100644
+--- a/zig/tests/cuda/ling_forward_synth.zig
++++ b/zig/tests/cuda/ling_forward_synth.zig
+@@ -98,9 +98,9 @@ pub fn run(gpu: check.Gpu, dir: []const u8, ref_path: []const u8, picks_out: ?[]
+     try check.expect(ref.V == V and T > P + 8 - 1 and ref.top == c.topk, "reference: {d} tokens of vocabulary {d}, top {d}", .{ T, ref.V, ref.top });
+     var r: Rig = .{ .gpu = gpu, .a = a, .s = s, .m = &m, .g = &g };
+     defer r.deinit();
+-    var pb = try F.Buffers.init(gpu.d, &m, &w, 2 * P, true, 128);
++    var pb = try F.Buffers.init(gpu.d, &m, &w, 2 * P, true, 128, null);
+     defer pb.deinit();
+-    var db = try F.Buffers.init(gpu.d, &m, &w, 2 * F.window_rows, false, 128);
++    var db = try F.Buffers.init(gpu.d, &m, &w, 2 * F.window_rows, false, 128, null);
+     defer db.deinit();
+     var nm: usize = 0;
+     for (w.layers) |l| nm += @intFromBool(l.ffn == .moe);
+diff --git a/zig/tests/cuda/ling_lanes_bytes.zig b/zig/tests/cuda/ling_lanes_bytes.zig
+index 4716e3c60..890ae3f34 100644
+--- a/zig/tests/cuda/ling_lanes_bytes.zig
++++ b/zig/tests/cuda/ling_lanes_bytes.zig
+@@ -171,9 +171,9 @@ fn scratchRefusal(c: *Cover, e: *Engine, prompt: []const u32, w: []const u32) !v
+     for (long, 0..) |*x, i| x.* = prompt[i % prompt.len];
+     var pend: [2]u32 = undefined;
+     for (0..2) |k| pend[k] = try pass(e, @intCast(60 + k), long[0 .. half - 12], 512, null, null); // twins at half - 12
+-    var bp = try F.Buffers.init(e.d, &e.m, &e.w, 64, true, half);
++    var bp = try F.Buffers.init(e.d, &e.m, &e.w, 64, true, half, null);
+     defer bp.deinit();
+-    var bd = try F.Buffers.init(e.d, &e.m, &e.w, F.window_rows, false, half);
++    var bd = try F.Buffers.init(e.d, &e.m, &e.w, F.window_rows, false, half, null);
+     defer bd.deinit();
+     try e.bind(60);
+     const q = e.seqs.items[60].?;
+-- 
+2.53.0
+

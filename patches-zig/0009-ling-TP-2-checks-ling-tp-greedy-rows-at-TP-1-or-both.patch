@@ -1,0 +1,210 @@
+From a4649e03e2b4ec0b169b1fa64b1cdb6fb3cf7483 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 23:57:27 +1100
+Subject: [PATCH 09/26] ling: TP=2 checks (ling-tp: greedy rows at TP=1 or both
+ ranks; ling-exl3-layers on each rank's share; ling-synth --set for an
+ every-expert routing pack) and the recipe (YaRN's TF_LING_YARN, the two-rank
+ run)
+
+---
+ docs/recipes/ling-3.1-flash-cuda.md | 47 +++++++++++++++++++++++++++++
+ zig/tests/cuda/ling_cmds.zig        |  2 +-
+ zig/tests/cuda/ling_exl3_layers.zig | 21 ++++++++++++-
+ zig/tests/cuda/ling_synth.zig       | 15 +++++++--
+ zig/tests/cuda/ling_tp.zig          | 10 ++++--
+ 5 files changed, 87 insertions(+), 8 deletions(-)
+ create mode 100644 docs/recipes/ling-3.1-flash-cuda.md
+
+diff --git a/docs/recipes/ling-3.1-flash-cuda.md b/docs/recipes/ling-3.1-flash-cuda.md
+new file mode 100644
+index 000000000..420db7ce9
+--- /dev/null
++++ b/docs/recipes/ling-3.1-flash-cuda.md
+@@ -0,0 +1,47 @@
++# Ling-3.1-flash on CUDA
++
++The native CUDA build serves inclusionAI's Ling-3.1-flash (`bailing_moe_v3`: 63 KDA and 9 MLA layers, 512 routed
++experts, an MTP layer) from bf16, FP8 block-128 and EXL3 checkpoints on one GPU, and from EXL3 packs on two ranks over
++hosts. Rank 0 serves HTTP and rank 1 follows its steps, as [GLM-5.3-Flash on CUDA](glm-5.3-flash-cuda.md) does.
++
++## Context past 262,144: YaRN
++
++The checkpoint's native window is 262,144 positions (`max_position_embeddings`, rope theta 6,000,000). For 1,048,576,
++give the config SGLang's override, as transformers reads it:
++
++```json
++"rope_scaling": {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 262144,
++                 "rope_theta": 6000000, "partial_rotary_factor": 0.5},
++"max_position_embeddings": 1048576
++```
++
++Only `yarn` is read; other rope types are refused by name. The MLA layers' 64 rope columns (and the MTP layer's) take
++transformers' `_compute_yarn_parameters` frequencies (beta_fast 32, beta_slow 1, the ramp bounds truncated) and its
++attention factor, 0.1 ln 4 + 1, on cos and sin; the softmax scale changes only when the config gives
++`mscale_all_dim`, as Ling's modeling applies it. `TF_LING_YARN` picks when:
++
++| `TF_LING_YARN` | rope |
++| --- | --- |
++| `auto` (default) | YaRN when `--context` is past the native window, the plain rope otherwise |
++| `on` | YaRN at any context (needs `rope_scaling`; without it the 1M override above is assumed) |
++| `off` | the plain rope; a `--context` past the native window is refused |
++
++The plain rope is unchanged bit for bit when YaRN is off.
++
++## Two ranks
++
++`TF_LING_RANK` of `TF_LING_WORLD` (1 or 2) places each rank and `NCCL_COMM_ID` names rank 0's address and port; each
++rank keeps a TCP line to rank 0 on the next port, and a rank that fails stops the other. Each rank loads half the KDA
++and MLA heads, half of every MLP and expert width (EXL3's 128-wide blocks) and half the vocabulary of the head; the
++latent cache is whole on both. Give both ranks the same arguments:
++
++```bash
++# on rank 1
++TF_LING_RANK=1 TF_LING_WORLD=2 NCCL_COMM_ID=192.0.2.1:29651 NCCL_SOCKET_IFNAME=enp1s0f0np0 NCCL_IB_HCA=rocep1s0f0 \
++  tensorfold-native serve /models/ling-3.1-flash-exl3 --context 262144
++# on rank 0 (192.0.2.1)
++TF_LING_RANK=0 TF_LING_WORLD=2 NCCL_COMM_ID=192.0.2.1:29651 NCCL_SOCKET_IFNAME=enp1s0f0np0 NCCL_IB_HCA=rocep1s0f0 \
++  tensorfold-native serve /models/ling-3.1-flash-exl3 --context 262144
++```
++
++Other formats and worlds other than 1 and 2 are refused at TP.
+diff --git a/zig/tests/cuda/ling_cmds.zig b/zig/tests/cuda/ling_cmds.zig
+index e01e2a615..e506483f2 100644
+--- a/zig/tests/cuda/ling_cmds.zig
++++ b/zig/tests/cuda/ling_cmds.zig
+@@ -15,7 +15,7 @@ pub const usage =
+     \\  ling-exl3-layers <dir> <ref> <out>   real EXL3 layers on exllamav3's inputs (prompt and decode), outputs saved
+     \\  ling-init-faults <dir> [--mtp] [--every N]   the backend opened with each driver call, then each allocation, failing
+     \\  ling-exl3-clamp <dir> [layer]   an EXL3 MoE layer's grouped gate-up in Ling's clamp order vs float64
+-    \\  ling-tp <dir> <out> [--layers a,b] [--steps N]   greedy rows at TP=1, or TP=2 over TF_LING_RANK/WORLD
++    \\  ling-tp <dir> <out> [--layers a,b] [--steps N] [--seed S]   greedy rows at TP=1, or TP=2 over TF_LING_RANK/WORLD
+     \\
+ ;
+ 
+diff --git a/zig/tests/cuda/ling_exl3_layers.zig b/zig/tests/cuda/ling_exl3_layers.zig
+index cf74458ac..c541538c2 100644
+--- a/zig/tests/cuda/ling_exl3_layers.zig
++++ b/zig/tests/cuda/ling_exl3_layers.zig
+@@ -88,11 +88,25 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+     defer m.deinit();
+     var pack = try cuda.modelopt.Packer.load(gpu.d);
+     defer pack.unload();
+-    var w = try rig.W.load(gpu.gpa, gpu.d, s, &pack, &o.ck, o.c, layers, .{ .globals = false });
++    // TP=2 by TF_LING_RANK, TF_LING_WORLD, NCCL_COMM_ID: both ranks run this loop on their shares; rank 0 writes
++    const p = try ling.tp.place(ling.tp.env);
++    var group: ?cuda.tp_group.Group = null;
++    if (p.world > 1) {
++        try cuda.tp_watch.start(gpu.io, p.rank, p.world);
++        group = try ling.tp.group(gpu.io, p);
++    }
++    defer if (group) |*gr| gr.close();
++    var w = try rig.W.load(gpu.gpa, gpu.d, s, &pack, &o.ck, o.c, layers, .{ .globals = false, .rank = p.rank, .world = p.world });
+     defer w.deinit();
+     std.debug.print("RESULT ling-exl3-layers: {t} layers {any} loaded\n", .{ o.c.quant, layers });
+     var g = try F.Graph.init(gpu.gpa, gpu.d, &m, s, &w);
+     defer g.deinit();
++    if (group) |*gr| {
++        g.tp = gr;
++        var dg: [32]u8 = @splat(0);
++        std.crypto.hash.sha2.Sha256.hash(rest[1], &dg, .{});
++        try cuda.tp_watch.ready(gpu.io, dg);
++    }
+     var r: Rig = .{ .gpu = gpu, .a = a, .s = s, .m = &m, .g = &g };
+     defer r.deinit();
+     var pb = try F.Buffers.init(gpu.d, &m, &w, T, true, T + 8);
+@@ -142,6 +156,11 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+         try out.appendSlice(a, ppicks);
+         try out.appendSlice(a, dpicks);
+     }
++    if (group) |*gr| { // both ranks done before either closes (a rank closing first stops the other)
++        try gr.connect(s, try r.zeros(128), 1 - gr.rank);
++        cuda.tp_watch.ended();
++    }
++    if (p.rank != 0) return check.pass("ling-exl3-layers rank {d}: {d} layers ran on its share", .{ p.rank, n });
+     try std.Io.Dir.cwd().writeFile(gpu.io, .{ .sub_path = rest[2], .data = out.items });
+     check.pass("ling-exl3-layers: {d} layers ran on {d} rows, outputs in {s} (the parity numbers are the script's)", .{ n, T, rest[2] });
+ }
+diff --git a/zig/tests/cuda/ling_synth.zig b/zig/tests/cuda/ling_synth.zig
+index d0b0fdbd9..055caaa08 100644
+--- a/zig/tests/cuda/ling_synth.zig
++++ b/zig/tests/cuda/ling_synth.zig
+@@ -124,17 +124,26 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+     var format: Quant = .fp8_block128;
+     var layers: u32 = 4;
+     var inter: ?u32 = null; // --moe-inter N: routed and shared expert width (256 splits into TP=2's 128-wide blocks)
++    var sets: [8][]const u8 = undefined; // --set key=N: an integer of config.json (e.g. every expert routed)
++    var nset: usize = 0;
+     var i: usize = 1;
+     while (i + 1 < rest.len) : (i += 2) {
+-        if (std.mem.eql(u8, rest[i], "--format")) format = try formatOf(rest[i + 1]) else if (std.mem.eql(u8, rest[i], "--layers")) layers = try std.fmt.parseInt(u32, rest[i + 1], 10) else if (std.mem.eql(u8, rest[i], "--moe-inter")) inter = try std.fmt.parseInt(u32, rest[i + 1], 10) else return error.BadArgument;
++        if (std.mem.eql(u8, rest[i], "--format")) format = try formatOf(rest[i + 1]) else if (std.mem.eql(u8, rest[i], "--layers")) layers = try std.fmt.parseInt(u32, rest[i + 1], 10) else if (std.mem.eql(u8, rest[i], "--moe-inter")) inter = try std.fmt.parseInt(u32, rest[i + 1], 10) else if (std.mem.eql(u8, rest[i], "--set") and nset < sets.len) {
++            sets[nset] = rest[i + 1];
++            nset += 1;
++        } else return error.BadArgument;
+     }
+     var arena = std.heap.ArenaAllocator.init(gpu.gpa);
+     defer arena.deinit();
+     const a = arena.allocator();
+     var json = try ling.synth.configJson(a, format, layers);
+-    if (inter) |n| {
++    if (inter != null or nset > 0) {
+         var root = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+-        for ([_][]const u8{ "moe_intermediate_size", "moe_shared_expert_intermediate_size" }) |key| try root.object.put(a, key, .{ .integer = n });
++        if (inter) |n| for ([_][]const u8{ "moe_intermediate_size", "moe_shared_expert_intermediate_size" }) |key| try root.object.put(a, key, .{ .integer = n });
++        for (sets[0..nset]) |kv| {
++            const eq = std.mem.indexOfScalar(u8, kv, '=') orelse return error.BadArgument;
++            try root.object.put(a, kv[0..eq], .{ .integer = try std.fmt.parseInt(i64, kv[eq + 1 ..], 10) });
++        }
+         json = try std.json.Stringify.valueAlloc(a, root, .{ .whitespace = .indent_2 });
+     }
+     var why: ling.config.Why = .{};
+diff --git a/zig/tests/cuda/ling_tp.zig b/zig/tests/cuda/ling_tp.zig
+index 3baee4cf9..617a59082 100644
+--- a/zig/tests/cuda/ling_tp.zig
++++ b/zig/tests/cuda/ling_tp.zig
+@@ -1,4 +1,4 @@
+-//! `ling-tp DIR OUT [--layers a,b] [--steps N]`: a prompt then N greedy rows at TP=1, or on both ranks at TP=2.
++//! `ling-tp DIR OUT [--layers a,b] [--steps N] [--seed S]`: a prompt, then N greedy rows at TP=1 or TP=2.
+ 
+ // TP=2 by TF_LING_RANK, TF_LING_WORLD and NCCL_COMM_ID; rank 1 runs tp.follow (the serving loop) on rank 0's steps.
+ 
+@@ -17,6 +17,7 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+     const a = arena.allocator();
+     var layers: ?[]u32 = null;
+     var steps: usize = 64;
++    var seed: u64 = 0;
+     var k: usize = 2;
+     while (k < rest.len) : (k += 1) {
+         if (std.mem.eql(u8, rest[k], "--layers") and k + 1 < rest.len) {
+@@ -25,6 +26,9 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+             var it = std.mem.splitScalar(u8, rest[k], ',');
+             while (it.next()) |x| try list.append(a, try std.fmt.parseInt(u32, x, 10));
+             layers = list.items;
++        } else if (std.mem.eql(u8, rest[k], "--seed") and k + 1 < rest.len) {
++            k += 1;
++            seed = try std.fmt.parseInt(u64, rest[k], 10);
+         } else if (std.mem.eql(u8, rest[k], "--steps") and k + 1 < rest.len) {
+             k += 1;
+             steps = try std.fmt.parseInt(usize, rest[k], 10);
+@@ -59,7 +63,7 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+     const V: usize = e.c.vocab;
+     const P = 40;
+     var ids: [P]u32 = undefined;
+-    var rng = std.Random.DefaultPrng.init(0x6c696e67);
++    var rng = std.Random.DefaultPrng.init(0x6c696e67 +% seed);
+     for (&ids) |*t| t.* = rng.random().uintLessThan(u32, @intCast(@min(V, 30000)));
+     const rows = steps + 1;
+     const logits = try a.alloc(u16, rows * V);
+@@ -76,8 +80,8 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+         try e.keep(1);
+         toks[s] = out[0];
+     }
++    cuda.tp_watch.ended(); // rank 1 leaves on the end step: its line closing from here is expected
+     try e.end();
+-    cuda.tp_watch.ended();
+     var buf: std.ArrayList(u8) = .empty;
+     try buf.appendSlice(a, "TFLTP001");
+     for ([_]u32{ p.world, @intCast(V), @intCast(rows) }) |v| try buf.appendSlice(a, std.mem.asBytes(&v));
+-- 
+2.53.0
+

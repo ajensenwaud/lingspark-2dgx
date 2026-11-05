@@ -1,0 +1,72 @@
+From e82bce74f4b5c48ac16997b66d322cf0d13cc2da Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 12:31:27 +1100
+Subject: [PATCH 22/26] ling: lean comment widths
+
+---
+ zig/kernels/cuda/ling_pattn.cuh            | 2 +-
+ zig/src/families/ling/block_mla_prompt.zig | 2 +-
+ zig/src/families/ling/engine.zig           | 2 +-
+ zig/src/families/ling/kept.zig             | 2 +-
+ zig/tests/cuda/contract_ling_pattn.zig     | 2 +-
+ 5 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/zig/kernels/cuda/ling_pattn.cuh b/zig/kernels/cuda/ling_pattn.cuh
+index 72c8ea853..6eda3c392 100644
+--- a/zig/kernels/cuda/ling_pattn.cuh
++++ b/zig/kernels/cuda/ling_pattn.cuh
+@@ -1,4 +1,4 @@
+-// Ling's MLA prompt rows in the expanded form: q [rows][heads][192] (nope, roped), one block of expanded keys at a time.
++// Ling's MLA prompt rows in the expanded form: q [rows][heads][192] (nope, roped), expanded keys a block at a time.
+ #pragma once
+ #include <cuda_bf16.h>
+ #include <stdint.h>
+diff --git a/zig/src/families/ling/block_mla_prompt.zig b/zig/src/families/ling/block_mla_prompt.zig
+index d6454e88a..a3e8c6d62 100644
+--- a/zig/src/families/ling/block_mla_prompt.zig
++++ b/zig/src/families/ling/block_mla_prompt.zig
+@@ -1,4 +1,4 @@
+-//! Ling's MLA prompt rows in the expanded form (TF_LING_PROMPT_MLA=expand): kv_b over blocks of cache rows, flash tiles.
++//! Ling's MLA prompt rows expanded (TF_LING_PROMPT_MLA=expand): kv_b over blocks of cache rows, flash tiles.
+ 
+ // Per head 192 q.k dims and 128 v dims a key instead of the absorbed 576 + 512; decode windows stay absorbed.
+ const std = @import("std");
+diff --git a/zig/src/families/ling/engine.zig b/zig/src/families/ling/engine.zig
+index 4ac45fbc6..907efe123 100644
+--- a/zig/src/families/ling/engine.zig
++++ b/zig/src/families/ling/engine.zig
+@@ -509,7 +509,7 @@ pub const Engine = struct {
+         for (out[0..rows], got[0..rows]) |*o, p| o.* = p[1];
+     }
+ 
+-    /// Bytes a state kept at `at` takes: the KDA part, each MLA layer's rows below `at` (none in place), the MTP head's.
++    /// Bytes a state kept at `at` takes: the KDA part, MLA rows below `at` (none in place), the MTP head's.
+     pub fn stateBytes(e: *const Engine, at: usize) u64 {
+         const q = e.cur;
+         return kept.bytes(&q.st, at, e.inplace) + if (q.hd) |h| kept.bytes(&h, at + 1, e.inplace) else 0;
+diff --git a/zig/src/families/ling/kept.zig b/zig/src/families/ling/kept.zig
+index 40fbfb6e5..b13c2897b 100644
+--- a/zig/src/families/ling/kept.zig
++++ b/zig/src/families/ling/kept.zig
+@@ -26,7 +26,7 @@ pub fn inplaceFor(context: usize) !bool {
+     };
+ }
+ 
+-/// Bytes a State kept at `at` holds: its conv windows and each KDA layer's committed state, and the rows unless in place.
++/// Bytes a State kept at `at` holds: conv windows, each KDA layer's committed state, and the rows unless in place.
+ pub fn bytes(st: *const fw.State, at: usize, inplace: bool) usize {
+     return st.keptHead() + if (inplace) 0 else st.mla_layers * st.below(at) * cache_row;
+ }
+diff --git a/zig/tests/cuda/contract_ling_pattn.zig b/zig/tests/cuda/contract_ling_pattn.zig
+index 9d2e72031..6d223dc35 100644
+--- a/zig/tests/cuda/contract_ling_pattn.zig
++++ b/zig/tests/cuda/contract_ling_pattn.zig
+@@ -1,4 +1,4 @@
+-//! Ling-3.1-flash's expanded MLA prompt attention (tf_ling_pattn): 192-wide q.k, 128-wide v, key blocks carried in fp32.
++//! Ling-3.1-flash's expanded MLA prompt attention (tf_ling_pattn): 192-wide q.k, 128-wide v, fp32 carry by blocks.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const core = @import("core");
+-- 
+2.53.0
+

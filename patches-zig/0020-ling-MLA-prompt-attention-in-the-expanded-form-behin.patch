@@ -1,0 +1,726 @@
+From c28f39c9394e1d28969335250230cb761f6d801a Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 12:31:02 +1100
+Subject: [PATCH 20/26] ling: MLA prompt attention in the expanded form behind
+ TF_LING_PROMPT_MLA=expand (default absorbed): kv_b over 2,048-key blocks of
+ cache rows on the lane, tf_ling_pattn flash tiles at 192 q.k / 128 v dims
+ with an fp32 carry across blocks (ling_glue image; GLM's glue untouched); a
+ split cache gathers each 1,024 positions' two pages through b.lat; scratch
+ inside the unused absorbed areas (no new memory); decode stays absorbed.
+ Kernel contract: tf_ling_pattn gates 1-4 (ling-contract 27/27), gate-5
+ records nvcc 13.0/13.3. TP=1 trial pack 16K: expand vs absorbed rel L2
+ 7.6e-4, greedy 9/9; cut at 9,000 byte-equal to uncut; resumed == fresh 9/9;
+ real layer 7 vs exllamav3 4.09e-2 (absorbed 4.05e-2). ling-tp:
+ TF_LING_TP_CHUNKS=1 times each chunk
+
+---
+ zig/kernels/cuda/ling_glue.cu                 |   2 +
+ zig/kernels/cuda/ling_pattn.cuh               | 231 ++++++++++++++++++
+ zig/src/core/contract/ling_cuda_records.zig   |   1 +
+ .../contract/measurements/pending_133.zig     |   1 +
+ zig/src/families/ling/block_mla.zig           |  19 +-
+ zig/src/families/ling/block_mla_prompt.zig    |  68 ++++++
+ zig/src/families/ling/graph.zig               |   5 +
+ zig/tests/cuda/contract_ling.zig              |   4 +
+ zig/tests/cuda/contract_ling_pattn.zig        | 206 ++++++++++++++++
+ zig/tests/cuda/ling_tp.zig                    |  15 +-
+ 10 files changed, 546 insertions(+), 6 deletions(-)
+ create mode 100644 zig/kernels/cuda/ling_pattn.cuh
+ create mode 100644 zig/src/families/ling/block_mla_prompt.zig
+ create mode 100644 zig/tests/cuda/contract_ling_pattn.zig
+
+diff --git a/zig/kernels/cuda/ling_glue.cu b/zig/kernels/cuda/ling_glue.cu
+index 83373f50f..e182d482e 100644
+--- a/zig/kernels/cuda/ling_glue.cu
++++ b/zig/kernels/cuda/ling_glue.cu
+@@ -2,6 +2,8 @@
+ #include <cuda_bf16.h>
+ #include <stdint.h>
+ 
++#include "ling_pattn.cuh"
++
+ namespace ling_glue {
+ __device__ __forceinline__ float bf(__nv_bfloat16 x) { return __bfloat162float(x); }
+ __device__ __forceinline__ float rbf(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
+diff --git a/zig/kernels/cuda/ling_pattn.cuh b/zig/kernels/cuda/ling_pattn.cuh
+new file mode 100644
+index 000000000..72c8ea853
+--- /dev/null
++++ b/zig/kernels/cuda/ling_pattn.cuh
+@@ -0,0 +1,231 @@
++// Ling's MLA prompt rows in the expanded form: q [rows][heads][192] (nope, roped), one block of expanded keys at a time.
++#pragma once
++#include <cuda_bf16.h>
++#include <stdint.h>
++
++#include "common/qmm_frag.cuh"
++
++namespace ling_pattn {
++
++constexpr int QK = 192, DV = 128, BN = 64, KC = QK / 8, VC = DV / 8;  // dims, keys a tile, 16-byte chunks a row
++constexpr int WARPS = 8, ROWS = 16 * WARPS, STAGE = BN * (KC + VC);   // a block's query rows; uint4 a stage
++constexpr float LOG2E = 1.4426950408889634f;
++
++__device__ __forceinline__ float texp(float x) {
++  float y;
++  asm("ex2.approx.f32 %0, %1;\n" : "=f"(y) : "f"(__fmul_rn(x, LOG2E)));
++  return y;
++}
++
++__device__ __forceinline__ uint32_t pack(float lo, float hi) {
++  __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
++  return *reinterpret_cast<uint32_t*>(&v);
++}
++
++template <int C>
++__device__ __forceinline__ int sw(int r, int c) { return r * C + (c ^ (r & 7)); }
++
++// The 4 lanes of a row's quad summed in a fixed order (xor 2, then xor 1), as prefill_attention's rowsum.
++__device__ __forceinline__ float quad(float x) {
++  x = __fadd_rn(x, __shfl_xor_sync(0xffffffffu, x, 2));
++  return __fadd_rn(x, __shfl_xor_sync(0xffffffffu, x, 1));
++}
++
++// fmaxf, but a NaN wins (a NaN score or carry makes the row NaN, as the float64 softmax does).
++__device__ __forceinline__ float nmax(float a, float b) { return (a > b || a != a) ? a : b; }
++
++}  // namespace ling_pattn
++
++// Block (128 rows, head) over keys kb0 + j < kb0 + n, j <= p0 + r - kb0; fp32 o/m/l carried, last: o / l as bf16.
++extern "C" __global__ void __launch_bounds__(256, 1)
++    tf_ling_pattn(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kv,
++                  const __nv_bfloat16* __restrict__ rk, float* __restrict__ co, float* __restrict__ cm,
++                  float* __restrict__ cl, __nv_bfloat16* __restrict__ out, int rows, int heads, int n, int kb0, int p0,
++                  float scale, int first, int last) {
++  using namespace ling_pattn;
++  using qmm_frag::cp16z;
++  using qmm_frag::ldmatrix4;
++  using qmm_frag::ldmatrix4t;
++  using qmm_frag::mma;
++  using qmm_frag::mma0;
++  extern __shared__ uint4 smem[];
++  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, qd = lane % 4, mt = lane / 8;
++  const int h = blockIdx.y, row0 = blockIdx.x * ROWS, wrow = row0 + warp * 16;
++  const int lastrow = min(row0 + ROWS, rows) - 1;
++  const int span = min(n, p0 + lastrow - kb0 + 1), tiles = (span + BN - 1) / BN;  // keys any row of the block sees
++  const int64_t kvrow = (int64_t)heads * 256;
++  auto stage = [&](int t, int slot) {
++    uint4* ks = smem + slot * STAGE;
++    uint4* vs = ks + BN * KC;
++    for (int i = threadIdx.x; i < BN * (KC + VC); i += 32 * WARPS) {
++      const int key = i < BN * KC ? i / KC : (i - BN * KC) / VC, j = t * BN + key;
++      const bool in = j < span;
++      const int jj = in ? j : 0;
++      if (i < BN * KC) {
++        const int c = i % KC;
++        const __nv_bfloat16* src = c < 16 ? kv + jj * kvrow + h * 256 + c * 8 : rk + (int64_t)jj * 576 + 512 + (c - 16) * 8;
++        cp16z(ks + sw<KC>(key, c), src, in);
++      } else {
++        const int c = (i - BN * KC) % VC;
++        cp16z(vs + sw<VC>(key, c), kv + jj * kvrow + h * 256 + 128 + c * 8, in);
++      }
++    }
++    qmm_frag::commit();
++  };
++  uint32_t qa[QK / 16][4];
++  {
++    const int r0 = wrow + g, r1 = r0 + 8;
++    const uint32_t* q0 = reinterpret_cast<const uint32_t*>(q + ((int64_t)min(r0, rows - 1) * heads + h) * QK);
++    const uint32_t* q1 = reinterpret_cast<const uint32_t*>(q + ((int64_t)min(r1, rows - 1) * heads + h) * QK);
++#pragma unroll
++    for (int k = 0; k < QK / 16; ++k) {
++      qa[k][0] = r0 < rows ? q0[8 * k + qd] : 0u;
++      qa[k][1] = r1 < rows ? q1[8 * k + qd] : 0u;
++      qa[k][2] = r0 < rows ? q0[8 * k + qd + 4] : 0u;
++      qa[k][3] = r1 < rows ? q1[8 * k + qd + 4] : 0u;
++    }
++  }
++  const int r0 = wrow + g, r1 = r0 + 8;
++  float o[VC][4];
++  float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
++#pragma unroll
++  for (int i = 0; i < VC; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
++  if (!first) {  // the carry of the earlier key blocks
++    if (r0 < rows) {
++      m0 = cm[(int64_t)r0 * heads + h];
++      l0 = cl[(int64_t)r0 * heads + h];
++    }
++    if (r1 < rows) {
++      m1 = cm[(int64_t)r1 * heads + h];
++      l1 = cl[(int64_t)r1 * heads + h];
++    }
++#pragma unroll
++    for (int i = 0; i < VC; ++i) {
++      const int d = 8 * i + 2 * qd;
++      if (r0 < rows) {
++        const float2 v = *reinterpret_cast<const float2*>(co + ((int64_t)r0 * heads + h) * DV + d);
++        o[i][0] = v.x;
++        o[i][1] = v.y;
++      }
++      if (r1 < rows) {
++        const float2 v = *reinterpret_cast<const float2*>(co + ((int64_t)r1 * heads + h) * DV + d);
++        o[i][2] = v.x;
++        o[i][3] = v.y;
++      }
++    }
++  }
++  const int pos0 = p0 + r0 - kb0, pos1 = pos0 + 8;  // the last key (block-local) each of the thread's rows sees
++  if (tiles > 0) stage(0, 0);
++  for (int t = 0; t < tiles; ++t) {
++    if (t + 1 < tiles) {
++      stage(t + 1, (t + 1) & 1);
++      qmm_frag::wait<1>();
++    } else {
++      qmm_frag::wait<0>();
++    }
++    __syncthreads();
++    const uint4* ks = smem + (t & 1) * STAGE;
++    const uint4* vs = ks + BN * KC;
++    float sc[8][4];
++#pragma unroll
++    for (int k = 0; k < QK / 16; ++k) {
++#pragma unroll
++      for (int nt = 0; nt < 8; nt += 2) {
++        uint32_t b[4];
++        ldmatrix4(b, ks + sw<KC>(8 * (nt + mt / 2) + lane % 8, 2 * k + mt % 2));
++        if (k == 0) {
++          mma0(sc[nt], qa[k], b[0], b[1]);
++          mma0(sc[nt + 1], qa[k], b[2], b[3]);
++        } else {
++          mma(sc[nt], qa[k], b[0], b[1]);
++          mma(sc[nt + 1], qa[k], b[2], b[3]);
++        }
++      }
++    }
++    const int kb = t * BN + 2 * qd;
++    float tm0 = -INFINITY, tm1 = -INFINITY;
++#pragma unroll
++    for (int nt = 0; nt < 8; ++nt) {
++      const int c = kb + 8 * nt;
++      sc[nt][0] = c <= pos0 && c < span ? __fmul_rn(sc[nt][0], scale) : -INFINITY;
++      sc[nt][1] = c + 1 <= pos0 && c + 1 < span ? __fmul_rn(sc[nt][1], scale) : -INFINITY;
++      sc[nt][2] = c <= pos1 && c < span ? __fmul_rn(sc[nt][2], scale) : -INFINITY;
++      sc[nt][3] = c + 1 <= pos1 && c + 1 < span ? __fmul_rn(sc[nt][3], scale) : -INFINITY;
++      tm0 = nmax(tm0, nmax(sc[nt][0], sc[nt][1]));
++      tm1 = nmax(tm1, nmax(sc[nt][2], sc[nt][3]));
++    }
++    for (int x = 1; x <= 2; x *= 2) {
++      tm0 = nmax(tm0, __shfl_xor_sync(0xffffffffu, tm0, x));
++      tm1 = nmax(tm1, __shfl_xor_sync(0xffffffffu, tm1, x));
++    }
++    const bool act0 = tm0 != -INFINITY, act1 = tm1 != -INFINITY;
++    const float n0 = act0 ? nmax(m0, tm0) : m0, n1 = act1 ? nmax(m1, tm1) : m1;
++    const float a0 = act0 ? (m0 == -INFINITY ? 0.0f : texp(__fsub_rn(m0, n0))) : 1.0f;
++    const float a1 = act1 ? (m1 == -INFINITY ? 0.0f : texp(__fsub_rn(m1, n1))) : 1.0f;
++    float s0 = 0.0f, s1 = 0.0f;
++#pragma unroll
++    for (int nt = 0; nt < 8; ++nt) {
++      sc[nt][0] = act0 && sc[nt][0] != -INFINITY ? texp(__fsub_rn(sc[nt][0], n0)) : 0.0f;
++      sc[nt][1] = act0 && sc[nt][1] != -INFINITY ? texp(__fsub_rn(sc[nt][1], n0)) : 0.0f;
++      sc[nt][2] = act1 && sc[nt][2] != -INFINITY ? texp(__fsub_rn(sc[nt][2], n1)) : 0.0f;
++      sc[nt][3] = act1 && sc[nt][3] != -INFINITY ? texp(__fsub_rn(sc[nt][3], n1)) : 0.0f;
++      s0 = __fadd_rn(s0, __fadd_rn(sc[nt][0], sc[nt][1]));
++      s1 = __fadd_rn(s1, __fadd_rn(sc[nt][2], sc[nt][3]));
++    }
++    l0 = __fmaf_rn(l0, a0, quad(s0));
++    l1 = __fmaf_rn(l1, a1, quad(s1));
++    m0 = n0;
++    m1 = n1;
++#pragma unroll
++    for (int i = 0; i < VC; ++i) {
++      o[i][0] = __fmul_rn(o[i][0], a0);
++      o[i][1] = __fmul_rn(o[i][1], a0);
++      o[i][2] = __fmul_rn(o[i][2], a1);
++      o[i][3] = __fmul_rn(o[i][3], a1);
++    }
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++      uint32_t pa[4];
++      pa[0] = pack(sc[2 * j][0], sc[2 * j][1]);
++      pa[1] = pack(sc[2 * j][2], sc[2 * j][3]);
++      pa[2] = pack(sc[2 * j + 1][0], sc[2 * j + 1][1]);
++      pa[3] = pack(sc[2 * j + 1][2], sc[2 * j + 1][3]);
++#pragma unroll
++      for (int i = 0; i < VC; i += 2) {
++        uint32_t b[4];
++        ldmatrix4t(b, vs + sw<VC>(16 * j + 8 * (mt % 2) + lane % 8, i + mt / 2));
++        mma(o[i], pa, b[0], b[1]);
++        mma(o[i + 1], pa, b[2], b[3]);
++      }
++    }
++    __syncthreads();
++  }
++  if (last) {
++    const float i0 = l0 == 0.0f ? 0.0f : 1.0f / l0, i1 = l1 == 0.0f ? 0.0f : 1.0f / l1;
++#pragma unroll
++    for (int i = 0; i < VC; ++i) {
++      const int d = 8 * i + 2 * qd;
++      if (r0 < rows)
++        *reinterpret_cast<uint32_t*>(out + ((int64_t)r0 * heads + h) * DV + d) = pack(o[i][0] * i0, o[i][1] * i0);
++      if (r1 < rows)
++        *reinterpret_cast<uint32_t*>(out + ((int64_t)r1 * heads + h) * DV + d) = pack(o[i][2] * i1, o[i][3] * i1);
++    }
++    return;
++  }
++#pragma unroll
++  for (int i = 0; i < VC; ++i) {
++    const int d = 8 * i + 2 * qd;
++    if (r0 < rows) *reinterpret_cast<float2*>(co + ((int64_t)r0 * heads + h) * DV + d) = make_float2(o[i][0], o[i][1]);
++    if (r1 < rows) *reinterpret_cast<float2*>(co + ((int64_t)r1 * heads + h) * DV + d) = make_float2(o[i][2], o[i][3]);
++  }
++  if (qd == 0) {
++    if (r0 < rows) {
++      cm[(int64_t)r0 * heads + h] = m0;
++      cl[(int64_t)r0 * heads + h] = l0;
++    }
++    if (r1 < rows) {
++      cm[(int64_t)r1 * heads + h] = m1;
++      cl[(int64_t)r1 * heads + h] = l1;
++    }
++  }
++}
+diff --git a/zig/src/core/contract/ling_cuda_records.zig b/zig/src/core/contract/ling_cuda_records.zig
+index 22e004c3b..83db4bd61 100644
+--- a/zig/src/core/contract/ling_cuda_records.zig
++++ b/zig/src/core/contract/ling_cuda_records.zig
+@@ -14,6 +14,7 @@ pub const records = [_]registry.CudaRecord{
+     .{ .launch = .{ .name = "glm_glue tf_ling_topk", .symbol = "tf_ling_topk", .image = "glm_glue", .threads = 32, .min_sm = 80 }, .usage = .{ .{ .regs = 72, .static = 0, .bound = 32 }, .{ .regs = 85, .static = 0, .bound = 32 }, .{ .regs = 85, .static = 0, .bound = 32 }, .{ .regs = 69, .static = 0, .bound = 32 }, .{ .regs = 69, .static = 0, .bound = 32 } }, .later_pending = true },
+     .{ .launch = .{ .name = "ling_glue tf_ling_add", .symbol = "tf_ling_add", .image = "ling_glue", .threads = 256 }, .usage = .{ .{ .regs = 10, .static = 0, .bound = 0 }, .{ .regs = 10, .static = 0, .bound = 0 }, .{ .regs = 10, .static = 0, .bound = 0 }, .{ .regs = 12, .static = 0, .bound = 0 }, .{ .regs = 12, .static = 0, .bound = 0 } }, .later_pending = true },
+     .{ .launch = .{ .name = "ling_glue tf_ling_gate", .symbol = "tf_ling_gate", .image = "ling_glue", .threads = 128 }, .usage = .{ .{ .regs = 16, .static = 0, .bound = 0 }, .{ .regs = 16, .static = 0, .bound = 0 }, .{ .regs = 16, .static = 0, .bound = 0 }, .{ .regs = 12, .static = 0, .bound = 0 }, .{ .regs = 12, .static = 0, .bound = 0 } }, .later_pending = true },
++    .{ .launch = .{ .name = "ling_glue tf_ling_pattn", .symbol = "tf_ling_pattn", .image = "ling_glue", .threads = 256, .dynamic = 81920, .opt_in = true, .min_sm = 80 }, .usage = .{ .{ .regs = 218, .static = 0, .bound = 256 }, .{ .regs = 218, .static = 0, .bound = 256 }, .{ .regs = 218, .static = 0, .bound = 256 }, .{ .regs = 238, .static = 0, .bound = 256 }, .{ .regs = 238, .static = 0, .bound = 256 } }, .later_pending = true },
+     .{ .launch = .{ .name = "ling_glue tf_ling_combine", .symbol = "tf_ling_combine", .image = "ling_glue", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 38, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } }, .later_pending = true },
+     .{ .launch = .{ .name = "ling_glue tf_ling_copy_rows", .symbol = "tf_ling_copy_rows", .image = "ling_glue", .threads = 256 }, .usage = .{ .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } }, .later_pending = true },
+     .{ .launch = .{ .name = "exl3_experts tf_exl3_plan_finish_after", .symbol = "tf_exl3_plan_finish_after", .image = "exl3_experts", .threads = 32 }, .usage = .{ .{ .regs = 39, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } }, .later_pending = true },
+diff --git a/zig/src/core/contract/measurements/pending_133.zig b/zig/src/core/contract/measurements/pending_133.zig
+index cb28e7cb1..912932b32 100644
+--- a/zig/src/core/contract/measurements/pending_133.zig
++++ b/zig/src/core/contract/measurements/pending_133.zig
+@@ -69,6 +69,7 @@ pub const records = [_]Override{
+     .{ .name = "glm_glue tf_ling_topk", .usage = .{ .{ .regs = 72, .static = 0, .bound = 32 }, .{ .regs = 85, .static = 0, .bound = 32 }, .{ .regs = 85, .static = 0, .bound = 32 }, .{ .regs = 69, .static = 0, .bound = 32 }, .{ .regs = 69, .static = 0, .bound = 32 } } },
+     .{ .name = "ling_glue tf_ling_add", .usage = .{ .{ .regs = 10, .static = 0, .bound = 0 }, .{ .regs = 10, .static = 0, .bound = 0 }, .{ .regs = 10, .static = 0, .bound = 0 }, .{ .regs = 12, .static = 0, .bound = 0 }, .{ .regs = 12, .static = 0, .bound = 0 } } },
+     .{ .name = "ling_glue tf_ling_gate", .usage = .{ .{ .regs = 16, .static = 0, .bound = 0 }, .{ .regs = 16, .static = 0, .bound = 0 }, .{ .regs = 16, .static = 0, .bound = 0 }, .{ .regs = 12, .static = 0, .bound = 0 }, .{ .regs = 12, .static = 0, .bound = 0 } } },
++    .{ .name = "ling_glue tf_ling_pattn", .usage = .{ .{ .regs = 218, .static = 0, .bound = 256 }, .{ .regs = 218, .static = 0, .bound = 256 }, .{ .regs = 218, .static = 0, .bound = 256 }, .{ .regs = 240, .static = 0, .bound = 256 }, .{ .regs = 240, .static = 0, .bound = 256 } } },
+     .{ .name = "ling_glue tf_ling_combine", .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
+     .{ .name = "ling_glue tf_ling_copy_rows", .usage = .{ .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
+     .{ .name = "exl3_experts tf_exl3_plan_finish_after", .usage = .{ .{ .regs = 39, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
+diff --git a/zig/src/families/ling/block_mla.zig b/zig/src/families/ling/block_mla.zig
+index 1da9b8182..b50b3c52c 100644
+--- a/zig/src/families/ling/block_mla.zig
++++ b/zig/src/families/ling/block_mla.zig
+@@ -4,6 +4,7 @@ const graph = @import("graph.zig");
+ const weights = @import("weights.zig");
+ const state = @import("state.zig");
+ const block_kda = @import("block_kda.zig");
++const expanded = @import("block_mla_prompt.zig");
+ 
+ const glue = graph.glue;
+ const latent = graph.latent;
+@@ -37,10 +38,11 @@ pub fn block(o: Ops, b: *const state.Buffers, a: weights.Mla, ab: graph.Absorb,
+     try o.mm(a.kv_a, b.normed, D, rows, b.kv);
+     try glue.rmsnorm(o.set(), o.s, b.kv, kvs, a.kv_a_norm, b.lat, kw, null, c.eps, rows, lw);
+     if (a.gate) |gp| try o.mm(gp, b.normed, D, rows, b.g);
+-    try ops.absorbQ(&o.m.ling, o.s, b.q, qk, ab.wk, b.qa, kw, rows, H, nope, lw);
++    const split = state.splitOf(g.w);
++    const wide = expanded.takes(o, b); // prompt rows in the expanded form: no absorb, no expand_v
++    if (!wide) try ops.absorbQ(&o.m.ling, o.s, b.q, qk, ab.wk, b.qa, kw, rows, H, nope, lw);
+     const scale = c.smScale();
+     for (segs) |sg| try room(b, sg.st, sg.rows); // every segment before the first cache write
+-    const split = state.splitOf(g.w);
+     for (segs) |sg| {
+         const st = sg.st;
+         const r = sg.row0;
+@@ -49,11 +51,16 @@ pub fn block(o: Ops, b: *const state.Buffers, a: weights.Mla, ab: graph.Absorb,
+             try o.addI32(st.pos_dev, st.rope_base, b.at + 4);
+             rp = b.at + 4;
+         }
+-        try ops.rope(&o.m.ling, o.s, .{ .x = b.q + (r * H * qk + nope) * 2, .x_row = H * qk, .x_head = qk, .out = b.qa + (r * H * kw + lw) * 2, .o_row = H * kw, .o_head = kw }, sg.rows, H, rp, g.freq, g.rope_scale);
++        const qr: ops.RopeRows = if (wide) .{ .x = b.q + (r * H * qk + nope) * 2, .x_row = H * qk, .x_head = qk, .out = b.q + (r * H * qk + nope) * 2, .o_row = H * qk, .o_head = qk } else .{ .x = b.q + (r * H * qk + nope) * 2, .x_row = H * qk, .x_head = qk, .out = b.qa + (r * H * kw + lw) * 2, .o_row = H * kw, .o_head = kw };
++        try ops.rope(&o.m.ling, o.s, qr, sg.rows, H, rp, g.freq, g.rope_scale);
+         try ops.rope(&o.m.ling, o.s, .{ .x = b.kv + (r * kvs + lw) * 2, .x_row = kvs, .x_head = 0, .out = b.lat + (r * kw + lw) * 2, .o_row = kw, .o_head = 0 }, sg.rows, 1, rp, g.freq, g.rope_scale);
+         // a split cache is written by pages: this rank's chunks to theirs, other ranks' rows to the spare page
+         const t: latent.Table = if (split != null) .{ .pt = g.table, .ps = latent.chunk * kw * 2 } else .{};
+         try latent.latentWrite(o.set(), o.s, b.lat + r * kw * 2, kw, st.cacheAt(mi), t, st.pos_dev, sg.rows, kw);
++        if (wide) { // a split cache gathers pages through b.lat: after every segment's write (below)
++            if (split == null) try expanded.attend(o, b, a, g, mi, sg, scale);
++            continue;
++        }
+         if (split != null) continue; // every segment's queries roped before they are gathered
+         var r0: usize = 0;
+         while (r0 < sg.rows) : (r0 += b.ar) {
+@@ -68,8 +75,10 @@ pub fn block(o: Ops, b: *const state.Buffers, a: weights.Mla, ab: graph.Absorb,
+             try ops.attention(&o.m.ling, o.set(), o.s, b.qa + row * H * kw * 2, st.cacheAt(mi), at, b.partials, b.ol + row * H * lw * 2, b.dummy, m, H, lw, nch, scale);
+         }
+     }
+-    if (split) |s| try splitAttention(o, b, g, mi, segs, rows, scale, s);
+-    try ops.expandV(&o.m.ling, o.s, b.ol, ab.wv, b.vn, rows, H, dv, lw);
++    if (split) |s| if (wide) {
++        for (segs) |sg| try expanded.attend(o, b, a, g, mi, sg, scale);
++    } else try splitAttention(o, b, g, mi, segs, rows, scale, s);
++    if (!wide) try ops.expandV(&o.m.ling, o.s, b.ol, ab.wv, b.vn, rows, H, dv, lw);
+     if (a.gate != null) try o.gate(b.vn, b.g, H, rows, H, dv);
+     try o.mm(a.o, b.vn, H * dv, rows, b.y);
+ }
+diff --git a/zig/src/families/ling/block_mla_prompt.zig b/zig/src/families/ling/block_mla_prompt.zig
+new file mode 100644
+index 000000000..d6454e88a
+--- /dev/null
++++ b/zig/src/families/ling/block_mla_prompt.zig
+@@ -0,0 +1,68 @@
++//! Ling's MLA prompt rows in the expanded form (TF_LING_PROMPT_MLA=expand): kv_b over blocks of cache rows, flash tiles.
++
++// Per head 192 q.k dims and 128 v dims a key instead of the absorbed 576 + 512; decode windows stay absorbed.
++const std = @import("std");
++const cuda = @import("cuda");
++const graph = @import("graph.zig");
++const weights = @import("weights.zig");
++const state = @import("state.zig");
++const block_kda = @import("block_kda.zig");
++
++const Ops = graph.Ops;
++const latent = graph.latent;
++const kw = state.cache_width;
++
++/// tf_ling_pattn's dynamic shared bytes: two stages of 64 keys, 192 + 128 bf16 dims each.
++pub const smem: u32 = 2 * 64 * (24 + 16) * 16;
++/// Query rows a tf_ling_pattn block takes.
++pub const block_rows = 128;
++
++/// Whether TF_LING_PROMPT_MLA asks for the expanded form (default: the absorbed one).
++pub fn wanted() bool {
++    const v = std.c.getenv("TF_LING_PROMPT_MLA") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "expand");
++}
++
++/// Whether this forward's MLA rows take the expanded form: prompt rows of a 1,024-row scratch, the switch on.
++pub fn takes(o: Ops, b: *const state.Buffers) bool {
++    return o.prompt and b.prompt and o.m.expand and b.rows >= 2 * latent.chunk;
++}
++
++/// Keys one expansion holds: the scratch's absorbed-query area (rows x heads x 576 bf16) as [2 rows][heads][256] bf16.
++pub fn blockKeys(b: *const state.Buffers) usize {
++    return 2 * b.rows;
++}
++
++/// Segment `sg`'s rows (q roped in b.q) over its cache through its own rows into b.vn; a split cache's pages gathered.
++pub fn attend(o: Ops, b: *const state.Buffers, a: weights.Mla, g: *const graph.Graph, mi: usize, sg: block_kda.Seg, scale: f32) !void {
++    const H: usize = g.w.config.mla_heads;
++    const st = sg.st;
++    const end = st.pos + sg.rows;
++    const split = state.splitOf(g.w);
++    if (split) |s| if (s.world != 2 or g.tp == null) return error.BadWorld;
++    const page = latent.chunk;
++    const kb = if (split != null) 2 * page else blockKeys(b);
++    const co = b.ol; // fp32 carry [rows][heads][128], then m and l [rows][heads]: inside the unused latent-output area
++    const cm = co + b.rows * H * 128 * 4;
++    const cl = cm + b.rows * H * 4;
++    const cache = st.cacheAt(mi);
++    var k0: usize = 0;
++    while (k0 < end) : (k0 += kb) {
++        const n = @min(kb, end - k0);
++        var rows_at = cache + k0 * kw * 2;
++        if (split != null) { // page k0 / 1,024 of each rank: chunks 2 j and 2 j + 1, positions k0 .. k0 + 1,024
++            try g.tp.?.allGather(o.s, cache + (k0 / kb) * page * kw * 2, b.lat, page * kw * 2);
++            rows_at = b.lat;
++        }
++        var j: usize = 0;
++        while (j < n) : (j += b.rows) try o.mm(a.kv_b, rows_at + j * kw * 2, kw, @min(b.rows, n - j), b.qa + j * H * 256 * 2);
++        var x: cuda.Args = .{};
++        inline for (.{ b.q + sg.row0 * H * 192 * 2, b.qa, rows_at, co, cm, cl, b.vn + sg.row0 * H * 128 * 2 }) |v| x.add(v);
++        inline for (.{ sg.rows, H, n, k0, st.pos }) |v| x.add(@as(c_int, @intCast(v)));
++        x.add(scale);
++        x.add(@as(c_int, @intFromBool(k0 == 0)));
++        x.add(@as(c_int, @intFromBool(k0 + kb >= end)));
++        const grid: cuda.launch.Dim3 = .{ .x = @intCast((sg.rows + block_rows - 1) / block_rows), .y = @intCast(H) };
++        try cuda.launch.launch(o.m.pattn, .{ .grid = grid, .block = .{ .x = 256 }, .shared = smem }, o.s, &x);
++    }
++}
+diff --git a/zig/src/families/ling/graph.zig b/zig/src/families/ling/graph.zig
+index e56a88546..b13f5298b 100644
+--- a/zig/src/families/ling/graph.zig
++++ b/zig/src/families/ling/graph.zig
+@@ -28,6 +28,8 @@ pub const Modules = struct {
+     add: cuda.Function,
+     gate: cuda.Function,
+     combine: cuda.Function,
++    pattn: cuda.Function, // tf_ling_pattn: MLA prompt rows in the expanded form
++    expand: bool, // TF_LING_PROMPT_MLA=expand: prompt rows' MLA attention expanded (block_mla_prompt.zig)
+     x3: *Exl3,
+ 
+     /// main's shared EXL3 kernels, heap-held (the grouped view points at its kernels): dense rows, grouped experts.
+@@ -56,6 +58,9 @@ pub const Modules = struct {
+         m.add = try m.mods[4].function("tf_ling_add");
+         m.gate = try m.mods[4].function("tf_ling_gate");
+         m.combine = try m.mods[4].function("tf_ling_combine");
++        m.pattn = try m.mods[4].function("tf_ling_pattn");
++        try m.pattn.allowDynamicShared(@import("block_mla_prompt.zig").smem);
++        m.expand = @import("block_mla_prompt.zig").wanted();
+         m.ling = try ops.Kernels.load(m.mods[0]);
+         m.lane = try cuda.qmmf.Lane.load(d, @intCast(try ctx.attribute(.compute_capability_major)));
+         errdefer m.lane.unload();
+diff --git a/zig/tests/cuda/contract_ling.zig b/zig/tests/cuda/contract_ling.zig
+index 89190fe8a..b78252905 100644
+--- a/zig/tests/cuda/contract_ling.zig
++++ b/zig/tests/cuda/contract_ling.zig
+@@ -520,6 +520,7 @@ pub const Set = struct {
+     copies: [entries.len]Copy = undefined,
+     mla: *@import("contract_ling_mla.zig").Set,
+     more: *@import("contract_ling_more.zig").Set,
++    pattn: @import("contract_ling_pattn.zig").Pattn = undefined,
+ 
+     /// The set, its kernels appended to `list`.
+     pub fn init(gpu: check.Gpu, s: cuda.Stream, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel)) !*Set {
+@@ -545,10 +546,13 @@ pub const Set = struct {
+         for (&set.glue, &set.copies, entries) |*x, *y, e| try list.append(a, if (e.kind == .copy) y.kernel() else x.kernel());
+         set.mla = try @import("contract_ling_mla.zig").Set.init(gpu, s, a, gg, list);
+         set.more = try @import("contract_ling_more.zig").Set.init(gpu, s, a, gg, list);
++        set.pattn = try @import("contract_ling_pattn.zig").init(gpu, s, lg);
++        try list.append(a, set.pattn.kernel());
+         return set;
+     }
+ 
+     pub fn deinit(set: *Set) void {
++        set.pattn.deinit();
+         set.more.deinit();
+         set.mla.deinit();
+         for (&set.glue, &set.copies) |*x, *y| {
+diff --git a/zig/tests/cuda/contract_ling_pattn.zig b/zig/tests/cuda/contract_ling_pattn.zig
+new file mode 100644
+index 000000000..9d2e72031
+--- /dev/null
++++ b/zig/tests/cuda/contract_ling_pattn.zig
+@@ -0,0 +1,206 @@
++//! Ling-3.1-flash's expanded MLA prompt attention (tf_ling_pattn): 192-wide q.k, 128-wide v, key blocks carried in fp32.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const check = @import("check.zig");
++const rig_ = @import("contract_rig.zig");
++const pages = @import("contract_glm_pages.zig");
++
++const contract = core.contract;
++const c = contract.spec;
++const g = contract.gates;
++
++const qk = 192; // q.k dims a head: 128 expanded nope, then the cache's 64 roped columns
++const dv = 128;
++const kw = 576; // a cache row: the latent, then the 64 roped columns
++const bn = 64; // keys a tile
++const block_keys = 512; // keys a launch: the fixture's spans take two to four, carried
++const att_scale: f32 = 0.07216878364870322; // 1 / sqrt(192), as fp32
++const smem: u32 = 2 * 64 * (24 + 16) * 16;
++const soft_why = "online softmax over 64-key tiles carried across key blocks: no input makes its sums exact in fp32";
++
++fn bf(h: u16) f64 {
++    return c.fromBf16(h);
++}
++
++/// A key's 192 products, a tile's 64 keys, then the tiles in turn.
++fn depth(s: c.Shape) usize {
++    return qk + bn + s.k / bn + 1;
++}
++
++const shapes = [_]c.Shape{ .{ .rows = 64, .n = 4 * dv, .k = 1024 }, .{ .rows = 130, .n = 2 * dv, .k = 700 }, .{ .rows = 8, .n = 8 * dv, .k = 2048 } };
++
++fn spec() c.Spec {
++    return .{ .name = "cuda ling ling_glue tf_ling_pattn (expanded MLA prompt rows: 192-wide q.k, 128-wide v, 512-key blocks carried)", .accum = .f32, .depth = depth, .ops = 8, .out = .bf16, .served = &shapes, .sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = soft_why } };
++}
++
++/// tf_ling_pattn as block_mla_prompt.attend calls it: rows at positions at + r over keys 0..at + r, block by block.
++pub const Pattn = struct {
++    rig: rig_.Rig,
++    f: cuda.Function,
++    shape: c.Shape = undefined,
++    q: []u16 = &.{},
++    kv: []u16 = &.{},
++    cache: []u16 = &.{},
++    tol: []f64 = &.{},
++    at: usize = 0,
++    heads: usize = 0,
++    in: [3]u64 = @splat(0), // q, kv, cache
++    carry: [3]u64 = @splat(0),
++    out: u64 = 0,
++
++    pub fn deinit(self: *Pattn) void {
++        self.free();
++        self.rig.deinit();
++    }
++
++    fn free(self: *Pattn) void {
++        const a = self.rig.gpu.gpa;
++        a.free(self.q);
++        a.free(self.kv);
++        a.free(self.cache);
++        a.free(self.tol);
++        self.q = &.{};
++        self.kv = &.{};
++        self.cache = &.{};
++        self.tol = &.{};
++    }
++
++    pub fn kernel(self: *Pattn) g.Kernel {
++        return .{ .spec = spec(), .ctx = self, .vt = &vt };
++    }
++
++    const vt = g.hooks(Pattn);
++
++    /// Queries, keys and values in [-1, 1); row r at position k - rows + r, so the last block holds the rows' own keys.
++    pub fn prepare(self: *Pattn, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (shape.n % dv != 0 or shape.rows == 0 or shape.k < shape.rows) return false;
++        self.free();
++        self.rig.reset();
++        self.shape = shape;
++        self.heads = shape.n / dv;
++        const a = self.rig.gpu.gpa;
++        var prng = std.Random.DefaultPrng.init(seed);
++        const rng = prng.random();
++        self.at = shape.k - shape.rows;
++        const span = shape.k;
++        self.q = try a.alloc(u16, shape.rows * self.heads * qk);
++        self.kv = try a.alloc(u16, span * self.heads * 2 * dv);
++        self.cache = try a.alloc(u16, span * kw);
++        for (self.q) |*v| v.* = c.toBf16(rng.float(f32) * 2 - 1);
++        for (self.kv) |*v| v.* = c.toBf16(rng.float(f32) * 2 - 1);
++        for (self.cache) |*v| v.* = c.toBf16(rng.float(f32) * 2 - 1);
++        if (fill == .nonfinite) {
++            self.q[3] = c.toBf16(std.math.nan(f32));
++            self.q[qk + 150] = c.toBf16(std.math.nan(f32)); // head 1, a roped column
++            self.kv[9] = c.toBf16(std.math.inf(f32)); // key 0, head 0: an expanded key column
++            self.kv[2 * self.heads * 2 * dv + dv + 5] = c.toBf16(std.math.inf(f32)); // key 2, head 0: a value
++            self.cache[3 * kw + 530] = c.toBf16(-std.math.inf(f32)); // key 3, a roped column: scores only
++        }
++        self.in[0] = try self.rig.input(std.mem.sliceAsBytes(self.q));
++        self.in[1] = try self.rig.input(std.mem.sliceAsBytes(self.kv));
++        self.in[2] = try self.rig.input(std.mem.sliceAsBytes(self.cache));
++        const n = shape.rows * self.heads;
++        self.carry = .{ try self.rig.scratch(n * dv * 4), try self.rig.scratch(n * 4), try self.rig.scratch(n * 4) };
++        self.out = try self.rig.output(n * dv * 2);
++        return true;
++    }
++
++    pub fn run(self: *Pattn) !void {
++        const span = self.shape.k;
++        var k0: usize = 0;
++        while (k0 < span) : (k0 += block_keys) {
++            const n = @min(block_keys, span - k0);
++            var a: cuda.Args = .{};
++            const kv = self.in[1] + k0 * self.heads * 2 * dv * 2;
++            inline for (.{ self.in[0], kv, self.in[2] + k0 * kw * 2, self.carry[0], self.carry[1], self.carry[2], self.out }) |v| a.add(v);
++            inline for (.{ self.shape.rows, self.heads, n, k0, self.at }) |v| a.add(@as(c_int, @intCast(v)));
++            a.add(att_scale);
++            a.add(@as(c_int, @intFromBool(k0 == 0)));
++            a.add(@as(c_int, @intFromBool(k0 + block_keys >= span)));
++            try cuda.launch.launch(self.f, .{ .grid = .{ .x = @intCast((self.shape.rows + 127) / 128), .y = @intCast(self.heads) }, .block = .{ .x = 256 }, .shared = smem }, self.rig.s, &a);
++        }
++        try self.rig.s.synchronize();
++    }
++
++    pub fn count(self: *Pattn) usize {
++        return self.shape.rows * self.heads * dv;
++    }
++
++    fn key(self: *const Pattn, i: usize, h: usize, d: usize) f64 {
++        if (d < dv) return bf(self.kv[(i * self.heads + h) * 2 * dv + d]);
++        return bf(self.cache[i * kw + 512 + d - dv]);
++    }
++
++    fn value(self: *const Pattn, i: usize, h: usize, d: usize) f64 {
++        return bf(self.kv[(i * self.heads + h) * 2 * dv + dv + d]);
++    }
++
++    /// Row r, head h: softmax(q . k scale) . v over keys 0..at + r, sums in `acc` (null: float64), into `o`.
++    fn attend(self: *Pattn, r: usize, h: usize, acc: ?c.Accum, order: g.Order, o: []f64, tol: ?[]f64) !void {
++        const a = self.rig.gpu.gpa;
++        const n = self.at + r + 1;
++        const s = try a.alloc(f64, 3 * n);
++        defer a.free(s);
++        const ds = s[n .. 2 * n];
++        const p = s[2 * n ..];
++        var terms: [qk]f64 = undefined;
++        var most = -std.math.inf(f64);
++        const sc: f64 = att_scale;
++        for (0..n) |i| {
++            var abs: f64 = 0;
++            for (&terms, 0..) |*x, d| {
++                x.* = bf(self.q[(r * self.heads + h) * qk + d]) * self.key(i, h, d);
++                abs += @abs(x.*);
++            }
++            s[i] = (if (acc) |k| pages.sumIn(k, order, &terms) else pages.sumIn(.none, .sequential, &terms)) * sc;
++            ds[i] = abs * sc * (qk + 8) * 0x1p-24;
++            most = pages.maxNan(most, s[i]);
++        }
++        for (p, s[0..n]) |*x, v| x.* = @exp(v - most);
++        const l = if (acc) |k| pages.sumIn(k, order, p) else pages.sumIn(.none, .sequential, p);
++        const col = try a.alloc(f64, n);
++        defer a.free(col);
++        for (o, 0..) |*od, d| {
++            var spread: f64 = 0;
++            for (col, p, 0..) |*x, w, i| {
++                const v = self.value(i, h, d);
++                x.* = w * v;
++                spread += w * @abs(v) * (0x1p-8 + ds[i]);
++            }
++            od.* = (if (acc) |k| pages.sumIn(k, order, col) else pages.sumIn(.none, .sequential, col)) / l;
++            if (tol) |t| t[d] = @abs(od.*) * 0x1p-8 + spread / l + 1e-30;
++        }
++    }
++
++    /// float64 o = sum p v / sum p, p = exp(s - max); bound: bf16 out and p (2^-8 each), 200 2^-24 scale sum |q k|.
++    pub fn reference(self: *Pattn, want: []f64, mag: []f64) !void {
++        const a = self.rig.gpu.gpa;
++        a.free(self.tol);
++        self.tol = try a.alloc(f64, want.len);
++        for (0..self.shape.rows) |r| for (0..self.heads) |h| {
++            const at = (r * self.heads + h) * dv;
++            try self.attend(r, h, null, .sequential, want[at..][0..dv], self.tol[at..][0..dv]);
++        };
++        for (mag, want) |*m, w| m.* = @abs(w);
++    }
++
++    pub fn bounds(self: *Pattn, _: []const f64, _: []const f64, allow: []f64) !void {
++        for (allow, self.tol) |*l, t| l.* = if (std.math.isFinite(t)) t else std.math.floatMax(f64);
++    }
++
++    pub fn simulate(self: *Pattn, acc: c.Accum, order: g.Order, out: []f64) !void {
++        for (0..self.shape.rows) |r| for (0..self.heads) |h| {
++            const at = (r * self.heads + h) * dv;
++            try self.attend(r, h, acc, order, out[at..][0..dv], null);
++            for (out[at..][0..dv]) |*v| v.* = bf(c.toBf16(@floatCast(v.*)));
++        };
++    }
++};
++
++/// The rig for tf_ling_pattn on the ling_glue image (`lg`), registered into `list`.
++pub fn init(gpu: check.Gpu, s: cuda.Stream, lg: cuda.Module) !Pattn {
++    const f = try lg.function("tf_ling_pattn");
++    try f.allowDynamicShared(smem);
++    return .{ .rig = .{ .gpu = gpu, .s = s }, .f = f };
++}
+diff --git a/zig/tests/cuda/ling_tp.zig b/zig/tests/cuda/ling_tp.zig
+index 60c8f7532..141d9af99 100644
+--- a/zig/tests/cuda/ling_tp.zig
++++ b/zig/tests/cuda/ling_tp.zig
+@@ -151,7 +151,20 @@ fn greedy(e: *engine.Engine, ids: []const u32, from: ?engine.Resume, marks: ?eng
+     try e.bind(0);
+     try e.begin(null);
+     const t0 = check.now(clock);
+-    toks[0] = try e.prefill(ids, from, null, marks);
++    if (std.c.getenv("TF_LING_TP_CHUNKS") != null and from == null and marks == null) { // each chunk timed alone
++        var at = try e.prefillStart(ids.len, null);
++        while (true) {
++            const c0 = check.now(clock);
++            const s = try e.prefillChunk(ids, at, null, null);
++            try e.stream.synchronize();
++            std.debug.print("RESULT ling-tp chunk at {d}: {d} rows in {d:.1} ms\n", .{ at, s.at - at, @as(f64, @floatFromInt(check.now(clock) - c0)) / 1e6 });
++            if (s.first) |t| {
++                toks[0] = t;
++                break;
++            }
++            at = s.at;
++        }
++    } else toks[0] = try e.prefill(ids, from, null, marks);
+     try e.stream.synchronize();
+     std.debug.print("RESULT ling-tp prompt: {d} ids from {d} in {d:.1} ms\n", .{ ids.len, if (from) |f| f.at else 0, @as(f64, @floatFromInt(check.now(clock) - t0)) / 1e6 });
+     try e.bp.arena.buf.download(e.bp.logits - e.bp.arena.buf.ptr, std.mem.sliceAsBytes(logits[0..V]));
+-- 
+2.53.0
+

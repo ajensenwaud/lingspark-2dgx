@@ -1,0 +1,168 @@
+From 67f3aaaa1eba41da1090656bbebffe996193b054 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 11:15:43 +1100
+Subject: [PATCH 19/26] ling: CUDA graphs and RoCE gathers on by default
+ (TF_LING_GRAPHS=0 / TF_LING_ROCE=0 turn them off): graphs dropped after every
+ prompt chunk and whenever an eager forward is wider than any window since the
+ last drop, since main's shared scratch may grow and move (a served run hit an
+ illegal address on a stale graph); a wider window runs eager first so scratch
+ never grows inside a capture. Gates: ling-tp every row's logits and drafts
+ byte-equal graphs+RoCE vs eager NCCL (windows of 4 at 4,000 and across the
+ 4,096-key/8-chunk edge, MTP chains of 5); served fixed texts equal to the
+ eager build's, drafted == plain on all four
+
+---
+ zig/src/families/ling/engine.zig |  7 +++---
+ zig/src/families/ling/steps.zig  | 40 ++++++++++++++++++++++++++------
+ zig/src/families/ling/tp.zig     |  6 ++---
+ 3 files changed, 40 insertions(+), 13 deletions(-)
+
+diff --git a/zig/src/families/ling/engine.zig b/zig/src/families/ling/engine.zig
+index 3d7d91010..0ae505bb6 100644
+--- a/zig/src/families/ling/engine.zig
++++ b/zig/src/families/ling/engine.zig
+@@ -102,7 +102,7 @@ pub const Engine = struct {
+     lead: bool = false,
+     asleep: bool = false, // rank 0: the other ranks sleep on their lines until its next step
+     dropped: std.ArrayList(u64) = .empty, // kept states dropped since the last step: rank 1 drops them first
+-    graphs: ?*steps.Graphs = null, // TF_LING_GRAPHS=1: one sequence's verify windows as CUDA graphs
++    graphs: ?*steps.Graphs = null, // one sequence's verify windows and MTP chains as CUDA graphs (TF_LING_GRAPHS=0: off)
+ 
+     /// The checkpoint at `dir` in its own format.
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, dir: []const u8, o: Options) !*Engine {
+@@ -377,6 +377,7 @@ pub const Engine = struct {
+         const ids = part;
+         const rows = stop - at;
+         const f = e.forward(&e.bp);
++        steps.eager(e.graphs, rows, true); // the prompt path's scratch may move: graphs are captured again after it
+         const seg = [_]fw.Seg{.{ .st = &e.cur.st, .row0 = 0, .rows = rows }};
+         try f.embed(@ptrCast(ids[0..rows]));
+         try f.stack(&seg);
+@@ -435,7 +436,7 @@ pub const Engine = struct {
+             @memcpy(ids[rows..][0..p.ids.len], p.ids);
+             rows += p.ids.len;
+         }
+-        try e.forward(&e.bs).run(segs[0..parts.len], @ptrCast(ids[0..rows]));
++        try steps.shared(e.graphs, e.forward(&e.bs), segs[0..parts.len], @ptrCast(ids[0..rows]));
+         for (parts, segs[0..parts.len]) |p, sg| {
+             try e.bind(p.slot);
+             e.cur.rows_at = e.bs.normed + sg.row0 * e.c.hidden * 2;
+@@ -464,7 +465,7 @@ pub const Engine = struct {
+         var s0: usize = 0;
+         while (s0 < follow.len) : (s0 += window_rows) {
+             const part = follow[s0..@min(follow.len, s0 + window_rows)];
+-            try h.absorb(&e.m, e.stream, &h.bm, hd, @ptrCast(part), hidden + s0 * D * 2);
++            try steps.absorb(e.graphs, h, h.forward(&e.m, e.stream, &h.bm), hd, @ptrCast(part), hidden + s0 * D * 2);
+         }
+         if (hd.pos != q.st.pos) return error.MtpOutOfStep;
+         const f = h.forward(&e.m, e.stream, &h.bm);
+diff --git a/zig/src/families/ling/steps.zig b/zig/src/families/ling/steps.zig
+index 3de735b20..4189ca70c 100644
+--- a/zig/src/families/ling/steps.zig
++++ b/zig/src/families/ling/steps.zig
+@@ -15,11 +15,12 @@ pub const Graphs = struct {
+     gpa: std.mem.Allocator,
+     eng: cuda.graph_cache.CudaEngine,
+     cache: cuda.graph_cache.Cache(Key),
++    epoch: u64 = 0, // the graphs' fingerprint: a new value drops them all (shared scratch may have moved)
++    rows_max: usize = 0, // the widest window since the last drop
+ 
+-    /// The graphs when TF_LING_GRAPHS=1 (null otherwise: every window eager, as before).
++    /// The graphs (TF_LING_GRAPHS=0: null, every window eager as before; replays are byte-equal to eager windows).
+     pub fn create(gpa: std.mem.Allocator, d: *const cuda.Driver) !?*Graphs {
+-        const v = std.c.getenv("TF_LING_GRAPHS") orelse return null;
+-        if (!std.mem.eql(u8, std.mem.span(v), "1")) return null;
++        if (std.c.getenv("TF_LING_GRAPHS")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return null;
+         const g = try gpa.create(Graphs);
+         g.* = .{ .gpa = gpa, .eng = .{ .d = d }, .cache = undefined };
+         g.cache = cuda.graph_cache.Cache(Key).init(gpa, g.eng.engine(), .{ .max = 24 });
+@@ -33,6 +34,27 @@ pub const Graphs = struct {
+     }
+ };
+ 
++/// An eager forward of `rows` (a prompt chunk, a shared window) ran: main's shared scratch (EXL3 rows, expert plans)
++/// may have grown and moved, so a prompt chunk or a wider forward drops every graph that points at the old one.
++pub fn eager(graphs: ?*Graphs, rows: usize, prompt: bool) void {
++    const g = graphs orelse return;
++    if (!prompt and rows <= g.rows_max) return;
++    g.epoch += 1;
++    g.rows_max = if (prompt) 0 else rows;
++}
++
++/// A shared window's forward (several sequences: eager), after eager()'s check.
++pub fn shared(graphs: ?*Graphs, f: fw.Forward, segs: []const fw.Seg, ids: []const i32) !void {
++    eager(graphs, try f.rowsOf(segs), false);
++    return f.run(segs, ids);
++}
++
++/// h.absorb (eager) after eager()'s check: a draft's kept rows may be wider than any window since the last drop.
++pub fn absorb(graphs: ?*Graphs, h: *const head.Head, f: fw.Forward, hd: *fw.State, next: []const i32, hidden: u64) !void {
++    eager(graphs, next.len, false);
++    return h.absorb(f.m, f.s, f.b, hd, next, hidden);
++}
++
+ const Body = struct {
+     f: *const fw.Forward,
+     segs: []const fw.Seg,
+@@ -54,12 +76,16 @@ pub fn run(graphs: ?*Graphs, f: fw.Forward, segs: []const fw.Seg, ids: []const i
+     const rows = try f.rowsOf(segs);
+     if (ids.len != rows) return error.TooManyRows;
+     const st = segs[0].st;
++    if (rows > g.rows_max) { // wider than any window since the last drop: eager first, so scratch grows outside a capture
++        eager(g, rows, false);
++        return f.run(segs, ids);
++    }
+     var gf = f;
+     gf.nch_fix = chunks(f, st, rows);
+     try gf.upload(ids);
+     const key: Key = .{ .arena = st.arena.buf.ptr, .buffers = f.b.arena.buf.ptr, .rows = @intCast(rows), .parity = if (st.cur.len > 0) st.cur[0] else 0, .nch = @intCast(gf.nch_fix) };
+     var body: Body = .{ .f = &gf, .segs = segs, .rows = rows };
+-    _ = try g.cache.run(key, f.s, 1, .{ .ctx = &body, .run = Body.run });
++    _ = try g.cache.run(key, f.s, g.epoch, .{ .ctx = &body, .run = Body.run });
+     st.pending = rows; // what stack() leaves on the host, which a replay does not run
+     st.prompt = false;
+ }
+@@ -75,7 +101,7 @@ fn chunks(f: fw.Forward, st: *const fw.State, rows: usize) usize {
+ pub fn chain(graphs: ?*Graphs, h: *const head.Head, f: fw.Forward, hd: *fw.State, tok: []const i32, hidden: u64) !void {
+     if (tok.len != 1) return error.BadRows;
+     try f.upload(tok);
+-    if (graphs != null and fw.splitOf(f.g.w) == null) {
++    if (graphs) |g| if (g.rows_max == 0) eager(g, 1, false) else if (fw.splitOf(f.g.w) == null) {
+         var gf = f;
+         gf.nch_fix = chunks(f, hd, 1);
+         const C = struct {
+@@ -94,11 +120,11 @@ pub fn chain(graphs: ?*Graphs, h: *const head.Head, f: fw.Forward, hd: *fw.State
+         };
+         var body: C = .{ .f = &gf, .h = h, .hd = hd, .hidden = hidden };
+         const key: Key = .{ .arena = hd.arena.buf.ptr, .buffers = f.b.arena.buf.ptr, .rows = 1, .parity = @as(u32, @intCast(hidden - f.b.normed)) | (1 << 31), .nch = @intCast(gf.nch_fix) };
+-        _ = try graphs.?.cache.run(key, f.s, 1, .{ .ctx = &body, .run = C.run });
++        _ = try g.cache.run(key, f.s, g.epoch, .{ .ctx = &body, .run = C.run });
+         hd.pending = 1;
+         hd.prompt = false;
+         return f.commit(hd, 1);
+-    }
++    };
+     try f.embedRows(1);
+     try h.step(f, hd, 1, hidden, null);
+     try f.final(1);
+diff --git a/zig/src/families/ling/tp.zig b/zig/src/families/ling/tp.zig
+index d151c5d82..7fc7136c3 100644
+--- a/zig/src/families/ling/tp.zig
++++ b/zig/src/families/ling/tp.zig
+@@ -53,10 +53,10 @@ pub fn group(io: std.Io, p: Place) !cuda.tp_group.Group {
+     return .{ .lib = lib, .comm = comm, .rank = p.rank, .world = p.world };
+ }
+ 
+-/// TF_LING_ROCE=1: the per-layer gathers by main's RoCE writes (GLM's TF_ROCE_MAX_KB cap); both ranks open it or neither.
++/// Main's RoCE one-shot gathers for the per-layer all-gathers (GLM's TF_ROCE_MAX_KB cap; TF_LING_ROCE=0 keeps NCCL):
++/// both ranks open it or neither (a gather is a copy: results byte-equal either way).
+ pub fn roce(g: *cuda.tp_group.Group, gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream) !void {
+-    const v = std.c.getenv("TF_LING_ROCE") orelse return;
+-    if (!std.mem.eql(u8, std.mem.span(v), "1")) return;
++    if (std.c.getenv("TF_LING_ROCE")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return;
+     try g.openRoce(gpa, io, d, s, try glm.native.roceBytes(if (std.c.getenv("TF_ROCE_MAX_KB")) |x| std.mem.span(x) else null));
+     std.log.info("ling tp: rank {d} gathers {s}", .{ g.rank, if (g.fast != null) "by RoCE writes up to the cap, NCCL past it" else "on NCCL (RoCE did not come up)" });
+ }
+-- 
+2.53.0
+

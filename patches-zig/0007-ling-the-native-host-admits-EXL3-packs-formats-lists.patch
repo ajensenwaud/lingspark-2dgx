@@ -1,0 +1,28 @@
+From 8b7018957ae0b1a1e66fea89ec6ac51f70adb01d Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 22:15:49 +1100
+Subject: [PATCH 07/26] ling: the native host admits EXL3 packs (formats lists
+ exl3, which the loader reads since the shared-operator port)
+
+Served at TP=1 from a 4-bit exllamav3 v1.6.6 conversion of a ling-synth checkpoint: models, completions
+and chat answered, greedy replies repeat byte for byte.
+---
+ zig/src/families/ling/native.zig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/src/families/ling/native.zig b/zig/src/families/ling/native.zig
+index bb8bdfe31..b314261e4 100644
+--- a/zig/src/families/ling/native.zig
++++ b/zig/src/families/ling/native.zig
+@@ -6,7 +6,7 @@ const engine = @import("engine.zig");
+ const ling_lanes = @import("lanes.zig");
+ 
+ pub const model_type = "bailing_hybrid";
+-pub const formats: []const []const u8 = &.{ "bf16", "fp8-block", "modelopt-nvfp4" };
++pub const formats: []const []const u8 = &.{ "bf16", "fp8-block", "modelopt-nvfp4", "exl3" };
+ pub const default_context: i64 = 8192;
+ pub const max_segments: u32 = 1;
+ pub const prompt_rows: u32 = engine.prompt_rows;
+-- 
+2.53.0
+

@@ -1,0 +1,89 @@
+From 694d0cac6e2a6ae032f4af42830ef754ad1f7152 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 21:44:45 +1100
+Subject: [PATCH 04/26] ling: uploads on v1.2.0's fail-fast fromHost replaced
+ by the family's own (a failed copy frees after a drain, else leaks)
+
+v1.2.0's DeviceBuffer.fromHost exits the process when a failed upload's drain fails too; the family's
+fault harness (ling-init-faults) fails every call from one on, so its staged packer inputs and the absorb
+identity rows now upload through weights.uploaded: freed after a context drain, leaked when it fails,
+as the rest of the loader does. ling-init-faults prints what a clean open left behind.
+---
+ zig/src/families/ling/graph.zig        |  2 +-
+ zig/src/families/ling/weights.zig      |  1 +
+ zig/src/families/ling/weights_proj.zig | 12 +++++++++++-
+ zig/tests/cuda/ling_faults.zig         |  3 ++-
+ 4 files changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/families/ling/graph.zig b/zig/src/families/ling/graph.zig
+index 30b36c732..c20e4f1cc 100644
+--- a/zig/src/families/ling/graph.zig
++++ b/zig/src/families/ling/graph.zig
+@@ -234,7 +234,7 @@ fn absorbOf(gpa: std.mem.Allocator, store: *weights.Store, m: *const Modules, s:
+     @memset(eye, 0);
+     for (0..lw) |i| eye[i * lw + i] = 0x3f80; // bf16 1.0
+     var pending = false; // the decode queued and not yet drained
+-    var x = try cuda.DeviceBuffer.fromHost(store.d, std.mem.sliceAsBytes(eye));
++    var x = try weights.uploaded(store.d, std.mem.sliceAsBytes(eye));
+     defer freeDrained(s, &x, pending);
+     var y = try cuda.DeviceBuffer.alloc(store.d, lw * n * 2);
+     defer freeDrained(s, &y, pending);
+diff --git a/zig/src/families/ling/weights.zig b/zig/src/families/ling/weights.zig
+index 3d411d88a..ad5084f81 100644
+--- a/zig/src/families/ling/weights.zig
++++ b/zig/src/families/ling/weights.zig
+@@ -13,6 +13,7 @@ pub const Mlp = proj.Mlp;
+ pub const Routed = proj.Routed;
+ pub const Store = proj.Store;
+ pub const drains = proj.drains;
++pub const uploaded = proj.uploaded;
+ 
+ /// KDA: full-rank projections, the q|k|v short convs as #804's chain reads them, the decay and output norm tensors.
+ pub const Kda = struct {
+diff --git a/zig/src/families/ling/weights_proj.zig b/zig/src/families/ling/weights_proj.zig
+index f842c69ed..899d24ac1 100644
+--- a/zig/src/families/ling/weights_proj.zig
++++ b/zig/src/families/ling/weights_proj.zig
+@@ -89,6 +89,16 @@ pub fn drains(s: cuda.Stream) bool {
+     return true;
+ }
+ 
++/// A device copy of `bytes`; a failed copy frees it after a context drain, else leaks it (fromHost exits instead).
++pub fn uploaded(d: *const cuda.Driver, bytes: []const u8) !cuda.DeviceBuffer {
++    var b = try cuda.DeviceBuffer.alloc(d, bytes.len);
++    b.upload(0, bytes) catch |e| {
++        if (d.synchronize()) |_| b.free() else |_| {}
++        return e;
++    };
++    return b;
++}
++
+ /// Host bf16 from fp32: round to nearest even, NaN kept quiet.
+ pub fn toBf16(v: f32) u16 {
+     const b: u32 = @bitCast(v);
+@@ -185,7 +195,7 @@ pub const Reader = struct {
+ 
+     /// A temporary device copy of `bytes` for a packer, freed by the caller once settled().
+     fn staged(r: *Reader, bytes: []const u8) !cuda.DeviceBuffer {
+-        return cuda.DeviceBuffer.fromHost(r.store.d, bytes);
++        return uploaded(r.store.d, bytes);
+     }
+ 
+     /// Nothing queued can still read or write memory: at once, or after a drain; false when the drain fails.
+diff --git a/zig/tests/cuda/ling_faults.zig b/zig/tests/cuda/ling_faults.zig
+index b380ed0ca..5b08d0f90 100644
+--- a/zig/tests/cuda/ling_faults.zig
++++ b/zig/tests/cuda/ling_faults.zig
+@@ -82,7 +82,8 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+     const calls = fake.count();
+     const allocs = counter.allocations;
+     clean.deinit(clean.ctx);
+-    try check.expect(dbg.deinit() == .ok and fake.live() == 0 and fake.badReleases() == 0 and fake.freedEarly() == 0, "a clean open and close leaves nothing", .{});
++    const leaks = dbg.deinit();
++    try check.expect(leaks == .ok and fake.live() == 0 and fake.badReleases() == 0 and fake.freedEarly() == 0, "a clean open and close leaves nothing (host {t}, {d} live, {d} bad releases, {d} freed early)", .{ leaks, fake.live(), fake.badReleases(), fake.freedEarly() });
+     var bad: usize = 0;
+     var tried: usize = 0;
+     var pending: usize = 0;
+-- 
+2.53.0
+

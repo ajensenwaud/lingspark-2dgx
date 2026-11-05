@@ -1,0 +1,1024 @@
+From d01cba3b76f6e835b4e18a6d4cda7b29066e3a80 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 01:13:32 +1100
+Subject: [PATCH 15/26] ling: the latent caches split by 512-key chunks over
+ two ranks past the native window (TF_LING_KV_SPLIT=auto|on|off): each rank
+ keeps every other chunk (cache writes through main's page table, other ranks'
+ rows to a spare page), runs every head's attention over its chunks (absorbed
+ queries all-gathered), merges them per head in fp32 (tf_ling_merge_part,
+ tf_glm_merge's loop as a template), swaps the other rank's heads' partials
+ and merges the two with tf_glm_merge; tf_ling_chunks_split_r16 is
+ tf_ling_chunks_r16's chunk kernel with a rank's chunk stride. Off: the
+ launches are today's. Also: the prompt pass's logits and head gather sized
+ for the one row it reads (0.72 GiB a rank at TP=2), and a kept prompt state
+ holds the conv windows and each KDA layer's committed state only (0.31 ->
+ 0.14 GiB a rank). ling-tp: --prompt, --capacity, --resume (resumed == fresh);
+ kernel contract: the split pair beside tf_ling_chunks_r16
+
+---
+ docs/recipes/ling-3.1-flash-cuda.md   |  14 ++-
+ zig/kernels/cuda/glm_glue_attn.cuh    |  61 +++++++++---
+ zig/src/families/ling/block_mla.zig   |  42 +++++++-
+ zig/src/families/ling/cuda.zig        |   2 +
+ zig/src/families/ling/engine.zig      |  65 +++++++++---
+ zig/src/families/ling/forward.zig     |   2 +
+ zig/src/families/ling/graph.zig       |   1 +
+ zig/src/families/ling/native.zig      |  24 +++--
+ zig/src/families/ling/ops.zig         |  21 ++++
+ zig/src/families/ling/state.zig       | 136 ++++++++++++++++++++++----
+ zig/src/families/ling/weights.zig     |   1 +
+ zig/tests/cuda/contract_ling_more.zig |  57 ++++++++++-
+ zig/tests/cuda/ling_lanes.zig         |   2 +-
+ zig/tests/cuda/ling_tp.zig            |  81 +++++++++++----
+ 14 files changed, 432 insertions(+), 77 deletions(-)
+
+diff --git a/docs/recipes/ling-3.1-flash-cuda.md b/docs/recipes/ling-3.1-flash-cuda.md
+index 420db7ce9..26acc601e 100644
+--- a/docs/recipes/ling-3.1-flash-cuda.md
++++ b/docs/recipes/ling-3.1-flash-cuda.md
+@@ -32,8 +32,18 @@ The plain rope is unchanged bit for bit when YaRN is off.
+ 
+ `TF_LING_RANK` of `TF_LING_WORLD` (1 or 2) places each rank and `NCCL_COMM_ID` names rank 0's address and port; each
+ rank keeps a TCP line to rank 0 on the next port, and a rank that fails stops the other. Each rank loads half the KDA
+-and MLA heads, half of every MLP and expert width (EXL3's 128-wide blocks) and half the vocabulary of the head; the
+-latent cache is whole on both. Give both ranks the same arguments:
++and MLA heads, half of every MLP and expert width (EXL3's 128-wide blocks) and half the vocabulary of the head. The
++latent cache is whole on both ranks up to the native window; past it each rank keeps every other 512-position chunk
++(`TF_LING_KV_SPLIT`), so at 1M a rank holds half the cache (5.6 GiB instead of 11.25 on the full model). Each rank then
++runs all 64 heads' attention over its own chunks (the absorbed queries gathered first), merges its chunks per head in
++fp32, swaps the other rank's heads' partials, and merges the two as GLM's chunk merge does; the result differs from the
++whole cache only in the order the chunks' softmax sums are added. Give both ranks the same arguments:
++
++| `TF_LING_KV_SPLIT` | latent cache at two ranks |
++| --- | --- |
++| `auto` (default) | split when `--context` is past 262,144 |
++| `on` | split at any context (two ranks only) |
++| `off` | whole on both ranks |
+ 
+ ```bash
+ # on rank 1
+diff --git a/zig/kernels/cuda/glm_glue_attn.cuh b/zig/kernels/cuda/glm_glue_attn.cuh
+index 8b1e5c061..7613ac5b3 100644
+--- a/zig/kernels/cuda/glm_glue_attn.cuh
++++ b/zig/kernels/cuda/glm_glue_attn.cuh
+@@ -43,12 +43,14 @@ constexpr int wide_smem() {
+   return (HB * (LW + RW) + 2 * KT * (LW + RW) + HB * KT) * 2 + (HB * 4 + 2 * HB) * 4;
+ }
+ 
+-// RW roped columns (Ling's 64) follow the latent in q and keys: scores over LW + RW, values from the latent alone.
+-template <int HB, bool FP8 = false, int RW = 0>
++// RW roped columns (Ling's 64) follow the latent in q and keys; SPLIT: block z is chunk z * sw + sr, keys page z.
++template <int HB, bool FP8 = false, int RW = 0, bool SPLIT = false>
+ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
+                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
+-                            float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr) {
++                            float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr,
++                            int sw = 1, int sr = 0) {
+   static_assert(!(FP8 && RW != 0), "the E4M3 cache holds the latent alone");
++  static_assert(!(SPLIT && FP8), "a split cache holds BF16 rows");
+   constexpr int MT = HB / 16, KW = LW + RW;
+   extern __shared__ __align__(16) unsigned char smem[];
+   __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(smem);
+@@ -59,10 +61,12 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+   const int t = threadIdx.x, lane = t & 31, warp = t >> 5, g = lane >> 2, q = lane & 3;
+   const int kg = warp & 3, hh = warp >> 2;
+   const int64_t r = blockIdx.x, h0 = (int64_t)blockIdx.y * HB, c = blockIdx.z;
+-  const int64_t n = sparse ? cnt[r] : 0, limit = sparse ? 0 : (int64_t)pos[0] + r, start = c * CH;
++  const int64_t n = sparse ? cnt[r] : 0, limit = sparse ? 0 : (int64_t)pos[0] + r;
++  const int64_t start = (SPLIT ? c * sw + sr : c) * CH;
+   const bool live = sparse ? start < n : start <= limit;
+   // a dense chunk's 512 keys are one page, its rows from that page's; a sparse key's row comes as the token list has it
+-  const __nv_bfloat16* keys_at = !FP8 && pt && !sparse && live ? lc + ((int64_t)pt[c] * (pstep / 2) - start * KW) : lc;
++  const __nv_bfloat16* paged = !FP8 && pt && !sparse && live ? lc + ((int64_t)pt[c] * (pstep / 2) - start * KW) : lc;
++  const __nv_bfloat16* keys_at = SPLIT ? lc + (c * CH - start) * KW : paged;
+   auto load_kv = [&](int tile) {
+     __nv_bfloat16* dst = kvs + (tile & 1) * KT * KW;
+     const int64_t first = start + tile * KT;
+@@ -237,6 +241,14 @@ extern "C" __global__ void __launch_bounds__(256)
+   glm_attn::chunks_wide<16, false, 64>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, pt, pstep);
+ }
+ 
++// tf_ling_chunks_r16 over a split cache: block z is chunk z * world + rank of the positions, page z of `lc`.
++extern "C" __global__ void __launch_bounds__(256)
++    tf_ling_chunks_split_r16(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, float* po, float* pm,
++                             float* pl, int64_t rows, int64_t heads, float scale, int world, int rank) {
++  glm_attn::chunks_wide<16, false, 64, true>(qa, lc, pos, nullptr, nullptr, po, pm, pl, rows, heads, 0, scale, 0,
++                                             nullptr, 0, nullptr, world, rank);
++}
++
+ // E4M3 cache variants reconstruct the existing BF16 shared tile before the unchanged attention math.
+ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_chunks_16_fp8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
+@@ -253,11 +265,13 @@ extern "C" __global__ void __launch_bounds__(256)
+                                  po, pm, pl, rows, heads, w, scale, sparse, nullptr, 0, scales);
+ }
+ 
+-// latent._merge, block (row, head), 128 threads: chunks merged in order, o / l by div.full; skips sparse count-0 rows.
+-extern "C" __global__ void __launch_bounds__(128)
+-    tf_glm_merge(const float* po, const float* pm, const float* pl, __nv_bfloat16* out, const int* cnt, int64_t rows,
+-                 int64_t heads, int nch, int sparse) {
+-  constexpr int LW = glm_attn::LW;
++namespace glm_attn {
++
++// latent._merge's loop, block (row, head): chunks in order into o / l in bf16, or (PART) o, m and l kept in fp32.
++template <bool PART>
++__device__ __forceinline__ void merge_rows(const float* po, const float* pm, const float* pl, __nv_bfloat16* out,
++                                           float* qo, float* qm, float* ql, const int* cnt, int64_t rows,
++                                           int64_t heads, int nch, int sparse) {
+   const int64_t r = blockIdx.x, h = blockIdx.y;
+   if (sparse && cnt[r] == 0) return;
+   const int k0 = threadIdx.x * 4;
+@@ -278,7 +292,32 @@ extern "C" __global__ void __launch_bounds__(128)
+     }
+     m = nm;
+   }
+-  for (int j = 0; j < 4; ++j) out[(r * heads + h) * LW + k0 + j] = __float2bfloat16_rn(glm_triton::div_full(o[j], l));
++  if constexpr (PART) {
++    for (int j = 0; j < 4; ++j) qo[(r * heads + h) * LW + k0 + j] = o[j];
++    if (threadIdx.x == 0) {
++      qm[r * heads + h] = m;
++      ql[r * heads + h] = l;
++    }
++  } else {
++    for (int j = 0; j < 4; ++j)
++      out[(r * heads + h) * LW + k0 + j] = __float2bfloat16_rn(glm_triton::div_full(o[j], l));
++  }
++}
++
++}  // namespace glm_attn
++
++// latent._merge, block (row, head), 128 threads: chunks merged in order, o / l by div.full; skips sparse count-0 rows.
++extern "C" __global__ void __launch_bounds__(128)
++    tf_glm_merge(const float* po, const float* pm, const float* pl, __nv_bfloat16* out, const int* cnt, int64_t rows,
++                 int64_t heads, int nch, int sparse) {
++  glm_attn::merge_rows<false>(po, pm, pl, out, nullptr, nullptr, nullptr, cnt, rows, heads, nch, sparse);
++}
++
++// One rank's chunks of a split cache merged, block (row, head): o, m and l in fp32 as one chunk's (nch 0: empty).
++extern "C" __global__ void __launch_bounds__(128)
++    tf_ling_merge_part(const float* po, const float* pm, const float* pl, float* qo, float* qm, float* ql,
++                       int64_t rows, int64_t heads, int nch) {
++  glm_attn::merge_rows<true>(po, pm, pl, nullptr, qo, qm, ql, nullptr, rows, heads, nch, 0);
+ }
+ 
+ // sparse._scores, block (row, L pool blocks) of 4 warps, 16 pools a warp: sum_h w relu(dots scale), -inf past visible.
+diff --git a/zig/src/families/ling/block_mla.zig b/zig/src/families/ling/block_mla.zig
+index d97c186d7..5da759804 100644
+--- a/zig/src/families/ling/block_mla.zig
++++ b/zig/src/families/ling/block_mla.zig
+@@ -40,6 +40,7 @@ pub fn block(o: Ops, b: *const state.Buffers, a: weights.Mla, ab: graph.Absorb,
+     try ops.absorbQ(&o.m.ling, o.s, b.q, qk, ab.wk, b.qa, kw, rows, H, nope, lw);
+     const scale = c.smScale();
+     for (segs) |sg| try room(b, sg.st, sg.rows); // every segment before the first cache write
++    const split = state.splitOf(g.w);
+     for (segs) |sg| {
+         const st = sg.st;
+         const r = sg.row0;
+@@ -50,7 +51,10 @@ pub fn block(o: Ops, b: *const state.Buffers, a: weights.Mla, ab: graph.Absorb,
+         }
+         try ops.rope(&o.m.ling, o.s, .{ .x = b.q + (r * H * qk + nope) * 2, .x_row = H * qk, .x_head = qk, .out = b.qa + (r * H * kw + lw) * 2, .o_row = H * kw, .o_head = kw }, sg.rows, H, rp, g.freq, g.rope_scale);
+         try ops.rope(&o.m.ling, o.s, .{ .x = b.kv + (r * kvs + lw) * 2, .x_row = kvs, .x_head = 0, .out = b.lat + (r * kw + lw) * 2, .o_row = kw, .o_head = 0 }, sg.rows, 1, rp, g.freq, g.rope_scale);
+-        try latent.latentWrite(o.set(), o.s, b.lat + r * kw * 2, kw, st.cacheAt(mi), .{}, st.pos_dev, sg.rows, kw);
++        // a split cache is written by pages: this rank's chunks to theirs, other ranks' rows to the spare page
++        const t: latent.Table = if (split != null) .{ .pt = g.table, .ps = latent.chunk * kw * 2 } else .{};
++        try latent.latentWrite(o.set(), o.s, b.lat + r * kw * 2, kw, st.cacheAt(mi), t, st.pos_dev, sg.rows, kw);
++        if (split != null) continue; // every segment's queries roped before they are gathered
+         var r0: usize = 0;
+         while (r0 < sg.rows) : (r0 += b.ar) {
+             const m = @min(b.ar, sg.rows - r0);
+@@ -64,7 +68,43 @@ pub fn block(o: Ops, b: *const state.Buffers, a: weights.Mla, ab: graph.Absorb,
+             try ops.attention(&o.m.ling, o.set(), o.s, b.qa + row * H * kw * 2, st.cacheAt(mi), at, b.partials, b.ol + row * H * lw * 2, b.dummy, m, H, lw, nch, scale);
+         }
+     }
++    if (split) |s| try splitAttention(o, b, g, mi, segs, rows, scale, s);
+     try ops.expandV(&o.m.ling, o.s, b.ol, ab.wv, b.vn, rows, H, dv, lw);
+     if (a.gate != null) try o.gate(b.vn, b.g, H, rows, H, dv);
+     try o.mm(a.o, b.vn, H * dv, rows, b.y);
+ }
++
++/// Split-cache attention (two ranks): all heads over this rank's chunks, merged, swapped, then merged across the ranks.
++fn splitAttention(o: Ops, b: *const state.Buffers, g: *const graph.Graph, mi: usize, segs: []const block_kda.Seg, rows: usize, scale: f32, s: state.Split) !void {
++    const tp = g.tp orelse return error.BadWorld;
++    if (s.world != 2 or tp.world != 2) return error.BadWorld;
++    const H: usize = g.w.config.mla_heads;
++    const q_rows = rows * H * kw * 2; // one rank's absorbed queries for the forward's rows
++    try tp.allGather(o.s, b.qa, b.qa_all, q_rows);
++    const peer = 1 - s.rank;
++    for (segs) |sg| {
++        const st = sg.st;
++        var r0: usize = 0;
++        while (r0 < sg.rows) : (r0 += b.ar) {
++            const m = @min(b.ar, sg.rows - r0);
++            var at = st.pos_dev;
++            if (r0 > 0) {
++                try o.addI32(st.pos_dev, r0, b.at);
++                at = b.at;
++            }
++            const nloc = s.owned(latent.chunksFor(st.pos + r0 + m));
++            const row = sg.row0 + r0;
++            const po = m * H * lw * 4; // a rank's merged o for these rows; then its m and l, m * H * 4 each
++            const ml = m * H * 4;
++            try ops.chunksSplit(&o.m.ling, o.s, b.qa_all + peer * q_rows + row * H * kw * 2, st.cacheAt(mi), at, b.partials, m, H, nloc, scale, s.world, s.rank);
++            try ops.mergePart(&o.m.ling, o.s, b.partials, b.sent, m, H, nloc);
++            try tp.allGather(o.s, b.sent.po, b.got.po, po);
++            try tp.allGather(o.s, b.sent.pm, b.got.pm, ml);
++            try tp.allGather(o.s, b.sent.pl, b.got.pl, ml);
++            try ops.chunksSplit(&o.m.ling, o.s, b.qa_all + s.rank * q_rows + row * H * kw * 2, st.cacheAt(mi), at, b.partials, m, H, nloc, scale, s.world, s.rank);
++            const own: latent.Partials = .{ .po = b.got.po + s.rank * po, .pm = b.got.pm + s.rank * ml, .pl = b.got.pl + s.rank * ml };
++            try ops.mergePart(&o.m.ling, o.s, b.partials, own, m, H, nloc); // over the copy of `sent` the gather left here
++            try latent.merge(o.set(), o.s, b.got, b.ol + row * H * lw * 2, b.dummy, m, H, lw, s.world, false);
++        }
++    }
++}
+diff --git a/zig/src/families/ling/cuda.zig b/zig/src/families/ling/cuda.zig
+index 1ed4d65c2..be24212b8 100644
+--- a/zig/src/families/ling/cuda.zig
++++ b/zig/src/families/ling/cuda.zig
+@@ -31,6 +31,8 @@ test {
+     _ = @import("config_test.zig");
+     _ = @import("rope.zig");
+     _ = @import("tp.zig");
++    _ = @import("state.zig");
++    _ = @import("engine.zig");
+     _ = @import("weights_cut.zig");
+     _ = @import("names_test.zig");
+     _ = @import("synth.zig");
+diff --git a/zig/src/families/ling/engine.zig b/zig/src/families/ling/engine.zig
+index 0eef8a68e..b6422b492 100644
+--- a/zig/src/families/ling/engine.zig
++++ b/zig/src/families/ling/engine.zig
+@@ -32,8 +32,22 @@ pub const Options = struct {
+     yarn: rope.Mode = .auto, // TF_LING_YARN: auto turns YaRN on when the context passes the native window
+     context: ?usize = null, // the served context auto compares (null: the capacity)
+     group: ?*const cuda.tp_group.Group = null, // TP=2: the ranks' group (this rank's share loads, blocks reduce)
++    kv_split: rope.Mode = .auto, // TF_LING_KV_SPLIT: the latent caches split over two ranks (splitOn)
++    prompt_logits: usize = 1, // rows the prompt pass's logits hold: the last row's is all it reads (checks: more)
+ };
+ 
++/// TF_LING_KV_SPLIT=auto splits the latent caches over two ranks past this many positions (the native window).
++pub const split_from = 262144;
++
++/// Whether the latent caches split by chunks over the ranks (state.Split): on needs two ranks; auto past split_from.
++pub fn splitOn(m: rope.Mode, world: usize, context: usize) !bool {
++    return switch (m) {
++        .off => false,
++        .on => if (world == 2) true else error.KvSplitWorld,
++        .auto => world == 2 and context > split_from,
++    };
++}
++
+ /// Rank 0's word on its request (cancelled or not), asked before each chunk.
+ pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) bool };
+ /// One stream's window of a shared verify: its slot, its ids, and its drawn tokens.
+@@ -122,11 +136,18 @@ pub const Engine = struct {
+             e.w = try weights.load(gpa, d, e.stream, &pack, &opened.ck, c, all, .{ .rank = if (g) |x| @intCast(x.rank) else 0, .world = if (g) |x| @intCast(x.world) else 1 });
+         }
+         errdefer e.w.drop(weights.drains(e.stream)); // leaked on a failed drain: a queued launch may read them
++        e.w.kv_split = try splitOn(o.kv_split, e.w.world, o.context orelse o.capacity);
+         e.main = e.w;
+         e.main.layers = e.w.layers[0..layers.len];
+         e.g = try fw.Graph.init(gpa, d, &e.m, e.stream, &e.main);
+         errdefer e.g.drop(weights.drains(e.stream)); // as e.w
+         e.g.tp = o.group;
++        if (fw.splitOf(&e.w)) |s| { // the cache write's table, a page per 512 positions (the graph's store holds it)
++            const t = try gpa.alloc(i32, @import("graph.zig").latent.chunksFor(o.capacity));
++            defer gpa.free(t);
++            s.table(t);
++            e.g.table = try e.g.store.keep(std.mem.sliceAsBytes(t), "ling.kv_split.table");
++        }
+         e.att = try fw.Att.init(d, &e.w, &.{ o.prompt_rows, window_rows, shared_rows }, o.capacity); // bm: window_rows
+         errdefer e.att.deinit();
+         if (mtp) {
+@@ -137,8 +158,11 @@ pub const Engine = struct {
+             };
+         }
+         errdefer if (e.mtp) |*h| h.deinit();
+-        if (e.mtp) |*h| h.g.tp = o.group;
+-        e.bp = try fw.Buffers.init(d, &e.m, &e.w, o.prompt_rows, true, o.capacity, &e.att);
++        if (e.mtp) |*h| {
++            h.g.tp = o.group;
++            h.g.table = e.g.table;
++        }
++        e.bp = try fw.Buffers.initRows(d, &e.m, &e.w, o.prompt_rows, true, o.capacity, &e.att, @min(o.prompt_rows, o.prompt_logits));
+         errdefer e.bp.deinit();
+         e.bd = try fw.Buffers.init(d, &e.m, &e.w, window_rows, false, o.capacity, &e.att);
+         errdefer e.bd.deinit();
+@@ -470,25 +494,30 @@ pub const Engine = struct {
+         for (out[0..rows], got[0..rows]) |*o, p| o.* = p[1];
+     }
+ 
+-    /// Bytes one state kept at `at` takes: the KDA part whole, each MLA layer's rows below `at`, the MTP head's alike.
++    /// Bytes a state kept at `at` takes: the committed KDA part, each MLA layer's rows below `at`, the MTP head's too.
+     pub fn stateBytes(e: *const Engine, at: usize) u64 {
+         const q = e.cur;
+         return keptBytes(&q.st, at) + if (q.hd) |h| keptBytes(&h, at + 1) else 0;
+     }
+ 
+-    /// A State's bytes before its MLA cache, then `at` rows of each layer's cache (later rows are never read).
++    /// A kept State: its conv windows and each KDA layer's committed state, then each layer's cache rows below `at`.
+     fn keptBytes(st: *const fw.State, at: usize) usize {
+-        return (st.cache - st.arena.buf.ptr) + st.mla_layers * at * cache_row;
++        return st.keptHead() + st.mla_layers * st.below(at) * cache_row;
+     }
+ 
+-    /// The State into `kept` (out) or back from it: the part before the cache, then each MLA layer's first `at` rows.
+-    fn keptCopy(e: *const Engine, st: *const fw.State, kept: u64, at: usize, out: bool) !void {
+-        const pre = st.cache - st.arena.buf.ptr;
+-        try (if (out) e.copy(kept, st.arena.buf.ptr, pre) else e.copy(st.arena.buf.ptr, kept, pre));
+-        const rows = at * cache_row;
++    /// The State into `kept` (out) or back from it: conv windows, the KDA copies `cur` names, the rows below `at`.
++    fn keptCopy(e: *const Engine, st: *const fw.State, kept: u64, at: usize, cur: []const u1, out: bool) !void {
++        const conv = st.kda_layers * 3 * st.convWidth() * 2;
++        if (conv > 0) try (if (out) e.copy(kept, st.conv, conv) else e.copy(st.conv, kept, conv));
++        for (0..st.kda_layers) |li| {
++            const k = kept + conv + li * st.rec_layer;
++            try (if (out) e.copy(k, st.recAt(cur[li], li), st.rec_layer) else e.copy(st.recAt(cur[li], li), k, st.rec_layer));
++        }
++        const rows = st.below(at) * cache_row;
+         if (rows == 0) return;
++        const lead = st.keptHead();
+         for (0..st.mla_layers) |mi| {
+-            const dst = kept + pre + mi * rows;
++            const dst = kept + lead + mi * rows;
+             try (if (out) e.copy(dst, st.cacheAt(mi), rows) else e.copy(st.cacheAt(mi), dst, rows));
+         }
+     }
+@@ -500,13 +529,13 @@ pub const Engine = struct {
+         try e.send(.keep_state, .{ .kind = 0, .a = e.next_snap }, &.{});
+         var buf = try cuda.DeviceBuffer.alloc(e.d, keptBytes(&q.st, q.st.pos));
+         errdefer if (weights.drains(e.stream)) buf.free(); // else leaked: the copy into it may be queued
+-        try e.keptCopy(&q.st, buf.ptr, q.st.pos, true);
++        try e.keptCopy(&q.st, buf.ptr, q.st.pos, q.st.cur, true);
+         var hd: ?cuda.DeviceBuffer = null;
+         errdefer if (hd) |*x| if (weights.drains(e.stream)) x.free();
+         if (q.hd) |h| {
+             if (q.in_head != 0) return error.NotCommitted;
+             hd = try cuda.DeviceBuffer.alloc(e.d, keptBytes(&h, h.pos));
+-            try e.keptCopy(&h, hd.?.ptr, h.pos, true);
++            try e.keptCopy(&h, hd.?.ptr, h.pos, h.cur, true);
+         }
+         try e.stream.synchronize();
+         const cur = try e.gpa.dupe(u1, q.st.cur);
+@@ -521,13 +550,13 @@ pub const Engine = struct {
+     pub fn restoreState(e: *Engine, id: u64) !void {
+         const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
+         const q = e.cur;
+-        try e.keptCopy(&q.st, s.buf.ptr, s.pos, false);
++        try e.keptCopy(&q.st, s.buf.ptr, s.pos, s.cur, false);
+         @memcpy(q.st.cur, s.cur);
+         q.st.pending = 0;
+         q.st.prompt = false;
+         try q.st.setPos(e.stream, s.pos);
+         if (q.hd) |*h| {
+-            try e.keptCopy(h, (s.hd orelse return error.NoKeptState).ptr, s.hd_pos, false);
++            try e.keptCopy(h, (s.hd orelse return error.NoKeptState).ptr, s.hd_pos, h.cur, false);
+             h.pending = 0;
+             try h.setPos(e.stream, s.hd_pos);
+         }
+@@ -555,3 +584,9 @@ pub const Engine = struct {
+         try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, e.stream.handle), "cuMemcpyDtoDAsync");
+     }
+ };
++
++test "TF_LING_KV_SPLIT: auto splits at two ranks past the native window, on needs two ranks, off never" {
++    try std.testing.expect(!try splitOn(.auto, 2, split_from) and try splitOn(.auto, 2, split_from + 1) and !try splitOn(.auto, 1, 1 << 20));
++    try std.testing.expect(try splitOn(.on, 2, 4096) and !try splitOn(.off, 2, 1 << 20));
++    try std.testing.expectError(error.KvSplitWorld, splitOn(.on, 1, 4096));
++}
+diff --git a/zig/src/families/ling/forward.zig b/zig/src/families/ling/forward.zig
+index b323ed148..14c0467be 100644
+--- a/zig/src/families/ling/forward.zig
++++ b/zig/src/families/ling/forward.zig
+@@ -15,6 +15,7 @@ pub const Graph = graph.Graph;
+ pub const Buffers = state.Buffers;
+ pub const Att = state.Att;
+ pub const State = state.State;
++pub const splitOf = state.splitOf;
+ pub const window_rows = state.window_rows;
+ pub const cache_width = state.cache_width;
+ 
+@@ -140,6 +141,7 @@ pub const Forward = struct {
+     /// lm_head of b.normed's rows row0 .. row0 + n into b.logits from its first row.
+     pub fn logitsOf(f: *const Forward, row0: usize, n: usize) !void {
+         const D: usize = f.g.w.config.hidden;
++        if (n > f.b.logit_rows) return error.TooManyRows;
+         const head_w = f.g.w.head orelse return error.TiedHeadNotBuilt;
+         const g = f.g.tp orelse return f.ops().mm(head_w, f.b.normed + row0 * D * 2, D, n, f.b.logits);
+         const V: usize = f.g.w.config.vocab; // TP: this rank's vocabulary half, gathered, then laid out by rows
+diff --git a/zig/src/families/ling/graph.zig b/zig/src/families/ling/graph.zig
+index c7daef379..f8e8314bf 100644
+--- a/zig/src/families/ling/graph.zig
++++ b/zig/src/families/ling/graph.zig
+@@ -175,6 +175,7 @@ pub const Graph = struct {
+     rope_scale: f32 = 1, // YaRN's attention factor on cos and sin, 1 for the plain rope
+     zero_bias: u64, // fp32 [experts]: select's bias without moe_router_enable_expert_bias
+     tp: ?*const cuda.tp_group.Group = null, // TP=2: the ranks' group, set by the engine (each block's one reduce)
++    table: u64 = 0, // a split's i32 [pages]: the latent cache write's table (state.Split.table), set by the engine
+ 
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, m: *const Modules, s: cuda.Stream, w: *const weights.Weights) !Graph {
+         const c = &w.config;
+diff --git a/zig/src/families/ling/native.zig b/zig/src/families/ling/native.zig
+index 0ce9077cf..050854597 100644
+--- a/zig/src/families/ling/native.zig
++++ b/zig/src/families/ling/native.zig
+@@ -57,29 +57,35 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     _ = kernels; // our own kernels: a captured set is not used
+     const p = try tp.place(tp.env);
+     const yarn = try rope.mode(if (std.c.getenv("TF_LING_YARN")) |v| std.mem.span(v) else null);
+-    if (p.world == 1) return openRank(gpa, io, ctx, dir, o, yarn, p);
++    const split = try splitMode();
++    if (p.world == 1) return openRank(gpa, io, ctx, dir, o, yarn, split, p);
+     if (std.c.getenv("NCCL_COMM_ID") == null) return error.NoCommId;
+     try cuda.tp_watch.start(io, p.rank, p.world); // each rank's TCP line to rank 0 at NCCL_COMM_ID's port + 1
+-    return openRank(gpa, io, ctx, dir, o, yarn, p) catch |err| {
++    return openRank(gpa, io, ctx, dir, o, yarn, split, p) catch |err| {
+         cuda.tp_watch.fail(@errorName(err)); // the other ranks stop with this one
+         return err;
+     };
+ }
+ 
++/// TF_LING_KV_SPLIT: auto (the default: split past the native window at two ranks), on or off.
++pub fn splitMode() !rope.Mode {
++    return rope.mode(if (std.c.getenv("TF_LING_KV_SPLIT")) |v| std.mem.span(v) else null) catch error.BadKvSplit;
++}
++
+ /// GLM's two-rank start: NCCL from rank 0's id, this rank's share loaded; rank 1 follows and exits, rank 0 serves.
+-fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, o: Options, yarn: rope.Mode, p: tp.Place) !Loaded {
++fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, o: Options, yarn: rope.Mode, split: rope.Mode, p: tp.Place) !Loaded {
+     const own = try gpa.create(Owned);
+     errdefer gpa.destroy(own);
+     own.* = .{ .gpa = gpa, .e = undefined };
+     if (p.world > 1) own.group = try tp.group(io, p);
+     errdefer if (own.group) |*g| g.close();
+-    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, .{ .capacity = capacity(o.context), .mtp = o.drafts, .yarn = yarn, .context = o.context, .group = if (own.group) |*g| g else null });
++    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, .{ .capacity = capacity(o.context), .mtp = o.drafts, .yarn = yarn, .context = o.context, .group = if (own.group) |*g| g else null, .kv_split = split });
+     errdefer own.e.deinit();
+     if (own.group) |*g| {
+         own.link = try tp.Link.init(gpa, ctx.d, &g.lib, g.comm, own.e.stream, capacity(o.context));
+         own.e.link = &own.link.?;
+         own.e.lead = p.rank == 0;
+-        try cuda.tp_watch.ready(io, try digest(gpa, io, dir, o, yarn)); // the ranks agree on the checkpoint and settings
++        try cuda.tp_watch.ready(io, try digest(gpa, io, dir, o, yarn, split)); // the ranks agree on the checkpoint and settings
+         if (p.rank != 0) { // a follower never serves: rank 0's steps, then it leaves the process
+             tp.follow(own.e, io) catch |err| {
+                 std.log.err("rank {d}: following rank 0 stopped ({s})", .{ p.rank, @errorName(err) });
+@@ -104,15 +110,15 @@ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     };
+ }
+ 
+-/// What the ranks must agree on: config.json's bytes, the context, drafts and the YaRN setting.
+-fn digest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Options, yarn: rope.Mode) ![32]u8 {
++/// What the ranks must agree on: config.json's bytes, the context, drafts, the YaRN and cache-split settings.
++fn digest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Options, yarn: rope.Mode, split: rope.Mode) ![32]u8 {
+     const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
+     defer gpa.free(path);
+     const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24));
+     defer gpa.free(text);
+     var h = std.crypto.hash.sha2.Sha256.init(.{});
+     h.update(text);
+-    h.update(std.mem.asBytes(&[_]u64{ o.context, @intFromBool(o.drafts), @backingInt(yarn) }));
++    h.update(std.mem.asBytes(&[_]u64{ o.context, @intFromBool(o.drafts), @backingInt(yarn), @backingInt(split) }));
+     return h.finalResult();
+ }
+ 
+@@ -172,6 +178,8 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.PromptTooLong => "the prompt and its reply exceed the window: raise --context",
+         error.YarnOff => "TF_LING_YARN=off keeps the plain rope, trained to the native window: lower --context or set TF_LING_YARN to auto or on",
+         error.BadYarnMode => "TF_LING_YARN: auto (YaRN past the native window, the default), on or off",
++        error.BadKvSplit => "TF_LING_KV_SPLIT: auto (the latent caches split over two ranks past 262,144 positions, the default), on or off",
++        error.KvSplitWorld => "TF_LING_KV_SPLIT=on splits the latent caches over two ranks: set TF_LING_WORLD=2, or auto or off",
+         error.NoRank => "Ling at TP over hosts: set TF_LING_RANK and TF_LING_WORLD (1 or 2) on every host, or neither for one GPU",
+         error.TpWorld => "Ling on CUDA runs on one GPU or two ranks: set TF_LING_WORLD to 1 or 2",
+         error.NoCommId => "Ling's ranks meet over NCCL: with TF_LING_WORLD 2, set NCCL_COMM_ID to rank 0's address:port on every host",
+diff --git a/zig/src/families/ling/ops.zig b/zig/src/families/ling/ops.zig
+index 716ca2514..a1182da83 100644
+--- a/zig/src/families/ling/ops.zig
++++ b/zig/src/families/ling/ops.zig
+@@ -20,6 +20,8 @@ pub const Kernels = struct {
+     expand_v: cuda.Function,
+     rope: cuda.Function,
+     chunks: cuda.Function,
++    chunks_split: cuda.Function,
++    merge_part: cuda.Function,
+ 
+     pub fn load(m: cuda.Module) !Kernels {
+         var k: Kernels = undefined;
+@@ -30,6 +32,9 @@ pub const Kernels = struct {
+         k.rope = try m.function("tf_ling_rope");
+         k.chunks = try m.function("tf_ling_chunks_r16");
+         try k.chunks.allowDynamicShared(chunksSmem(latent.heads_tile));
++        k.chunks_split = try m.function("tf_ling_chunks_split_r16");
++        try k.chunks_split.allowDynamicShared(chunksSmem(latent.heads_tile));
++        k.merge_part = try m.function("tf_ling_merge_part");
+         return k;
+     }
+ };
+@@ -123,6 +128,22 @@ pub fn attention(k: *const Kernels, set: glue.Set, stream: cuda.Stream, qa: u64,
+     try latent.merge(set, stream, p, out, dummy, rows, heads, lw, nch, false);
+ }
+ 
++/// The chunk kernel over a split cache: this rank's `nch` chunks (chunk z * world + rank of the positions) into `p`.
++pub fn chunksSplit(k: *const Kernels, stream: cuda.Stream, qa: u64, cache: u64, pos: u64, p: latent.Partials, rows: usize, heads: usize, nch: usize, scale: f32, world: usize, rank: usize) !void {
++    if (nch == 0) return;
++    const hb = latent.heads_tile;
++    var a: cuda.Args = .{};
++    inline for (.{ qa, cache, pos, p.po, p.pm, p.pl, i64of(rows), i64of(heads), scale, cint(world), cint(rank) }) |v| a.add(v);
++    try cuda.launch.launch(k.chunks_split, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb), .z = @intCast(nch) }, .block = .{ .x = 256 }, .shared = chunksSmem(hb) }, stream, &a);
++}
++
++/// `nch` chunks' partials merged into one chunk's (o, m, l in fp32) at `out`: nch 0 writes the empty one.
++pub fn mergePart(k: *const Kernels, stream: cuda.Stream, p: latent.Partials, out: latent.Partials, rows: usize, heads: usize, nch: usize) !void {
++    var a: cuda.Args = .{};
++    inline for (.{ p.po, p.pm, p.pl, out.po, out.pm, out.pl, i64of(rows), i64of(heads), cint(nch) }) |v| a.add(v);
++    try cuda.launch.launch(k.merge_part, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(heads) }, .block = .{ .x = 128 } }, stream, &a);
++}
++
+ test "the roped chunk tiles fit the 99 KiB a GB10 block may take" {
+     try std.testing.expect(chunksSmem(16) <= 99 * 1024);
+     try std.testing.expectEqual(@as(f32, 1.0), ropeFreqs(6e6)[0]);
+diff --git a/zig/src/families/ling/state.zig b/zig/src/families/ling/state.zig
+index 8435a1d8b..af0a45e31 100644
+--- a/zig/src/families/ling/state.zig
++++ b/zig/src/families/ling/state.zig
+@@ -25,6 +25,46 @@ fn partialBytes(nch: usize, ar: usize, heads: usize) [3]usize {
+     return .{ nch * ar * heads * 512 * 4, nch * ar * heads * 4, nch * ar * heads * 4 };
+ }
+ 
++/// Latent caches split by 512-key chunks (TF_LING_KV_SPLIT): chunk c is page c / world on rank c % world.
++pub const Split = struct {
++    world: usize,
++    rank: usize,
++
++    /// The chunks below chunk `n` this rank holds.
++    pub fn owned(s: Split, n: usize) usize {
++        return (n + s.world - 1 - s.rank) / s.world;
++    }
++
++    /// Rows a layer's cache of `capacity` positions takes here: this rank's chunks, then the spare page.
++    pub fn rows(s: Split, capacity: usize) usize {
++        return (s.owned(latent.chunksFor(capacity)) + 1) * latent.chunk;
++    }
++
++    /// This rank's rows of the positions below `at`: they lead its cache, its chunks in order.
++    pub fn below(s: Split, at: usize) usize {
++        const full = at / latent.chunk;
++        const n = s.owned(full) * latent.chunk;
++        return if (full % s.world == s.rank) n + at % latent.chunk else n;
++    }
++
++    /// The cache write's table (i32, a page per 512 positions): this rank's page for its chunks, else the spare page.
++    pub fn table(s: Split, out: []i32) void {
++        const spare = s.owned(out.len);
++        for (out, 0..) |*p, c| p.* = @intCast(if (c % s.world == s.rank) c / s.world else spare);
++    }
++};
++
++/// The split a rank's weights were opened with (Weights.kv_split), or null: every position on every rank.
++pub fn splitOf(w: *const weights.Weights) ?Split {
++    return if (w.kv_split and w.world > 1) .{ .world = w.world, .rank = w.rank } else null;
++}
++
++/// The chunks one attention call's partials hold at `capacity`: all of them, or this rank's under a split.
++fn localChunks(w: *const weights.Weights, capacity: usize) usize {
++    const n = latent.chunksFor(capacity);
++    return if (splitOf(w)) |s| s.owned(n) else n;
++}
++
+ /// One partials area all an engine's Buffers share: each attention call writes all its merge reads, on one stream.
+ pub const Att = struct {
+     arena: Arena,
+@@ -35,7 +75,7 @@ pub const Att = struct {
+     /// Sized once for the widest of `rows` (each sharing Buffers' rows) at `capacity`.
+     pub fn init(d: *const cuda.Driver, w: *const weights.Weights, rows: []const usize, capacity: usize) !Att {
+         const heads: usize = w.config.mla_heads;
+-        const nch = latent.chunksFor(capacity);
++        const nch = localChunks(w, capacity);
+         var ar: usize = 1;
+         for (rows) |r| ar = @max(ar, attRows(r, nch, heads));
+         var p: [3]u64 = undefined;
+@@ -149,11 +189,22 @@ pub const Buffers = struct {
+     plan: cuda.grouped.Plan,
+     eact: u64, // bf16 [pairs][moe_inter]
+     ey: u64, // bf16 [pairs][hidden], or every expert's rows [experts][rows][hidden] for per-expert lanes
+-    logits: u64, // bf16 [rows][vocab]
++    logits: u64, // bf16 [logit_rows][vocab]
+     xg: u64, // TP: bf16 [world][rows][hidden] gathered partials, or the head's [rows][vocab / world] then [world][..]
++    logit_rows: usize, // the most rows lm_head takes at once (a prompt pass reads its last row only)
++    nloc: usize, // the chunks one attention call's partials hold: nch, or this rank's under a split
++    qa_all: u64, // split: bf16 [world][rows][heads][576], every rank's absorbed queries
++    sent: latent.Partials, // split: fp32 [ar][heads][512], [ar][heads] x 2: this rank's chunks merged for a peer's heads
++    got: latent.Partials, // split: [world] of `sent`, each rank's chunks merged for this rank's heads
+ 
+     /// `att`: the engine's shared partials area (null: the scratch's own, as a check's standalone Buffers).
+     pub fn init(d: *const cuda.Driver, m: *const graph.Modules, w: *const weights.Weights, rows: usize, prompt: bool, capacity: usize, att: ?*const Att) !Buffers {
++        return initRows(d, m, w, rows, prompt, capacity, att, rows);
++    }
++
++    /// init with logits for `logit_rows` rows (1 ..= rows): the prompt pass reads one, a verify window all of them.
++    pub fn initRows(d: *const cuda.Driver, m: *const graph.Modules, w: *const weights.Weights, rows: usize, prompt: bool, capacity: usize, att: ?*const Att, logit_rows: usize) !Buffers {
++        if (logit_rows == 0 or logit_rows > rows) return error.TooManyRows;
+         const c = &w.config;
+         const D: usize = c.hidden;
+         const H: usize = c.kda_heads;
+@@ -169,23 +220,30 @@ pub const Buffers = struct {
+             lanes = true;
+         };
+         const nch = latent.chunksFor(capacity);
+-        const ar = attRows(rows, nch, HM);
+-        if (att) |x| if (x.nch != nch or x.ar < ar) return error.AttScratch;
+-        const pb: [3]usize = if (att != null) .{ 0, 0, 0 } else partialBytes(nch, ar, HM); // shared: none of its own
++        const nloc = localChunks(w, capacity);
++        const ar = attRows(rows, nloc, HM);
++        if (att) |x| if (x.nch != nloc or x.ar < ar) return error.AttScratch;
++        const pb: [3]usize = if (att != null) .{ 0, 0, 0 } else partialBytes(nloc, ar, HM); // shared: none of its own
++        const W: usize = w.world;
++        const lr = logit_rows;
++        const sp = splitOf(w) != null;
++        const xs: [2]usize = if (sp) .{ ar * HM * 512 * 4, ar * HM * 4 } else .{ 0, 0 }; // a merged partial's o, then m or l
+         const hist = if (pairs > cuda.grouped.small) (pairs + cuda.grouped.small - 1) / cuda.grouped.small * (E + 1) else 1;
+         const sizes = [_]usize{
+-            rows * 4,                                        rows * D * 2,                   rows * D * 2,                                                                                             rows * D * 2,
+-            rows * D * 2,                                    rows * @max(n, width) * 2,      partBytes(m, w, rows),                                                                                    if (prompt) rows * kdaStride(w) * 2 else 16,
+-            rows * n * 2,                                    rows * n * 2,                   rows * n * 2,                                                                                             rows * n * 4,
+-            rows * n * 2,                                    rows * n * 4,                   rows * H * 4,                                                                                             rows * n * 4,
+-            rows * n * 2,                                    rows * ql * 2,                  rows * ql * 2,                                                                                            rows * HM * c.qkDim() * 2,
+-            rows * kv_rows * 2,                              rows * cache_width * 2,         rows * HM * cache_width * 2,                                                                              rows * HM * 512 * 2,
+-            rows * HM * c.v_dim * 2,                         rows * HM * 2,                  pb[0],                                                                                                    pb[1],
+-            pb[2],                                           4,                              8,                                                                                                        rows * 2 * width * 2,
+-            rows * width * 2,                                rows * (width / 64 + 1) * 4,    rows * E * 4,                                                                                             glue_router_ks * rows * E * 4,
+-            pairs * 4,                                       pairs * 4,                      pairs * 4,                                                                                                cuda.grouped.maxItems(pairs, E + 1, 16) * 12,
+-            8,                                               pairs * 4,                      hist * 4,                                                                                                 pairs * c.moe_inter * 2,
+-            @max(pairs, if (lanes) E * rows else 0) * D * 2, rows * @as(usize, c.vocab) * 2, if (w.world > 1) rows * @max(2 * D * w.world, @as(usize, c.vocab) / w.world * (w.world + 1)) * 2 else 16,
++            rows * 4,                                        rows * D * 2,                 rows * D * 2,                                                                            rows * D * 2,
++            rows * D * 2,                                    rows * @max(n, width) * 2,    partBytes(m, w, rows),                                                                   if (prompt) rows * kdaStride(w) * 2 else 16,
++            rows * n * 2,                                    rows * n * 2,                 rows * n * 2,                                                                            rows * n * 4,
++            rows * n * 2,                                    rows * n * 4,                 rows * H * 4,                                                                            rows * n * 4,
++            rows * n * 2,                                    rows * ql * 2,                rows * ql * 2,                                                                           rows * HM * c.qkDim() * 2,
++            rows * kv_rows * 2,                              rows * cache_width * 2,       rows * HM * cache_width * 2,                                                             rows * HM * 512 * 2,
++            rows * HM * c.v_dim * 2,                         rows * HM * 2,                pb[0],                                                                                   pb[1],
++            pb[2],                                           4,                            8,                                                                                       rows * 2 * width * 2,
++            rows * width * 2,                                rows * (width / 64 + 1) * 4,  rows * E * 4,                                                                            glue_router_ks * rows * E * 4,
++            pairs * 4,                                       pairs * 4,                    pairs * 4,                                                                               cuda.grouped.maxItems(pairs, E + 1, 16) * 12,
++            8,                                               pairs * 4,                    hist * 4,                                                                                pairs * c.moe_inter * 2,
++            @max(pairs, if (lanes) E * rows else 0) * D * 2, lr * @as(usize, c.vocab) * 2, if (W > 1) @max(rows * 2 * D * W, lr * (@as(usize, c.vocab) / W * (W + 1))) * 2 else 16, if (sp) W * rows * HM * cache_width * 2 else 0,
++            xs[0],                                           xs[1],                        xs[1],                                                                                   W * xs[0],
++            W * xs[1],                                       W * xs[1],
+         };
+         var p: [sizes.len]u64 = undefined;
+         const a = try Arena.init(d, &sizes, &p);
+@@ -231,6 +289,11 @@ pub const Buffers = struct {
+             .ey = p[44],
+             .logits = p[45],
+             .xg = p[46],
++            .logit_rows = lr,
++            .nloc = nloc,
++            .qa_all = p[47],
++            .sent = .{ .po = p[48], .pm = p[49], .pl = p[50] },
++            .got = .{ .po = p[51], .pm = p[52], .pl = p[53] },
+         };
+     }
+ 
+@@ -259,13 +322,15 @@ pub const State = struct {
+     save_v: u64, // bf16, as save_k
+     save_g: u64, // fp32, as save_k
+     save_b: u64, // fp32 [kda layers][window_rows][heads]
+-    cache: u64, // bf16 [mla layers][capacity][576]
++    cache: u64, // bf16 [mla layers][rows][576]
+     cur: []u1, // each KDA layer's committed copy of rec
+     kda_layers: usize,
+     mla_layers: usize,
+     heads: usize,
+     stride: usize, // kdaStride
+     rec_layer: usize, // bytes of one layer's state
++    rows: usize, // a layer's cache rows here: capacity, or this rank's chunks and the spare page (Split)
++    split: ?Split,
+ 
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, g: *const graph.Graph, capacity: usize) !State {
+         const c = &g.w.config;
+@@ -275,13 +340,15 @@ pub const State = struct {
+         const n = H * kda.dk;
+         const ps = kdaStride(g.w);
+         const W = window_rows;
+-        const sizes = [_]usize{ 4, nk * 3 * 3 * n * 2, 2 * nk * n * kda.dv * 4, nk * W * ps * 2, nk * W * n * 4, nk * W * n * 2, nk * W * n * 4, nk * W * H * 4, nm * capacity * cache_width * 2 };
++        const split = splitOf(g.w);
++        const rows = if (split) |s| s.rows(capacity) else capacity;
++        const sizes = [_]usize{ 4, nk * 3 * 3 * n * 2, 2 * nk * n * kda.dv * 4, nk * W * ps * 2, nk * W * n * 4, nk * W * n * 2, nk * W * n * 4, nk * W * H * 4, nm * rows * cache_width * 2 };
+         var p: [sizes.len]u64 = undefined;
+         var a = try Arena.init(d, &sizes, &p);
+         errdefer a.buf.free();
+         const cur = try gpa.alloc(u1, nk);
+         @memset(cur, 0);
+-        return .{ .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cache = p[8], .cur = cur, .kda_layers = nk, .mla_layers = nm, .heads = H, .stride = ps, .rec_layer = n * kda.dv * 4 };
++        return .{ .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cache = p[8], .cur = cur, .kda_layers = nk, .mla_layers = nm, .heads = H, .stride = ps, .rec_layer = n * kda.dv * 4, .rows = rows, .split = split };
+     }
+ 
+     pub fn deinit(st: *State) void {
+@@ -321,7 +388,17 @@ pub const State = struct {
+     }
+ 
+     pub fn cacheAt(st: *const State, mi: usize) u64 {
+-        return st.cache + mi * st.capacity * cache_width * 2;
++        return st.cache + mi * st.rows * cache_width * 2;
++    }
++
++    /// The rows of each layer's cache that hold positions below `at` (they lead it): at, or this rank's share.
++    pub fn below(st: *const State, at: usize) usize {
++        return if (st.split) |s| s.below(at) else at;
++    }
++
++    /// A kept state's part before its cache rows: the conv windows, then each KDA layer's committed state.
++    pub fn keptHead(st: *const State) usize {
++        return st.kda_layers * (3 * st.convWidth() * 2 + st.rec_layer);
+     }
+ 
+     /// Layer li's window saves: projection rows, k, v, decay, beta.
+@@ -331,3 +408,20 @@ pub const State = struct {
+         return .{ .p = st.proj + li * window_rows * st.stride * 2, .k = st.save_k + kv * 4, .v = st.save_v + kv * 2, .g = st.save_g + kv * 4, .b = st.save_b + li * window_rows * st.heads * 4 };
+     }
+ };
++
++test "a split cache: chunks alternate over two ranks, each rank's rows below a position lead its cache" {
++    const s: [2]Split = .{ .{ .world = 2, .rank = 0 }, .{ .world = 2, .rank = 1 } };
++    try std.testing.expectEqual(@as(usize, 2), s[0].owned(3));
++    try std.testing.expectEqual(@as(usize, 1), s[1].owned(3));
++    try std.testing.expectEqual(@as(usize, 3 * 512), s[0].rows(1088));
++    try std.testing.expectEqual(@as(usize, 2 * 512), s[1].rows(1088));
++    try std.testing.expectEqual(@as(usize, 512), s[0].below(700));
++    try std.testing.expectEqual(@as(usize, 188), s[1].below(700));
++    try std.testing.expectEqual(@as(usize, 588), s[0].below(1100));
++    for (0..5000) |at| try std.testing.expectEqual(at, s[0].below(at) + s[1].below(at));
++    var t: [5]i32 = undefined;
++    s[0].table(&t);
++    try std.testing.expectEqualSlices(i32, &.{ 0, 3, 1, 3, 2 }, &t);
++    s[1].table(&t);
++    try std.testing.expectEqualSlices(i32, &.{ 2, 0, 2, 1, 2 }, &t);
++}
+diff --git a/zig/src/families/ling/weights.zig b/zig/src/families/ling/weights.zig
+index d5050703c..aa4a5ddb6 100644
+--- a/zig/src/families/ling/weights.zig
++++ b/zig/src/families/ling/weights.zig
+@@ -75,6 +75,7 @@ pub const Weights = struct {
+     config: Config, // this rank's share (weights_cut.rankConfig): every width the forward runs at
+     rank: u32 = 0,
+     world: u32 = 1,
++    kv_split: bool = false, // TP: the latent caches split by chunks over the ranks (state.Split), set by the engine
+     store: Store,
+     embed: u64 = 0, // bf16 [vocab][hidden]
+     norm: u64 = 0,
+diff --git a/zig/tests/cuda/contract_ling_more.zig b/zig/tests/cuda/contract_ling_more.zig
+index 10e0a40d0..428b98d54 100644
+--- a/zig/tests/cuda/contract_ling_more.zig
++++ b/zig/tests/cuda/contract_ling_more.zig
+@@ -92,6 +92,9 @@ pub const Chunks = struct {
+     pos: u64 = 0,
+     parts: [3]u64 = @splat(0),
+     out: u64 = 0,
++    split: ?[2]cuda.Function = null, // tf_ling_chunks_split_r16 and tf_ling_merge_part: the split form (splitRun)
++    halves: [2]u64 = @splat(0), // the split form's caches: each rank's chunks 2 j + rank as page j
++    got: [3]u64 = @splat(0), // the split form's [2] merged partials: o, m, l
+ 
+     pub fn deinit(self: *Chunks) void {
+         self.free();
+@@ -109,7 +112,9 @@ pub const Chunks = struct {
+     }
+ 
+     pub fn kernel(self: *Chunks) g.Kernel {
+-        return .{ .spec = chunkSpec(), .ctx = self, .vt = &vt };
++        var s = chunkSpec();
++        if (self.split != null) s.name = "cuda ling glm_glue tf_ling_chunks_split_r16 and tf_ling_merge_part (a split cache's two halves), with tf_glm_merge";
++        return .{ .spec = s, .ctx = self, .vt = &vt };
+     }
+ 
+     const vt = g.hooks(Chunks);
+@@ -146,10 +151,12 @@ pub const Chunks = struct {
+         const n = self.nch * shape.rows * self.heads;
+         self.parts = .{ try self.rig.scratch(n * lw * 4), try self.rig.scratch(n * 4), try self.rig.scratch(n * 4) };
+         self.out = try self.rig.output(shape.rows * self.heads * lw * 2);
++        if (self.split != null) try splitPrepare(self);
+         return true;
+     }
+ 
+     pub fn run(self: *Chunks) !void {
++        if (self.split) |f| return splitRun(self, f[0], f[1]);
+         const rows: i64 = @intCast(self.shape.rows);
+         const heads: i64 = @intCast(self.heads);
+         var a: cuda.Args = .{};
+@@ -442,10 +449,53 @@ pub const Finish = struct {
+     }
+ };
+ 
++/// Chunks' split form: each half of a split cache by tf_ling_chunks_split_r16 and tf_ling_merge_part, as served.
++fn splitPrepare(self: *Chunks) !void {
++    const a = self.rig.gpu.gpa;
++    const span = self.at + self.shape.rows;
++    for (0..2) |w| {
++        const n_pages = (self.nch + 1 - w) / 2 + 1;
++        const host = try a.alloc(u16, n_pages * chunk * kw);
++        defer a.free(host);
++        @memset(host, 0);
++        var j: usize = 0;
++        while (2 * j + w < self.nch) : (j += 1) {
++            const first = (2 * j + w) * chunk;
++            const n = @min(chunk, span - first);
++            @memcpy(host[j * chunk * kw ..][0 .. n * kw], self.cache[first * kw ..][0 .. n * kw]);
++        }
++        self.halves[w] = try self.rig.input(std.mem.sliceAsBytes(host));
++    }
++    const n = self.shape.rows * self.heads;
++    self.got = .{ try self.rig.scratch(2 * n * lw * 4), try self.rig.scratch(2 * n * 4), try self.rig.scratch(2 * n * 4) };
++}
++
++fn splitRun(self: *Chunks, split: cuda.Function, part: cuda.Function) !void {
++    const rows: i64 = @intCast(self.shape.rows);
++    const heads: i64 = @intCast(self.heads);
++    const n: u64 = @intCast(self.shape.rows * self.heads);
++    for (0..2) |w| {
++        const nloc = (self.nch + 1 - w) / 2;
++        if (nloc > 0) {
++            var a: cuda.Args = .{};
++            inline for (.{ self.in[0], self.halves[w], self.pos, self.parts[0], self.parts[1], self.parts[2], rows, heads, att_scale, @as(c_int, 2), @as(c_int, @intCast(w)) }) |v| a.add(v);
++            try cuda.launch.launch(split, .{ .grid = .{ .x = @intCast(self.shape.rows), .y = @intCast((self.heads + 15) / 16), .z = @intCast(nloc) }, .block = .{ .x = 256 }, .shared = chunksSmem() }, self.rig.s, &a);
++        }
++        var m: cuda.Args = .{};
++        inline for (.{ self.parts[0], self.parts[1], self.parts[2], self.got[0] + w * n * lw * 4, self.got[1] + w * n * 4, self.got[2] + w * n * 4, rows, heads, @as(c_int, @intCast(nloc)) }) |v| m.add(v);
++        try cuda.launch.launch(part, .{ .grid = .{ .x = @intCast(self.shape.rows), .y = @intCast(self.heads) }, .block = .{ .x = 128 } }, self.rig.s, &m);
++    }
++    var m: cuda.Args = .{};
++    inline for (.{ self.got[0], self.got[1], self.got[2], self.out, self.in[2], rows, heads, @as(c_int, 2), @as(c_int, 0) }) |v| m.add(v);
++    try cuda.launch.launch(self.merge, .{ .grid = .{ .x = @intCast(self.shape.rows), .y = @intCast(self.heads) }, .block = .{ .x = 128 } }, self.rig.s, &m);
++    try self.rig.s.synchronize();
++}
++
+ /// The three kinds on the heap: the gates hold pointers to them.
+ pub const Set = struct {
+     gpa: std.mem.Allocator,
+     chunks: Chunks = undefined,
++    split: Chunks = undefined,
+     finish: [finish_entries.len]Finish = undefined,
+     fp8s: [lf.fp8_entries.len]lf.Fp8 = undefined,
+     exl3: cuda.Module = undefined,
+@@ -458,6 +508,9 @@ pub const Set = struct {
+         const f = try glue.function("tf_ling_chunks_r16");
+         try f.allowDynamicShared(chunksSmem());
+         set.chunks = .{ .rig = .{ .gpu = gpu, .s = s }, .f = f, .merge = try glue.function("tf_glm_merge") };
++        const fs = try glue.function("tf_ling_chunks_split_r16");
++        try fs.allowDynamicShared(chunksSmem());
++        set.split = .{ .rig = .{ .gpu = gpu, .s = s }, .f = f, .merge = set.chunks.merge, .split = .{ fs, try glue.function("tf_ling_merge_part") } };
+         set.exl3 = try cuda.Module.load(gpu.d, cuda.kernels.exl3_experts);
+         errdefer set.exl3.unload();
+         const fin = try set.exl3.function("tf_exl3_plan_finish_after");
+@@ -465,6 +518,7 @@ pub const Set = struct {
+         set.ex = try fx8.load(gpu.d, @intCast(try gpu.ctx.attribute(.multiprocessor_count)));
+         for (&set.fp8s, lf.fp8_entries) |*x, e| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .ex = &set.ex, .entry = e };
+         try list.append(a, set.chunks.kernel());
++        try list.append(a, set.split.kernel());
+         for (&set.finish) |*x| try list.append(a, x.kernel());
+         for (&set.fp8s) |*x| try list.append(a, x.kernel());
+         return set;
+@@ -472,6 +526,7 @@ pub const Set = struct {
+ 
+     pub fn deinit(set: *Set) void {
+         set.chunks.deinit();
++        set.split.deinit();
+         for (&set.finish) |*x| x.deinit();
+         for (&set.fp8s) |*x| x.deinit();
+         set.ex.unload();
+diff --git a/zig/tests/cuda/ling_lanes.zig b/zig/tests/cuda/ling_lanes.zig
+index 1040288ce..cd508725c 100644
+--- a/zig/tests/cuda/ling_lanes.zig
++++ b/zig/tests/cuda/ling_lanes.zig
+@@ -42,7 +42,7 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+             mtp = true;
+         } else ref = rest[i];
+     }
+-    const e = try Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, dir, .{ .capacity = 1024, .prompt_rows = 512, .layers = thin, .mtp = mtp });
++    const e = try Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, dir, .{ .capacity = 1024, .prompt_rows = 512, .layers = thin, .mtp = mtp, .prompt_logits = 512 });
+     defer e.deinit();
+     e.chunk = chunk;
+     var ll: ling.lanes.Lanes = .{ .e = e };
+diff --git a/zig/tests/cuda/ling_tp.zig b/zig/tests/cuda/ling_tp.zig
+index 617a59082..b86743342 100644
+--- a/zig/tests/cuda/ling_tp.zig
++++ b/zig/tests/cuda/ling_tp.zig
+@@ -18,6 +18,9 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+     var layers: ?[]u32 = null;
+     var steps: usize = 64;
+     var seed: u64 = 0;
++    var cap: usize = 512;
++    var P: usize = 40;
++    var resume_at: ?u32 = null;
+     var k: usize = 2;
+     while (k < rest.len) : (k += 1) {
+         if (std.mem.eql(u8, rest[k], "--layers") and k + 1 < rest.len) {
+@@ -32,6 +35,15 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+         } else if (std.mem.eql(u8, rest[k], "--steps") and k + 1 < rest.len) {
+             k += 1;
+             steps = try std.fmt.parseInt(usize, rest[k], 10);
++        } else if (std.mem.eql(u8, rest[k], "--prompt") and k + 1 < rest.len) {
++            k += 1;
++            P = try std.fmt.parseInt(usize, rest[k], 10);
++        } else if (std.mem.eql(u8, rest[k], "--capacity") and k + 1 < rest.len) {
++            k += 1;
++            cap = try std.fmt.parseInt(usize, rest[k], 10);
++        } else if (std.mem.eql(u8, rest[k], "--resume") and k + 1 < rest.len) {
++            k += 1;
++            resume_at = try std.fmt.parseInt(u32, rest[k], 10);
+         } else return error.BadArgument;
+     }
+     const p = try ling.tp.place(ling.tp.env);
+@@ -41,8 +53,8 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+         group = try ling.tp.group(gpu.io, p);
+     }
+     defer if (group) |*g| g.close();
+-    const cap = 512;
+-    const e = try engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, rest[0], .{ .capacity = cap, .layers = layers, .group = if (group) |*g| g else null });
++    const split = try ling.native.splitMode();
++    const e = try engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, rest[0], .{ .capacity = cap, .layers = layers, .group = if (group) |*g| g else null, .kv_split = split });
+     defer e.deinit();
+     var link: ?ling.tp.Link = null;
+     defer if (link) |*l| l.deinit();
+@@ -61,24 +73,25 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+         e.asleep = cuda.tp_watch.open();
+     }
+     const V: usize = e.c.vocab;
+-    const P = 40;
+-    var ids: [P]u32 = undefined;
++    const ids = try a.alloc(u32, P);
+     var rng = std.Random.DefaultPrng.init(0x6c696e67 +% seed);
+-    for (&ids) |*t| t.* = rng.random().uintLessThan(u32, @intCast(@min(V, 30000)));
++    for (ids) |*t| t.* = rng.random().uintLessThan(u32, @intCast(@min(V, 30000)));
+     const rows = steps + 1;
+     const logits = try a.alloc(u16, rows * V);
+     const toks = try a.alloc(u32, rows);
+-    try e.bind(0);
+-    try e.begin(null);
+-    toks[0] = try e.prefill(&ids, null, null, null);
+-    try e.stream.synchronize();
+-    try e.bp.arena.buf.download(e.bp.logits - e.bp.arena.buf.ptr, std.mem.sliceAsBytes(logits[0..V]));
+-    for (1..rows) |s| {
+-        var out: [1]u32 = undefined;
+-        try e.verify(toks[s - 1 ..][0..1], &out);
+-        try e.bd.arena.buf.download(e.bd.logits - e.bd.arena.buf.ptr, std.mem.sliceAsBytes(logits[s * V ..][0..V]));
+-        try e.keep(1);
+-        toks[s] = out[0];
++    var keep: Keep = .{ .e = e };
++    const at = [_]u32{resume_at orelse 0};
++    const marks: ?engine.Marks = if (resume_at != null) .{ .at = &at, .ctx = &keep, .call = Keep.call } else null;
++    try greedy(e, ids, null, marks, toks, logits);
++    if (keep.err) |err| return err;
++    var same: usize = rows;
++    if (resume_at) |m| { // resumed == fresh: the same prompt again from the state kept at m, every row's bytes compared
++        const toks2 = try a.alloc(u32, rows);
++        const logits2 = try a.alloc(u16, rows * V);
++        try greedy(e, ids, .{ .id = keep.id orelse return error.NoKeptState, .at = m }, null, toks2, logits2);
++        same = 0;
++        for (0..rows) |r| same += @intFromBool(toks[r] == toks2[r] and std.mem.eql(u16, logits[r * V ..][0..V], logits2[r * V ..][0..V]));
++        std.debug.print("RESULT ling-tp resumed at {d} == fresh: {d}/{d} rows byte-equal\n", .{ m, same, rows });
+     }
+     cuda.tp_watch.ended(); // rank 1 leaves on the end step: its line closing from here is expected
+     try e.end();
+@@ -88,6 +101,40 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+     try buf.appendSlice(a, std.mem.sliceAsBytes(toks));
+     try buf.appendSlice(a, std.mem.sliceAsBytes(logits));
+     try std.Io.Dir.cwd().writeFile(gpu.io, .{ .sub_path = rest[1], .data = buf.items });
+-    std.debug.print("RESULT ling-tp world {d}: {d} prompt ids, {d} greedy rows; tokens {any}\n", .{ p.world, P, steps, toks[0..@min(rows, 16)] });
++    std.debug.print("RESULT ling-tp world {d} split {t}: {d} prompt ids, {d} greedy rows; tokens {any}\n", .{ p.world, split, P, steps, toks[0..@min(rows, 16)] });
++    if (same != rows) return error.ResumedDiffers;
+     check.pass("ling-tp world {d}: rows saved in {s}", .{ p.world, rest[1] });
+ }
++
++/// The pass's mark: the state kept there (an error kept for after the pass).
++const Keep = struct {
++    e: *engine.Engine,
++    id: ?u64 = null,
++    err: ?anyerror = null,
++
++    fn call(ctx: *anyopaque, at: u32) void {
++        const kp: *Keep = @ptrCast(@alignCast(ctx));
++        _ = at;
++        kp.id = kp.e.keepState() catch |err| {
++            kp.err = err;
++            return;
++        };
++    }
++};
++
++/// A fresh sequence (or one resumed from `from`): the prompt, then greedy rows, each row's tokens and bf16 logits.
++fn greedy(e: *engine.Engine, ids: []const u32, from: ?engine.Resume, marks: ?engine.Marks, toks: []u32, logits: []u16) !void {
++    const V: usize = e.c.vocab;
++    try e.bind(0);
++    try e.begin(null);
++    toks[0] = try e.prefill(ids, from, null, marks);
++    try e.stream.synchronize();
++    try e.bp.arena.buf.download(e.bp.logits - e.bp.arena.buf.ptr, std.mem.sliceAsBytes(logits[0..V]));
++    for (1..toks.len) |s| {
++        var out: [1]u32 = undefined;
++        try e.verify(toks[s - 1 ..][0..1], &out);
++        try e.bd.arena.buf.download(e.bd.logits - e.bd.arena.buf.ptr, std.mem.sliceAsBytes(logits[s * V ..][0..V]));
++        try e.keep(1);
++        toks[s] = out[0];
++    }
++}
+-- 
+2.53.0
+

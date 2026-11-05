@@ -1,0 +1,576 @@
+From 6787b2a6b873166e58bccb9c6a20a8d59defdf85 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 10:18:56 +1100
+Subject: [PATCH 18/26] ling: speed levers behind switches, default off:
+ TF_LING_ROCE=1 (main's RoCE one-shot gathers beside NCCL, both ranks),
+ TF_LING_GRAPHS=1 (one sequence's verify windows and chained MTP drafts as
+ CUDA graphs on main's graph cache, keyed by rows, KDA copy and an 8-chunk MLA
+ bucket; trailing chunks merge as nothing), TF_LING_MTP_DRAFTS (the chain's
+ most drafts, 1..5, default 3), TF_LING_PROMPT_TILES=1 (EXL3 prompt
+ projections on main's tensor-core tiles); ling-tp --window/--time/--mtp
+ (every row's logits and drafts hashed; per-width verify and draft timing)
+
+---
+ zig/src/families/ling/block_mla.zig |   2 +-
+ zig/src/families/ling/engine.zig    |  14 ++--
+ zig/src/families/ling/forward.zig   |  18 ++++-
+ zig/src/families/ling/graph.zig     |  15 +++-
+ zig/src/families/ling/lanes.zig     |   9 ++-
+ zig/src/families/ling/mtp.zig       |  15 ++--
+ zig/src/families/ling/native.zig    |   1 +
+ zig/src/families/ling/steps.zig     | 106 ++++++++++++++++++++++++++++
+ zig/src/families/ling/tp.zig        |   8 +++
+ zig/tests/cuda/ling_tp.zig          |  88 ++++++++++++++++++++---
+ 10 files changed, 253 insertions(+), 23 deletions(-)
+ create mode 100644 zig/src/families/ling/steps.zig
+
+diff --git a/zig/src/families/ling/block_mla.zig b/zig/src/families/ling/block_mla.zig
+index 5da759804..1da9b8182 100644
+--- a/zig/src/families/ling/block_mla.zig
++++ b/zig/src/families/ling/block_mla.zig
+@@ -63,7 +63,7 @@ pub fn block(o: Ops, b: *const state.Buffers, a: weights.Mla, ab: graph.Absorb,
+                 try o.addI32(st.pos_dev, r0, b.at);
+                 at = b.at;
+             }
+-            const nch = latent.chunksFor(st.pos + r0 + m);
++            const nch = @max(latent.chunksFor(st.pos + r0 + m), o.nch_fix);
+             const row = r + r0;
+             try ops.attention(&o.m.ling, o.set(), o.s, b.qa + row * H * kw * 2, st.cacheAt(mi), at, b.partials, b.ol + row * H * lw * 2, b.dummy, m, H, lw, nch, scale);
+         }
+diff --git a/zig/src/families/ling/engine.zig b/zig/src/families/ling/engine.zig
+index b6422b492..3d7d91010 100644
+--- a/zig/src/families/ling/engine.zig
++++ b/zig/src/families/ling/engine.zig
+@@ -8,6 +8,7 @@ const fw = @import("forward.zig");
+ const head = @import("mtp.zig");
+ const rope = @import("rope.zig");
+ const tp = @import("tp.zig");
++const steps = @import("steps.zig");
+ 
+ const sampler = glm.sampler;
+ pub const Sampling = sampler.Sampling;
+@@ -101,6 +102,7 @@ pub const Engine = struct {
+     lead: bool = false,
+     asleep: bool = false, // rank 0: the other ranks sleep on their lines until its next step
+     dropped: std.ArrayList(u64) = .empty, // kept states dropped since the last step: rank 1 drops them first
++    graphs: ?*steps.Graphs = null, // TF_LING_GRAPHS=1: one sequence's verify windows as CUDA graphs
+ 
+     /// The checkpoint at `dir` in its own format.
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, dir: []const u8, o: Options) !*Engine {
+@@ -177,6 +179,7 @@ pub const Engine = struct {
+             e.seqs.deinit(gpa);
+         }
+         try e.bind(0);
++        e.graphs = try steps.Graphs.create(gpa, d);
+         try e.stream.synchronize();
+         return e;
+     }
+@@ -194,6 +197,7 @@ pub const Engine = struct {
+ 
+     pub fn deinit(e: *Engine) void {
+         e.stream.synchronize() catch {};
++        if (e.graphs) |g| g.destroy();
+         var it = e.snaps.valueIterator();
+         while (it.next()) |s| e.freeSnap(s);
+         e.snaps.deinit(e.gpa);
+@@ -400,7 +404,7 @@ pub const Engine = struct {
+         try e.send(.verify, .{ .kind = 0 }, ids);
+         const f = e.forward(&e.bd);
+         const at = e.cur.st.pos;
+-        try f.run(&.{.{ .st = &e.cur.st, .row0 = 0, .rows = ids.len }}, @ptrCast(ids));
++        try steps.run(e.graphs, f, &.{.{ .st = &e.cur.st, .row0 = 0, .rows = ids.len }}, @ptrCast(ids));
+         e.cur.rows_at = e.bd.normed;
+         try e.draw(e.bd.logits, ids.len, at + 1, out);
+     }
+@@ -466,11 +470,13 @@ pub const Engine = struct {
+         const f = h.forward(&e.m, e.stream, &h.bm);
+         var last = (follow.len - 1) % window_rows; // h.bm's row of the newest absorbed token
+         for (0..depth) |j| {
+-            try f.final(last + 1);
+-            try f.logitsOf(last, 1);
++            if (j == 0) { // later rows' norm and head ran in steps.chain
++                try f.final(last + 1);
++                try f.logitsOf(last, 1);
++            }
+             try e.draw(h.bm.logits, 1, q.st.pos + 1 + j, out[j..][0..1]);
+             if (j + 1 == depth) break;
+-            try h.absorb(&e.m, e.stream, &h.bm, hd, @ptrCast(out[j..][0..1]), h.bm.normed + last * D * 2);
++            try steps.chain(e.graphs, h, f, hd, @ptrCast(out[j..][0..1]), h.bm.normed + last * D * 2);
+             q.in_head += 1;
+             last = 0;
+         }
+diff --git a/zig/src/families/ling/forward.zig b/zig/src/families/ling/forward.zig
+index 14c0467be..a5360fec4 100644
+--- a/zig/src/families/ling/forward.zig
++++ b/zig/src/families/ling/forward.zig
+@@ -26,13 +26,14 @@ pub const Forward = struct {
+     b: *const state.Buffers,
+     picks: ?u64 = null, // i32 [MoE layers][rows][top_k + 1]: every MoE layer's picks, for checks
+     kda_wide: bool = true, // GLM's TF_GLM_KDA_DECODE_WIDE default: decode windows on the three-kernel chain
++    nch_fix: usize = 0, // a graphed window's MLA chunk count (steps.zig); 0: each call's own
+ 
+     pub fn ops(f: *const Forward) graph.Ops {
+-        return .{ .m = f.m, .s = f.s, .prompt = f.b.prompt, .part = f.b.part, .kda_wide = f.kda_wide };
++        return .{ .m = f.m, .s = f.s, .prompt = f.b.prompt, .part = f.b.part, .kda_wide = f.kda_wide, .nch_fix = f.nch_fix };
+     }
+ 
+     /// Segments in row order from row 0, each on its own committed sequence with room (and scratch) for its rows.
+-    fn rowsOf(f: *const Forward, segs: []const Seg) !usize {
++    pub fn rowsOf(f: *const Forward, segs: []const Seg) !usize {
+         var rows: usize = 0;
+         for (segs, 0..) |sg, i| {
+             if (sg.row0 != rows or sg.rows == 0 or sg.st.pending != 0) return error.BadSegments;
+@@ -57,12 +58,23 @@ pub const Forward = struct {
+ 
+     /// The tokens' bf16 embedding rows into b.x.
+     pub fn embed(f: *const Forward, ids: []const i32) !void {
++        try f.upload(ids);
++        try f.embedRows(ids.len);
++    }
++
++    /// The ids into b.ids (a graph's first kernel reads them there).
++    pub fn upload(f: *const Forward, ids: []const i32) !void {
+         const w = f.g.w;
+         const d = f.b.arena.buf.d;
+         if (ids.len > f.b.rows) return error.TooManyRows;
+         for (ids) |t| if (t < 0 or t >= w.config.vocab) return error.BadToken;
+         try d.check(d.api.cuMemcpyHtoDAsync_v2(f.b.ids, ids.ptr, ids.len * 4, f.s.handle), "cuMemcpyHtoDAsync");
+-        try glue.embedB16(f.ops().set(), f.s, f.b.ids, w.embed, f.b.x, ids.len, w.config.hidden, 1);
++    }
++
++    /// b.ids' first `rows` tokens' embedding rows into b.x.
++    pub fn embedRows(f: *const Forward, rows: usize) !void {
++        const w = f.g.w;
++        try glue.embedB16(f.ops().set(), f.s, f.b.ids, w.embed, f.b.x, rows, w.config.hidden, 1);
+     }
+ 
+     /// Every loaded layer on b.x in place; each sequence then holds its rows pending until commit().
+diff --git a/zig/src/families/ling/graph.zig b/zig/src/families/ling/graph.zig
+index f8e8314bf..e56a88546 100644
+--- a/zig/src/families/ling/graph.zig
++++ b/zig/src/families/ling/graph.zig
+@@ -35,6 +35,7 @@ pub const Modules = struct {
+         dense: cuda.exl3.Dense,
+         experts: cuda.exl3_experts.Experts,
+         grouped: cuda.exl3_grouped.Grouped,
++        tiles: ?cuda.exl3.Dense, // TF_LING_PROMPT_TILES=1: prompt rows' projections on the tensor-core tiles
+     };
+ 
+     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
+@@ -70,6 +71,11 @@ pub const Modules = struct {
+         errdefer x3.dense.unload();
+         x3.experts = try cuda.exl3_experts.Experts.load(d);
+         x3.grouped = .{ .d = d, .kernels = &x3.experts };
++        x3.tiles = null;
++        if (std.c.getenv("TF_LING_PROMPT_TILES")) |v| if (std.mem.eql(u8, std.mem.span(v), "1")) {
++            x3.tiles = try cuda.exl3.Dense.load(d);
++            x3.tiles.?.implementation = .tiles;
++        };
+         m.x3 = x3;
+         return m;
+     }
+@@ -82,6 +88,7 @@ pub const Modules = struct {
+         m.x4.unload();
+         m.x3.grouped.deinit();
+         m.x3.experts.unload();
++        if (m.x3.tiles) |*t| t.unload();
+         m.x3.dense.unload();
+         std.heap.page_allocator.destroy(m.x3);
+         m.* = undefined;
+@@ -96,6 +103,11 @@ pub const Modules = struct {
+         return .{ .lane = &m.lane, .nvfp4_prompt = &m.prompt, .exl3 = &m.x3.dense };
+     }
+ 
++    /// linear(), but EXL3 prompt rows on main's tensor-core tiles (exl3.md, Prompts) when TF_LING_PROMPT_TILES=1.
++    pub fn promptLinear(m: *const Modules) cuda.qlinear.Linear {
++        return .{ .lane = &m.lane, .nvfp4_prompt = &m.prompt, .exl3 = if (m.x3.tiles != null) &m.x3.tiles.? else &m.x3.dense };
++    }
++
+     pub fn grouped(m: *const Modules) cuda.experts.Grouped {
+         return .{ .fp8g = &m.x8, .nvfp4 = &m.x4, .exl3 = &m.x3.grouped };
+     }
+@@ -112,6 +124,7 @@ pub const Ops = struct {
+     prompt: bool,
+     part: u64,
+     kda_wide: bool = true, // decode windows on KDA's three-kernel chain (bit-equal to the fused one, faster)
++    nch_fix: usize = 0, // > 0: every MLA attention call runs this many chunks (a graph's; trailing ones merge as nothing)
+ 
+     pub fn set(o: Ops) glue.Set {
+         return o.m.set();
+@@ -120,7 +133,7 @@ pub const Ops = struct {
+     /// out [rows][n] bf16 = x rows (`ldx` apart) through `w` in whatever format it loaded.
+     pub fn mm(o: Ops, w: Proj, x: u64, ldx: usize, rows: usize, out: u64) !void {
+         const in: cuda.qlinear.Rows = .{ .x = x, .ldx = ldx, .part = o.part };
+-        if (o.prompt) return o.m.linear().prompt(o.s, w, in, out, rows);
++        if (o.prompt) return o.m.promptLinear().prompt(o.s, w, in, out, rows);
+         return o.m.linear().decode(o.s, w, in, out, rows);
+     }
+ 
+diff --git a/zig/src/families/ling/lanes.zig b/zig/src/families/ling/lanes.zig
+index 400a740a1..ae051d3cf 100644
+--- a/zig/src/families/ling/lanes.zig
++++ b/zig/src/families/ling/lanes.zig
+@@ -63,7 +63,7 @@ pub const Lanes = struct {
+             .gpu_tokens = false,
+             .mtp = drafting,
+             .speculate = drafting,
+-            .drafts = engine.max_drafts,
++            .drafts = mtpDrafts(),
+             .speculate_early = false,
+             .hidden_rows = sharing,
+             .batch_rows = if (sharing) engine.shared_rows else 0,
+@@ -75,6 +75,13 @@ pub const Lanes = struct {
+         return @ptrCast(@alignCast(ptr));
+     }
+ 
++    /// TF_LING_MTP_DRAFTS (1 .. engine.max_drafts): the MTP chain's most drafts a round; 3 when unset.
++    fn mtpDrafts() u32 {
++        const v = std.c.getenv("TF_LING_MTP_DRAFTS") orelse return 3;
++        const n = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return 3;
++        return @max(1, @min(n, engine.max_drafts));
++    }
++
+     fn take(self: *Lanes, token: u32) u64 {
+         const h = self.next;
+         self.drawn[h % ring] = token;
+diff --git a/zig/src/families/ling/mtp.zig b/zig/src/families/ling/mtp.zig
+index 413ca2b69..a09d62ef4 100644
+--- a/zig/src/families/ling/mtp.zig
++++ b/zig/src/families/ling/mtp.zig
+@@ -6,8 +6,8 @@ const fw = @import("forward.zig");
+ 
+ const glue = @import("graph.zig").glue;
+ 
+-/// The most drafts one chain holds.
+-pub const max_drafts = 3;
++/// The most drafts one chain holds (the lanes ask for TF_LING_MTP_DRAFTS of them, 3 by default).
++pub const max_drafts = 5;
+ 
+ /// The MTP layer's graph over a view of the weights (its layer alone, its final norm as `norm`) and its scratch.
+ pub const Head = struct {
+@@ -47,6 +47,14 @@ pub const Head = struct {
+ 
+     /// The layer on b.x's `rows` embedding rows and `hidden`'s rows (bf16 [rows][hidden]), committed on `hd`.
+     pub fn step(h: *const Head, f: fw.Forward, hd: *fw.State, rows: usize, hidden: u64, picks: ?u64) !void {
++        try h.run(f, hd, rows, hidden, picks);
++        hd.pending = rows;
++        hd.prompt = f.b.prompt;
++        try f.commit(hd, rows);
++    }
++
++    /// step()'s launches alone (a graph's body): nothing on the host changes, `hd` is left uncommitted.
++    pub fn run(h: *const Head, f: fw.Forward, hd: *fw.State, rows: usize, hidden: u64, picks: ?u64) !void {
+         const b = f.b;
+         const c = &h.view.config;
+         const D: usize = c.hidden;
+@@ -56,9 +64,6 @@ pub const Head = struct {
+         try glue.rmsnorm(o.set(), o.s, hidden, D, h.mtp.hnorm, h.cat.ptr + D * 2, 2 * D, null, c.eps, rows, D);
+         try o.mm(h.mtp.eh, h.cat.ptr, 2 * D, rows, b.x);
+         try f.layer(&.{.{ .st = hd, .row0 = 0, .rows = rows }}, 0, rows, picks);
+-        hd.pending = rows;
+-        hd.prompt = b.prompt;
+-        try f.commit(hd, rows);
+     }
+ 
+     /// `next` (the token after each row) with `hidden`'s rows through the layer on `b`, committed on `hd`.
+diff --git a/zig/src/families/ling/native.zig b/zig/src/families/ling/native.zig
+index 050854597..ad7f6a65b 100644
+--- a/zig/src/families/ling/native.zig
++++ b/zig/src/families/ling/native.zig
+@@ -82,6 +82,7 @@ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, .{ .capacity = capacity(o.context), .mtp = o.drafts, .yarn = yarn, .context = o.context, .group = if (own.group) |*g| g else null, .kv_split = split });
+     errdefer own.e.deinit();
+     if (own.group) |*g| {
++        try tp.roce(g, gpa, io, ctx.d, own.e.stream);
+         own.link = try tp.Link.init(gpa, ctx.d, &g.lib, g.comm, own.e.stream, capacity(o.context));
+         own.e.link = &own.link.?;
+         own.e.lead = p.rank == 0;
+diff --git a/zig/src/families/ling/steps.zig b/zig/src/families/ling/steps.zig
+new file mode 100644
+index 000000000..3de735b20
+--- /dev/null
++++ b/zig/src/families/ling/steps.zig
+@@ -0,0 +1,106 @@
++//! Ling's one-sequence verify windows as CUDA graphs on main's graph cache (TF_LING_GRAPHS=1): ids go up first.
++const std = @import("std");
++const cuda = @import("cuda");
++const fw = @import("forward.zig");
++const head = @import("mtp.zig");
++const latent = @import("graph.zig").latent;
++
++/// A graph's MLA calls run the window's chunk count rounded up to this many (trailing chunks merge as nothing).
++pub const bucket = 8;
++
++/// What a captured window depends on besides the weights: the sequence and scratch, rows, KDA copy, chunk count.
++pub const Key = struct { arena: u64, buffers: u64, rows: u32, parity: u32, nch: u32 };
++
++pub const Graphs = struct {
++    gpa: std.mem.Allocator,
++    eng: cuda.graph_cache.CudaEngine,
++    cache: cuda.graph_cache.Cache(Key),
++
++    /// The graphs when TF_LING_GRAPHS=1 (null otherwise: every window eager, as before).
++    pub fn create(gpa: std.mem.Allocator, d: *const cuda.Driver) !?*Graphs {
++        const v = std.c.getenv("TF_LING_GRAPHS") orelse return null;
++        if (!std.mem.eql(u8, std.mem.span(v), "1")) return null;
++        const g = try gpa.create(Graphs);
++        g.* = .{ .gpa = gpa, .eng = .{ .d = d }, .cache = undefined };
++        g.cache = cuda.graph_cache.Cache(Key).init(gpa, g.eng.engine(), .{ .max = 24 });
++        g.cache.name = "ling windows";
++        return g;
++    }
++
++    pub fn destroy(g: *Graphs) void {
++        g.cache.deinit();
++        g.gpa.destroy(g);
++    }
++};
++
++const Body = struct {
++    f: *const fw.Forward,
++    segs: []const fw.Seg,
++    rows: usize,
++
++    fn run(ctx: *anyopaque, s: cuda.Stream) anyerror!void {
++        const b: *const Body = @ptrCast(@alignCast(ctx));
++        _ = s; // the forward's own stream is the one captured
++        try b.f.embedRows(b.rows);
++        try b.f.stack(b.segs);
++        try b.f.head(b.rows);
++    }
++};
++
++/// f.run(segs, ids); a graph's when `graphs` is set, the window is one sequence's and its cache is not split.
++pub fn run(graphs: ?*Graphs, f: fw.Forward, segs: []const fw.Seg, ids: []const i32) !void {
++    const g = graphs orelse return f.run(segs, ids);
++    if (segs.len != 1 or f.b.prompt or fw.splitOf(f.g.w) != null) return f.run(segs, ids);
++    const rows = try f.rowsOf(segs);
++    if (ids.len != rows) return error.TooManyRows;
++    const st = segs[0].st;
++    var gf = f;
++    gf.nch_fix = chunks(f, st, rows);
++    try gf.upload(ids);
++    const key: Key = .{ .arena = st.arena.buf.ptr, .buffers = f.b.arena.buf.ptr, .rows = @intCast(rows), .parity = if (st.cur.len > 0) st.cur[0] else 0, .nch = @intCast(gf.nch_fix) };
++    var body: Body = .{ .f = &gf, .segs = segs, .rows = rows };
++    _ = try g.cache.run(key, f.s, 1, .{ .ctx = &body, .run = Body.run });
++    st.pending = rows; // what stack() leaves on the host, which a replay does not run
++    st.prompt = false;
++}
++
++/// The chunk count a graph of `rows` rows at `st`'s position runs (0 without MLA layers): a multiple of `bucket`.
++fn chunks(f: fw.Forward, st: *const fw.State, rows: usize) usize {
++    if (f.g.mla_layers == 0) return 0;
++    return @min(f.b.nch, std.mem.alignForward(usize, latent.chunksFor(st.pos + rows), bucket));
++}
++
++/// One chained draft: `tok` through the MTP layer on `hd` beside `hidden`'s row, committed, then the final norm and
++/// head of its row into f.b.logits (the next draw reads them). A graph's (without the commit) when `graphs` is set.
++pub fn chain(graphs: ?*Graphs, h: *const head.Head, f: fw.Forward, hd: *fw.State, tok: []const i32, hidden: u64) !void {
++    if (tok.len != 1) return error.BadRows;
++    try f.upload(tok);
++    if (graphs != null and fw.splitOf(f.g.w) == null) {
++        var gf = f;
++        gf.nch_fix = chunks(f, hd, 1);
++        const C = struct {
++            f: *const fw.Forward,
++            h: *const head.Head,
++            hd: *fw.State,
++            hidden: u64,
++            fn run(ctx: *anyopaque, s: cuda.Stream) anyerror!void {
++                const c: *const @This() = @ptrCast(@alignCast(ctx));
++                _ = s;
++                try c.f.embedRows(1);
++                try c.h.run(c.f.*, c.hd, 1, c.hidden, null);
++                try c.f.final(1);
++                try c.f.logitsOf(0, 1);
++            }
++        };
++        var body: C = .{ .f = &gf, .h = h, .hd = hd, .hidden = hidden };
++        const key: Key = .{ .arena = hd.arena.buf.ptr, .buffers = f.b.arena.buf.ptr, .rows = 1, .parity = @as(u32, @intCast(hidden - f.b.normed)) | (1 << 31), .nch = @intCast(gf.nch_fix) };
++        _ = try graphs.?.cache.run(key, f.s, 1, .{ .ctx = &body, .run = C.run });
++        hd.pending = 1;
++        hd.prompt = false;
++        return f.commit(hd, 1);
++    }
++    try f.embedRows(1);
++    try h.step(f, hd, 1, hidden, null);
++    try f.final(1);
++    try f.logitsOf(0, 1);
++}
+diff --git a/zig/src/families/ling/tp.zig b/zig/src/families/ling/tp.zig
+index 58baa817a..d151c5d82 100644
+--- a/zig/src/families/ling/tp.zig
++++ b/zig/src/families/ling/tp.zig
+@@ -53,6 +53,14 @@ pub fn group(io: std.Io, p: Place) !cuda.tp_group.Group {
+     return .{ .lib = lib, .comm = comm, .rank = p.rank, .world = p.world };
+ }
+ 
++/// TF_LING_ROCE=1: the per-layer gathers by main's RoCE writes (GLM's TF_ROCE_MAX_KB cap); both ranks open it or neither.
++pub fn roce(g: *cuda.tp_group.Group, gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream) !void {
++    const v = std.c.getenv("TF_LING_ROCE") orelse return;
++    if (!std.mem.eql(u8, std.mem.span(v), "1")) return;
++    try g.openRoce(gpa, io, d, s, try glm.native.roceBytes(if (std.c.getenv("TF_ROCE_MAX_KB")) |x| std.mem.span(x) else null));
++    std.log.info("ling tp: rank {d} gathers {s}", .{ g.rank, if (g.fast != null) "by RoCE writes up to the cap, NCCL past it" else "on NCCL (RoCE did not come up)" });
++}
++
+ /// Rank 1's loop: each of rank 0's steps on its own engine until rank 0 ends; an idle step sleeps on the TCP line.
+ pub fn follow(e: *engine.Engine, io: std.Io) !void {
+     const l = e.link orelse return error.NoLink;
+diff --git a/zig/tests/cuda/ling_tp.zig b/zig/tests/cuda/ling_tp.zig
+index b86743342..60c8f7532 100644
+--- a/zig/tests/cuda/ling_tp.zig
++++ b/zig/tests/cuda/ling_tp.zig
+@@ -10,7 +10,11 @@ const ling = @import("ling_cuda");
+ 
+ const engine = ling.engine;
+ 
++/// The clock step() times drafts by (run sets it).
++var clock: std.Io = undefined;
++
+ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
++    clock = gpu.io;
+     if (rest.len < 2) return error.MissingArgument;
+     var arena = std.heap.ArenaAllocator.init(gpu.gpa);
+     defer arena.deinit();
+@@ -21,6 +25,9 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+     var cap: usize = 512;
+     var P: usize = 40;
+     var resume_at: ?u32 = null;
++    var win: usize = 1; // --window W: each greedy step verifies W rows (the token, then W - 1 made-up drafts), keeps 1
++    var timed: usize = 0; // --time N: N more such steps, each timed (and with --mtp a draft of 3 after each)
++    var mtp = false;
+     var k: usize = 2;
+     while (k < rest.len) : (k += 1) {
+         if (std.mem.eql(u8, rest[k], "--layers") and k + 1 < rest.len) {
+@@ -44,6 +51,14 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+         } else if (std.mem.eql(u8, rest[k], "--resume") and k + 1 < rest.len) {
+             k += 1;
+             resume_at = try std.fmt.parseInt(u32, rest[k], 10);
++        } else if (std.mem.eql(u8, rest[k], "--window") and k + 1 < rest.len) {
++            k += 1;
++            win = try std.fmt.parseInt(usize, rest[k], 10);
++        } else if (std.mem.eql(u8, rest[k], "--time") and k + 1 < rest.len) {
++            k += 1;
++            timed = try std.fmt.parseInt(usize, rest[k], 10);
++        } else if (std.mem.eql(u8, rest[k], "--mtp")) {
++            mtp = true;
+         } else return error.BadArgument;
+     }
+     const p = try ling.tp.place(ling.tp.env);
+@@ -54,11 +69,12 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+     }
+     defer if (group) |*g| g.close();
+     const split = try ling.native.splitMode();
+-    const e = try engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, rest[0], .{ .capacity = cap, .layers = layers, .group = if (group) |*g| g else null, .kv_split = split });
++    const e = try engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, rest[0], .{ .capacity = cap, .layers = layers, .group = if (group) |*g| g else null, .kv_split = split, .mtp = mtp });
+     defer e.deinit();
+     var link: ?ling.tp.Link = null;
+     defer if (link) |*l| l.deinit();
+     if (group) |*g| {
++        try ling.tp.roce(g, gpu.gpa, gpu.io, gpu.d, e.stream);
+         link = try ling.tp.Link.init(gpu.gpa, gpu.d, &g.lib, g.comm, e.stream, cap);
+         e.link = &link.?;
+         e.lead = p.rank == 0;
+@@ -82,17 +98,23 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
+     var keep: Keep = .{ .e = e };
+     const at = [_]u32{resume_at orelse 0};
+     const marks: ?engine.Marks = if (resume_at != null) .{ .at = &at, .ctx = &keep, .call = Keep.call } else null;
+-    try greedy(e, ids, null, marks, toks, logits);
++    var all = std.crypto.hash.sha2.Sha256.init(.{});
++    try greedy(e, ids, null, marks, toks, logits, win, &all);
+     if (keep.err) |err| return err;
+     var same: usize = rows;
+     if (resume_at) |m| { // resumed == fresh: the same prompt again from the state kept at m, every row's bytes compared
+         const toks2 = try a.alloc(u32, rows);
+         const logits2 = try a.alloc(u16, rows * V);
+-        try greedy(e, ids, .{ .id = keep.id orelse return error.NoKeptState, .at = m }, null, toks2, logits2);
++        var all2 = std.crypto.hash.sha2.Sha256.init(.{});
++        try greedy(e, ids, .{ .id = keep.id orelse return error.NoKeptState, .at = m }, null, toks2, logits2, win, &all2);
+         same = 0;
+         for (0..rows) |r| same += @intFromBool(toks[r] == toks2[r] and std.mem.eql(u16, logits[r * V ..][0..V], logits2[r * V ..][0..V]));
+         std.debug.print("RESULT ling-tp resumed at {d} == fresh: {d}/{d} rows byte-equal\n", .{ m, same, rows });
+     }
++    if (timed > 0) for (1..@min(win, 16) + 1) |w| try timeSteps(gpu, e, toks[rows - 1], w, timed);
++    var dg: [32]u8 = undefined;
++    all.final(&dg);
++    std.debug.print("RESULT ling-tp windows of {d}: every row's logits and draws sha256 {x}\n", .{ win, dg[0..8] });
+     cuda.tp_watch.ended(); // rank 1 leaves on the end step: its line closing from here is expected
+     try e.end();
+     var buf: std.ArrayList(u8) = .empty;
+@@ -123,18 +145,68 @@ const Keep = struct {
+ };
+ 
+ /// A fresh sequence (or one resumed from `from`): the prompt, then greedy rows, each row's tokens and bf16 logits.
+-fn greedy(e: *engine.Engine, ids: []const u32, from: ?engine.Resume, marks: ?engine.Marks, toks: []u32, logits: []u16) !void {
++/// Windows of `win` rows: every row's logits go into `all` (row 0's into `logits` as before), one row kept a step.
++fn greedy(e: *engine.Engine, ids: []const u32, from: ?engine.Resume, marks: ?engine.Marks, toks: []u32, logits: []u16, win: usize, all: *std.crypto.hash.sha2.Sha256) !void {
+     const V: usize = e.c.vocab;
+     try e.bind(0);
+     try e.begin(null);
++    const t0 = check.now(clock);
+     toks[0] = try e.prefill(ids, from, null, marks);
+     try e.stream.synchronize();
++    std.debug.print("RESULT ling-tp prompt: {d} ids from {d} in {d:.1} ms\n", .{ ids.len, if (from) |f| f.at else 0, @as(f64, @floatFromInt(check.now(clock) - t0)) / 1e6 });
+     try e.bp.arena.buf.download(e.bp.logits - e.bp.arena.buf.ptr, std.mem.sliceAsBytes(logits[0..V]));
++    if (e.mtp != null) { // the MTP layer stays in step with the sequence: it drafts after the prompt and every window
++        var d: [engine.max_drafts]u32 = undefined;
++        try e.draft(true, toks[0..1], engine.max_drafts, &d);
++    }
++    const row = try std.heap.page_allocator.alloc(u16, 16 * V);
++    defer std.heap.page_allocator.free(row);
+     for (1..toks.len) |s| {
+-        var out: [1]u32 = undefined;
+-        try e.verify(toks[s - 1 ..][0..1], &out);
+-        try e.bd.arena.buf.download(e.bd.logits - e.bd.arena.buf.ptr, std.mem.sliceAsBytes(logits[s * V ..][0..V]));
+-        try e.keep(1);
++        var out: [16]u32 = undefined;
++        const w = try step(e, toks[s - 1], win, &out, null, all);
++        const n = @min(w * V, row.len);
++        try e.bd.arena.buf.download(e.bd.logits - e.bd.arena.buf.ptr, std.mem.sliceAsBytes(row[0..n]));
++        @memcpy(logits[s * V ..][0..V], row[0..V]);
++        all.update(std.mem.sliceAsBytes(row[0..n]));
++        all.update(std.mem.sliceAsBytes(out[0..w]));
+         toks[s] = out[0];
+     }
+ }
++
++/// One verify of `win` rows from `tok` (made-up drafts after it), the first row kept, and with the MTP layer a draft
++/// of max_drafts after it (its ms into `draft_ms`); the rows verified.
++fn step(e: *engine.Engine, tok: u32, win: usize, out: *[16]u32, draft_ms: ?*f64, all: ?*std.crypto.hash.sha2.Sha256) !usize {
++    const w = @min(@max(win, 1), 16);
++    var ids: [16]u32 = undefined;
++    ids[0] = tok;
++    for (1..w) |j| ids[j] = @intCast((@as(u64, tok) * 31 + j * 7919) % @min(e.c.vocab, 30000));
++    try e.verify(ids[0..w], out[0..w]);
++    try e.keep(1);
++    if (e.mtp == null) return w;
++    const t0 = if (draft_ms != null) check.now(clock) else 0;
++    var d: [engine.max_drafts]u32 = undefined;
++    try e.draft(false, out[0..1], engine.max_drafts, &d);
++    if (draft_ms) |p| p.* = @as(f64, @floatFromInt(check.now(clock) - t0)) / 1e6;
++    if (all) |h| h.update(std.mem.sliceAsBytes(&d)); // the drafts too: graphed chains must draw what eager ones do
++    return w;
++}
++
++/// `n` more windows of `win` rows from `tok`, each timed (verify + keep; with the MTP layer, its draft apart).
++fn timeSteps(gpu: check.Gpu, e: *engine.Engine, tok0: u32, win: usize, n: usize) !void {
++    var a = std.heap.ArenaAllocator.init(gpu.gpa);
++    defer a.deinit();
++    const ms = try a.allocator().alloc(f64, n);
++    const dm = try a.allocator().alloc(f64, n);
++    var tok = tok0;
++    for (0..n) |i| {
++        var out: [16]u32 = undefined;
++        dm[i] = 0;
++        const t0 = check.now(gpu.io);
++        _ = try step(e, tok, win, &out, &dm[i], null);
++        ms[i] = @as(f64, @floatFromInt(check.now(gpu.io) - t0)) / 1e6 - dm[i];
++        tok = out[0];
++    }
++    std.mem.sort(f64, ms, {}, std.sort.asc(f64));
++    std.mem.sort(f64, dm, {}, std.sort.asc(f64));
++    std.debug.print("RESULT ling-tp time: {d} windows of {d} rows at position {d}: median {d:.2} ms (min {d:.2}, max {d:.2}); draft of {d}: median {d:.2} ms\n", .{ n, win, e.pos(), ms[n / 2], ms[0], ms[n - 1], engine.max_drafts, dm[n / 2] });
++}
+-- 
+2.53.0
+

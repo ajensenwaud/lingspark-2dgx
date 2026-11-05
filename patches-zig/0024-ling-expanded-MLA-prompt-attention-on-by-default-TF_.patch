@@ -1,0 +1,69 @@
+From bcd9ee07763226a5c8b501d37c083a5aed0d314a Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 14:34:02 +1100
+Subject: [PATCH 24/26] ling: expanded MLA prompt attention on by default
+ (TF_LING_PROMPT_MLA=absorb restores the absorbed path); EXL3 prompt
+ projections the tensor-core tiles refuse (CandidateFormat: TP-cut strides)
+ fall back to 128-row blocks under TF_LING_PROMPT_TILES=1. TP=2 full pack:
+ 1,024-row chunk 2.22 s at 0 and 2.63 s at 64K (absorbed 2.26 + 33 ms/1K: 4.36
+ s at 64K), split cache 2.74 s at 64K; 65,536 ids 154.7 s vs 262.2 s; 16K
+ expand vs absorbed rel L2 3.6e-2 greedy 9/9; cut == whole and resumed ==
+ fresh byte-equal, split == whole on the prompt rows
+
+---
+ zig/src/families/ling/block_mla_prompt.zig | 8 ++++----
+ zig/src/families/ling/graph.zig            | 7 +++++--
+ 2 files changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/zig/src/families/ling/block_mla_prompt.zig b/zig/src/families/ling/block_mla_prompt.zig
+index 56954c72e..695a810e0 100644
+--- a/zig/src/families/ling/block_mla_prompt.zig
++++ b/zig/src/families/ling/block_mla_prompt.zig
+@@ -1,4 +1,4 @@
+-//! Ling's MLA prompt rows expanded (TF_LING_PROMPT_MLA=expand): kv_b over blocks of cache rows, flash tiles.
++//! Ling's MLA prompt rows expanded (default; TF_LING_PROMPT_MLA=absorb: off): kv_b over cache rows, flash tiles.
+ 
+ // Per head 192 q.k dims and 128 v dims a key instead of the absorbed 576 + 512; decode windows stay absorbed.
+ const std = @import("std");
+@@ -17,10 +17,10 @@ pub const smem: u32 = 2 * 64 * (24 + 16) * 16;
+ /// Query rows a tf_ling_pattn block takes.
+ pub const block_rows = 128;
+ 
+-/// Whether TF_LING_PROMPT_MLA asks for the expanded form (default: the absorbed one).
++/// Whether prompt rows' MLA is expanded: TF_LING_PROMPT_MLA=absorb keeps the absorbed form (default expand).
+ pub fn wanted() bool {
+-    const v = std.c.getenv("TF_LING_PROMPT_MLA") orelse return false;
+-    return std.mem.eql(u8, std.mem.span(v), "expand");
++    const v = std.c.getenv("TF_LING_PROMPT_MLA") orelse return true;
++    return !std.mem.eql(u8, std.mem.span(v), "absorb");
+ }
+ 
+ /// Whether MLA rows take the expanded form: prompt rows, the switch on (a split cache needs a 1,024-row scratch).
+diff --git a/zig/src/families/ling/graph.zig b/zig/src/families/ling/graph.zig
+index b13f5298b..c35d7622f 100644
+--- a/zig/src/families/ling/graph.zig
++++ b/zig/src/families/ling/graph.zig
+@@ -29,7 +29,7 @@ pub const Modules = struct {
+     gate: cuda.Function,
+     combine: cuda.Function,
+     pattn: cuda.Function, // tf_ling_pattn: MLA prompt rows in the expanded form
+-    expand: bool, // TF_LING_PROMPT_MLA=expand: prompt rows' MLA attention expanded (block_mla_prompt.zig)
++    expand: bool, // prompt rows' MLA attention expanded (block_mla_prompt.zig; TF_LING_PROMPT_MLA=absorb: off)
+     x3: *Exl3,
+ 
+     /// main's shared EXL3 kernels, heap-held (the grouped view points at its kernels): dense rows, grouped experts.
+@@ -138,7 +138,10 @@ pub const Ops = struct {
+     /// out [rows][n] bf16 = x rows (`ldx` apart) through `w` in whatever format it loaded.
+     pub fn mm(o: Ops, w: Proj, x: u64, ldx: usize, rows: usize, out: u64) !void {
+         const in: cuda.qlinear.Rows = .{ .x = x, .ldx = ldx, .part = o.part };
+-        if (o.prompt) return o.m.promptLinear().prompt(o.s, w, in, out, rows);
++        if (o.prompt) return o.m.promptLinear().prompt(o.s, w, in, out, rows) catch |err| switch (err) {
++            error.CandidateFormat => o.m.linear().prompt(o.s, w, in, out, rows), // a matrix the tiles refuse: 128-row blocks
++            else => err,
++        };
+         return o.m.linear().decode(o.s, w, in, out, rows);
+     }
+ 
+-- 
+2.53.0
+
